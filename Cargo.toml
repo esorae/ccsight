@@ -1,0 +1,95 @@
+[package]
+name = "ccsight"
+version = "1.0.0"
+edition = "2024"
+description = "Claude Code log viewer with integrated statistics and daily summaries"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/esorae/ccsight"
+keywords = ["claude", "tui", "analytics", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# TUI
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+crossterm = "0.29"
+
+# Async runtime
+tokio = { version = "1", features = ["full", "process", "fs"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# File discovery
+glob = "0.3"
+
+# Directories
+directories = "6"
+
+# Syntax highlighting
+syntect = "5"
+
+# Regex for parsing
+regex = "1"
+
+# Unicode width
+unicode-width = "0.2"
+
+# Clipboard
+arboard = "3"
+
+# MCP server
+rmcp = { version = "0.16", features = ["server", "transport-io"] }
+schemars = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Result/Option ignoring prevention
+let_underscore_must_use = "warn"
+
+# Deny - must fix (code correctness & consistency)
+derive_partial_eq_without_eq = "deny"
+manual_string_new = "deny"
+match_same_arms = "deny"
+redundant_else = "deny"
+rc_buffer = "deny"
+string_to_string = "deny"
+
+# Warn - should fix (code quality)
+uninlined_format_args = "warn"
+redundant_closure_for_method_calls = "warn"
+filter_map_next = "warn"
+map_unwrap_or = "warn"
+cloned_instead_of_copied = "warn"
+from_iter_instead_of_collect = "warn"
+manual_let_else = "warn"
+needless_for_each = "warn"
+or_fun_call = "warn"
+
+# Allow - too noisy for this codebase
+too_many_arguments = "allow"
+too_many_lines = "allow"
+type_complexity = "allow"
+field_reassign_with_default = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cognitive_complexity = "allow"
+needless_pass_by_value = "allow"
+trivially_copy_pass_by_ref = "allow"
+explicit_iter_loop = "allow"
+flat_map_option = "allow"
+match_bool = "allow"
+semicolon_if_nothing_returned = "allow"
+unused_self = "allow"

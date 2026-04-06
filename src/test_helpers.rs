@@ -1,0 +1,182 @@
+#[cfg(test)]
+pub mod helpers {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use chrono::{NaiveDate, Utc};
+
+    use crate::aggregator::{DailyGroup, ModelTokens, SessionInfo};
+
+    pub fn make_session(project: &str, summary: Option<&str>, branch: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            file_path: PathBuf::from("/tmp/test.jsonl"),
+            project_name: project.to_string(),
+            git_branch: branch.map(|s| s.to_string()),
+            session_first_timestamp: Utc::now(),
+            day_first_timestamp: Utc::now(),
+            day_last_timestamp: Utc::now(),
+            day_input_tokens: 1000,
+            day_output_tokens: 500,
+            day_tokens_by_model: HashMap::new(),
+            day_hourly_activity: HashMap::new(),
+            day_hourly_work_tokens: HashMap::new(),
+            day_tool_usage: HashMap::new(),
+            day_language_usage: HashMap::new(),
+            day_extension_usage: HashMap::new(),
+            summary: summary.map(|s| s.to_string()),
+            custom_title: None,
+            model: None,
+            is_subagent: false,
+            is_continued: false,
+        }
+    }
+
+    pub fn make_session_with_tokens(
+        project: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        model: &str,
+    ) -> SessionInfo {
+        let mut tokens_by_model = HashMap::new();
+        tokens_by_model.insert(
+            model.to_string(),
+            ModelTokens {
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+        );
+        SessionInfo {
+            file_path: PathBuf::from("/tmp/test.jsonl"),
+            project_name: project.to_string(),
+            git_branch: None,
+            session_first_timestamp: Utc::now(),
+            day_first_timestamp: Utc::now(),
+            day_last_timestamp: Utc::now(),
+            day_input_tokens: input_tokens,
+            day_output_tokens: output_tokens,
+            day_tokens_by_model: tokens_by_model,
+            day_hourly_activity: HashMap::new(),
+            day_hourly_work_tokens: HashMap::new(),
+            day_tool_usage: HashMap::new(),
+            day_language_usage: HashMap::new(),
+            day_extension_usage: HashMap::new(),
+            summary: None,
+            custom_title: None,
+            model: Some(model.to_string()),
+            is_subagent: false,
+            is_continued: false,
+        }
+    }
+
+    pub fn make_daily_group(date: NaiveDate, sessions: Vec<SessionInfo>) -> DailyGroup {
+        DailyGroup { date, sessions }
+    }
+
+    pub fn make_test_app_state(groups: Vec<DailyGroup>) -> crate::AppState {
+        let daily_costs: Vec<(NaiveDate, f64)> = groups.iter().map(|g| (g.date, 1.0)).collect();
+
+        crate::AppState {
+            needs_draw: false,
+            tab: crate::Tab::Dashboard,
+            pins: crate::pins::Pins::empty(),
+            conv_list_mode: crate::ConvListMode::Day,
+            stats: crate::aggregator::Stats::default(),
+            total_cost: daily_costs.len() as f64,
+            cost_without_subagents: daily_costs.len() as f64,
+            model_costs: Vec::new(),
+            aggregated_model_tokens: HashMap::new(),
+            models_without_pricing: std::collections::HashSet::new(),
+            daily_groups: groups.clone(),
+            daily_costs: daily_costs.clone(),
+            selected_day: 0,
+            selected_session: 0,
+            show_detail: false,
+            show_help: false,
+            help_scroll: 0,
+            show_conversation: false,
+            show_summary: false,
+            summary_content: String::new(),
+            summary_scroll: 0,
+            summary_type: None,
+            daily_breakdown_focus: false,
+            daily_breakdown_scroll: 0,
+            daily_breakdown_max_scroll: 0,
+            generating_summary: false,
+            summary_task: None,
+            loading: false,
+            error: None,
+            file_count: 0,
+            cache_stats: None,
+            dashboard_panel: 0,
+            dashboard_scroll: [0; 7],
+            show_dashboard_detail: false,
+            search_mode: false,
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_selected: 0,
+            search_task: None,
+            searching: false,
+            ctrl_c_pressed: false,
+            last_click_time: None,
+            last_click_pos: (0, 0),
+            text_selection: None,
+            selecting: false,
+            mouse_down_pos: None,
+            screen_buffer: None,
+            conversation_content_area: None,
+            updating_session: None,
+            updating_task: None,
+            last_data_update: None,
+            data_reload_task: None,
+            data_limit: 0,
+            animation_frame: 0,
+            retention_warning: None,
+            retention_warning_dismissed: false,
+            show_insights_detail: false,
+            insights_detail_scroll: 0,
+            insights_panel: 0,
+            toast_message: None,
+            toast_time: None,
+            panes: Vec::new(),
+            active_pane_index: None,
+            session_list_hidden: false,
+            show_conversation_detail: false,
+            tab_areas: Vec::new(),
+            pane_areas: Vec::new(),
+            dashboard_panel_areas: Vec::new(),
+            insights_panel_areas: Vec::new(),
+            session_list_area: None,
+            breakdown_panel_area: None,
+            summary_popup_area: None,
+            daily_header_area: None,
+            filter_popup_area_trigger: None,
+            project_popup_area_trigger: None,
+            pin_view_trigger: None,
+            help_trigger: None,
+            filter_popup_area: None,
+            project_popup_area: None,
+            search_results_area: None,
+            period_filter: crate::PeriodFilter::All,
+            show_filter_popup: false,
+            filter_popup_selected: 0,
+            filter_input_mode: false,
+            filter_input: String::new(),
+            filter_input_cursor: 0,
+            filter_input_error: false,
+            project_filter: None,
+            show_project_popup: false,
+            project_popup_selected: 0,
+            project_popup_scroll: 0,
+            project_list: Vec::new(),
+            original_daily_groups: groups,
+            original_daily_costs: daily_costs.clone(),
+            original_stats: crate::aggregator::Stats::default(),
+            original_total_cost: daily_costs.len() as f64,
+            original_cost_without_subagents: daily_costs.len() as f64,
+            original_model_costs: Vec::new(),
+            original_aggregated_model_tokens: HashMap::new(),
+        }
+    }
+}

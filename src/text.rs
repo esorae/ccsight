@@ -1,0 +1,313 @@
+fn is_cjk_breakable(c: char) -> bool {
+    matches!(c,
+        '\u{2E80}'..='\u{9FFF}' |
+        '\u{F900}'..='\u{FAFF}' |
+        '\u{FE30}'..='\u{FE4F}' |
+        '\u{FF00}'..='\u{FFEF}' |
+        '\u{20000}'..='\u{2FA1F}'
+    )
+}
+
+pub fn wrap_text_with_continuation(text: &str, max_width: usize) -> (Vec<String>, Vec<bool>) {
+    use unicode_width::UnicodeWidthChar;
+
+    if max_width == 0 {
+        return (vec![text.to_string()], vec![false]);
+    }
+
+    let mut lines = Vec::new();
+    let mut flags = Vec::new();
+
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            flags.push(false);
+            continue;
+        }
+
+        let chars: Vec<char> = paragraph.chars().collect();
+        let mut pos = 0;
+        let mut is_first_line = true;
+
+        while pos < chars.len() && chars[pos].is_whitespace() {
+            pos += 1;
+        }
+        if pos >= chars.len() {
+            lines.push(String::new());
+            flags.push(false);
+            continue;
+        }
+
+        while pos < chars.len() {
+            let mut line_width = 0usize;
+            let mut line_end = pos;
+            let mut last_break: Option<usize> = None;
+
+            while line_end < chars.len() {
+                let ch = chars[line_end];
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+                if line_width + ch_width > max_width {
+                    break;
+                }
+
+                line_width += ch_width;
+                line_end += 1;
+
+                if ch.is_whitespace() || is_cjk_breakable(ch) {
+                    last_break = Some(line_end);
+                }
+
+                if line_end < chars.len() && is_cjk_breakable(chars[line_end]) && !ch.is_whitespace() {
+                    last_break = Some(line_end);
+                }
+            }
+
+            if line_end >= chars.len() {
+                let line_str: String = chars[pos..].iter().collect();
+                lines.push(line_str.trim_end().to_string());
+                flags.push(!is_first_line);
+                break;
+            }
+
+            let break_at = if let Some(bp) = last_break {
+                if bp > pos { bp } else { line_end.max(pos + 1) }
+            } else {
+                line_end.max(pos + 1)
+            };
+
+            let line_str: String = chars[pos..break_at].iter().collect();
+            lines.push(line_str.trim_end().to_string());
+            flags.push(!is_first_line);
+            is_first_line = false;
+
+            pos = break_at;
+            while pos < chars.len() && chars[pos].is_whitespace() {
+                pos += 1;
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+        flags.push(false);
+    }
+
+    (lines, flags)
+}
+
+pub fn format_number(n: u64) -> String {
+    let (divisor, suffix) = match n {
+        n if n >= 1_000_000_000_000 => (1_000_000_000_000.0, "T"),
+        n if n >= 1_000_000_000 => (1_000_000_000.0, "B"),
+        n if n >= 1_000_000 => (1_000_000.0, "M"),
+        n if n >= 1_000 => (1_000.0, "K"),
+        _ => return n.to_string(),
+    };
+
+    #[allow(clippy::cast_precision_loss)]
+    let v = n as f64 / divisor;
+    if v >= 100.0 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rounded = v.round() as u64;
+        format!("{rounded}{suffix}")
+    } else if v >= 10.0 {
+        format!("{v:.1}{suffix}")
+    } else {
+        format!("{v:.2}{suffix}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextSegment {
+    Plain(String),
+    Code {
+        lang: Option<String>,
+        content: String,
+    },
+}
+
+pub fn parse_text_with_code_blocks(text: &str) -> Vec<TextSegment> {
+    let mut segments = Vec::new();
+    let mut current_plain = String::new();
+    let mut in_code_block = false;
+    let mut code_lang: Option<String> = None;
+    let mut code_content = String::new();
+
+    for line in text.lines() {
+        if line.starts_with("```") {
+            if in_code_block {
+                segments.push(TextSegment::Code {
+                    lang: code_lang.take(),
+                    content: std::mem::take(&mut code_content),
+                });
+                in_code_block = false;
+            } else {
+                if !current_plain.is_empty() {
+                    segments.push(TextSegment::Plain(std::mem::take(&mut current_plain)));
+                }
+                in_code_block = true;
+                let lang_str = line.trim_start_matches('`').trim();
+                code_lang = if lang_str.is_empty() {
+                    None
+                } else {
+                    Some(lang_str.to_string())
+                };
+            }
+        } else if in_code_block {
+            if !code_content.is_empty() {
+                code_content.push('\n');
+            }
+            code_content.push_str(line);
+        } else {
+            if !current_plain.is_empty() {
+                current_plain.push('\n');
+            }
+            current_plain.push_str(line);
+        }
+    }
+
+    if in_code_block && !code_content.is_empty() {
+        segments.push(TextSegment::Code {
+            lang: code_lang,
+            content: code_content,
+        });
+    } else if !current_plain.is_empty() {
+        segments.push(TextSegment::Plain(current_plain));
+    }
+
+    segments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_number_small() {
+        assert_eq!(format_number(999), "999");
+    }
+
+    #[test]
+    fn test_format_number_thousands() {
+        assert_eq!(format_number(1500), "1.50K");
+        assert_eq!(format_number(15000), "15.0K");
+        assert_eq!(format_number(150000), "150K");
+    }
+
+    #[test]
+    fn test_format_number_millions() {
+        assert_eq!(format_number(1_500_000), "1.50M");
+        assert_eq!(format_number(15_000_000), "15.0M");
+    }
+
+    #[test]
+    fn test_format_number_billions() {
+        assert_eq!(format_number(1_500_000_000), "1.50B");
+    }
+
+    #[test]
+    fn test_format_number_trillions() {
+        assert_eq!(format_number(1_500_000_000_000), "1.50T");
+    }
+
+    #[test]
+    fn test_wrap_text_with_continuation_flags() {
+        let (lines, flags) = wrap_text_with_continuation("hello world foo bar", 10);
+        assert_eq!(lines, vec!["hello", "world foo", "bar"]);
+        assert_eq!(flags, vec![false, true, true]);
+    }
+
+    #[test]
+    fn test_wrap_text_with_continuation_paragraphs() {
+        let (lines, flags) = wrap_text_with_continuation("first paragraph\n\nsecond paragraph", 80);
+        assert_eq!(lines, vec!["first paragraph", "", "second paragraph"]);
+        assert_eq!(flags, vec![false, false, false]);
+    }
+
+    #[test]
+    fn test_wrap_text_with_continuation_cjk() {
+        let (lines, flags) = wrap_text_with_continuation("あいうえおか", 8);
+        assert_eq!(lines, vec!["あいうえ", "おか"]);
+        assert_eq!(flags, vec![false, true]);
+    }
+
+    #[test]
+    fn test_format_number_zero() {
+        assert_eq!(format_number(0), "0");
+    }
+
+    #[test]
+    fn test_format_number_max() {
+        let result = format_number(u64::MAX);
+        assert!(result.ends_with('T'));
+    }
+
+    #[test]
+    fn test_parse_text_with_code_blocks_simple() {
+        let text = "Hello\n```rust\nfn main() {}\n```\nWorld";
+        let segments = parse_text_with_code_blocks(text);
+        assert_eq!(segments.len(), 3);
+        assert!(matches!(&segments[0], TextSegment::Plain(s) if s == "Hello"));
+        assert!(
+            matches!(&segments[1], TextSegment::Code { lang: Some(l), content: c } if l == "rust" && c == "fn main() {}")
+        );
+        assert!(matches!(&segments[2], TextSegment::Plain(s) if s == "World"));
+    }
+
+    #[test]
+    fn test_parse_text_with_code_blocks_multiple() {
+        let text = "A\n```\ncode1\n```\nB\n```python\ncode2\n```\nC";
+        let segments = parse_text_with_code_blocks(text);
+        assert_eq!(segments.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_text_with_code_blocks_no_lang() {
+        let text = "```\nno language\n```";
+        let segments = parse_text_with_code_blocks(text);
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(&segments[0], TextSegment::Code { lang: None, .. }));
+    }
+
+    #[test]
+    fn test_parse_plain_text_only() {
+        let text = "Just plain text\nno code blocks";
+        let segments = parse_text_with_code_blocks(text);
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(&segments[0], TextSegment::Plain(_)));
+    }
+
+    #[test]
+    fn test_parse_unclosed_code_block() {
+        let text = "Start\n```rust\nunclosed code";
+        let segments = parse_text_with_code_blocks(text);
+        assert_eq!(segments.len(), 2);
+        assert!(matches!(&segments[1], TextSegment::Code { .. }));
+    }
+
+    #[test]
+    fn test_parse_empty_string() {
+        let segments = parse_text_with_code_blocks("");
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_parse_only_backticks() {
+        let segments = parse_text_with_code_blocks("```");
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_parse_empty_code_block() {
+        let segments = parse_text_with_code_blocks("```\n```");
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(
+            &segments[0],
+            TextSegment::Code {
+                lang: None,
+                content
+            } if content.is_empty()
+        ));
+    }
+}

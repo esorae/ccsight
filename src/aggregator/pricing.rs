@@ -1,0 +1,625 @@
+// Pricing: https://platform.claude.com/docs/en/docs/about-claude/pricing
+// Cache pricing uses 5-minute TTL rates (1.25x input). Claude Code uses 5m cache by default.
+// 1-hour TTL (2x input) exists but JSONL entries don't include TTL metadata, so we can't distinguish.
+
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use crate::aggregator::TokenStats;
+
+static GLOBAL_CALCULATOR: LazyLock<CostCalculator> = LazyLock::new(CostCalculator::new);
+
+const FAMILIES: &[(&str, &str)] = &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")];
+
+pub fn normalize_model_name(model: &str) -> String {
+    for &(family, display) in FAMILIES {
+        if !model.contains(family) {
+            continue;
+        }
+
+        let prefix = format!("{family}-");
+        if let Some(pos) = model.find(&prefix) {
+            let after = &model[pos + prefix.len()..];
+            let major_str: String = after.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(major) = major_str.parse::<u32>()
+                && major_str.len() <= 2 {
+                    let rest = &after[major_str.len()..];
+                    if let Some(rest) = rest.strip_prefix('-') {
+                        let minor_str: String =
+                            rest.chars().take_while(char::is_ascii_digit).collect();
+                        if minor_str.len() <= 2
+                            && let Ok(minor) = minor_str.parse::<u32>() {
+                                return format!("{display} {major}.{minor}");
+                            }
+                    }
+                    return format!("{display} {major}");
+                }
+        }
+
+        if let Some(pos) = model.find(family) {
+            let before = &model[..pos];
+            let parts: Vec<&str> = before.split('-').filter(|s| !s.is_empty()).collect();
+            let nums: Vec<u32> = parts
+                .iter()
+                .rev()
+                .take(2)
+                .filter_map(|s| s.parse::<u32>().ok())
+                .collect();
+            match nums.len() {
+                2 => return format!("{} {}.{}", display, nums[1], nums[0]),
+                1 => return format!("{} {}", display, nums[0]),
+                _ => {}
+            }
+        }
+
+        return display.to_string();
+    }
+
+    "Other".to_string()
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelPricing {
+    pub input_cost_per_mtok: f64,
+    pub output_cost_per_mtok: f64,
+    pub cache_write_cost_per_mtok: f64, // 5-minute TTL (1.25x input)
+    pub cache_read_cost_per_mtok: f64,  // 0.1x input
+}
+
+pub struct CostBreakdown {
+    pub input: f64,
+    pub output: f64,
+}
+
+impl CostBreakdown {
+    pub fn effective_rate(cost: f64, tokens: u64) -> Option<f64> {
+        if tokens > 0 {
+            Some(cost / (tokens as f64 / 1_000_000.0))
+        } else {
+            None
+        }
+    }
+}
+
+pub struct CostCalculator {
+    pricing: HashMap<String, ModelPricing>,
+    sorted_keys: Vec<String>,
+}
+
+impl Default for CostCalculator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CostCalculator {
+    pub fn global() -> &'static CostCalculator {
+        &GLOBAL_CALCULATOR
+    }
+
+    pub fn new() -> Self {
+        let mut pricing = HashMap::new();
+
+        // Claude Opus 4.6: $5/$25 per MTok
+        pricing.insert(
+            "claude-opus-4-6".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 5.0,
+                output_cost_per_mtok: 25.0,
+                cache_write_cost_per_mtok: 6.25,
+                cache_read_cost_per_mtok: 0.50,
+            },
+        );
+
+        // Claude Opus 4.5: $5/$25 per MTok
+        pricing.insert(
+            "claude-opus-4-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 5.0,
+                output_cost_per_mtok: 25.0,
+                cache_write_cost_per_mtok: 6.25,
+                cache_read_cost_per_mtok: 0.50,
+            },
+        );
+
+        // Claude Opus 4.1: $15/$75 per MTok
+        pricing.insert(
+            "claude-opus-4-1".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 15.0,
+                output_cost_per_mtok: 75.0,
+                cache_write_cost_per_mtok: 18.75,
+                cache_read_cost_per_mtok: 1.50,
+            },
+        );
+
+        // Claude Opus 4: $15/$75 per MTok
+        pricing.insert(
+            "claude-opus-4".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 15.0,
+                output_cost_per_mtok: 75.0,
+                cache_write_cost_per_mtok: 18.75,
+                cache_read_cost_per_mtok: 1.50,
+            },
+        );
+
+        // Claude Sonnet 4.6: $3/$15 per MTok
+        pricing.insert(
+            "claude-sonnet-4-6".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 3.0,
+                output_cost_per_mtok: 15.0,
+                cache_write_cost_per_mtok: 3.75,
+                cache_read_cost_per_mtok: 0.30,
+            },
+        );
+
+        // Claude Sonnet 4.5: $3/$15 per MTok
+        pricing.insert(
+            "claude-sonnet-4-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 3.0,
+                output_cost_per_mtok: 15.0,
+                cache_write_cost_per_mtok: 3.75,
+                cache_read_cost_per_mtok: 0.30,
+            },
+        );
+
+        // Claude Sonnet 4: $3/$15 per MTok
+        pricing.insert(
+            "claude-sonnet-4".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 3.0,
+                output_cost_per_mtok: 15.0,
+                cache_write_cost_per_mtok: 3.75,
+                cache_read_cost_per_mtok: 0.30,
+            },
+        );
+
+        // Claude Sonnet 3.7 (deprecated): $3/$15 per MTok
+        pricing.insert(
+            "claude-3-7-sonnet".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 3.0,
+                output_cost_per_mtok: 15.0,
+                cache_write_cost_per_mtok: 3.75,
+                cache_read_cost_per_mtok: 0.30,
+            },
+        );
+
+        // Claude Sonnet 3.5 (legacy): $3/$15 per MTok
+        pricing.insert(
+            "claude-3-5-sonnet".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 3.0,
+                output_cost_per_mtok: 15.0,
+                cache_write_cost_per_mtok: 3.75,
+                cache_read_cost_per_mtok: 0.30,
+            },
+        );
+
+        // Claude Opus 3 (deprecated): $15/$75 per MTok
+        pricing.insert(
+            "claude-3-opus".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 15.0,
+                output_cost_per_mtok: 75.0,
+                cache_write_cost_per_mtok: 18.75,
+                cache_read_cost_per_mtok: 1.50,
+            },
+        );
+
+        // Claude Haiku 4.5: $1/$5 per MTok
+        pricing.insert(
+            "claude-haiku-4-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 1.0,
+                output_cost_per_mtok: 5.0,
+                cache_write_cost_per_mtok: 1.25,
+                cache_read_cost_per_mtok: 0.10,
+            },
+        );
+
+        // Claude Haiku 3.5: $0.80/$4 per MTok
+        pricing.insert(
+            "claude-3-5-haiku".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 0.80,
+                output_cost_per_mtok: 4.0,
+                cache_write_cost_per_mtok: 1.0,
+                cache_read_cost_per_mtok: 0.08,
+            },
+        );
+
+        // Claude Haiku 3: $0.25/$1.25 per MTok
+        pricing.insert(
+            "claude-3-haiku".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 0.25,
+                output_cost_per_mtok: 1.25,
+                cache_write_cost_per_mtok: 0.30,
+                cache_read_cost_per_mtok: 0.03,
+            },
+        );
+
+        let mut sorted_keys: Vec<String> = pricing.keys().cloned().collect();
+        sorted_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+
+        Self {
+            pricing,
+            sorted_keys,
+        }
+    }
+
+    pub fn calculate_cost(&self, tokens: &TokenStats, model: Option<&str>) -> Option<f64> {
+        let pricing = self.get_pricing(model)?;
+        let million = 1_000_000.0;
+
+        let input_cost = tokens.input_tokens as f64 / million * pricing.input_cost_per_mtok;
+        let output_cost = tokens.output_tokens as f64 / million * pricing.output_cost_per_mtok;
+        let cache_write_cost =
+            tokens.cache_creation_tokens as f64 / million * pricing.cache_write_cost_per_mtok;
+        let cache_read_cost =
+            tokens.cache_read_tokens as f64 / million * pricing.cache_read_cost_per_mtok;
+
+        Some(input_cost + output_cost + cache_write_cost + cache_read_cost)
+    }
+
+    pub fn cost_breakdown_by_display_name(
+        &self,
+        display_name: &str,
+        tokens: &TokenStats,
+    ) -> Option<CostBreakdown> {
+        let pricing = self.get_pricing_by_display_name(display_name)?;
+        let million = 1_000_000.0;
+        Some(CostBreakdown {
+            input: tokens.input_tokens as f64 / million * pricing.input_cost_per_mtok,
+            output: tokens.output_tokens as f64 / million * pricing.output_cost_per_mtok,
+        })
+    }
+
+    pub fn get_pricing_by_display_name(&self, display_name: &str) -> Option<&ModelPricing> {
+        for key in self.pricing.keys() {
+            if normalize_model_name(key) == display_name {
+                return self.pricing.get(key);
+            }
+        }
+        None
+    }
+
+    pub fn has_pricing(&self, model: Option<&str>) -> bool {
+        self.get_pricing(model).is_some()
+    }
+
+    pub fn models_without_pricing(
+        &self,
+        model_tokens: &std::collections::HashMap<String, TokenStats>,
+    ) -> std::collections::HashSet<String> {
+        let mut result = std::collections::HashSet::new();
+        for model in model_tokens.keys() {
+            if !self.has_pricing(Some(model))
+                && let Some(simplified) = Self::simplify_model_name(model) {
+                    result.insert(simplified);
+                }
+        }
+        result
+    }
+
+    pub fn calculate_costs_by_model(
+        &self,
+        model_tokens: &std::collections::HashMap<String, TokenStats>,
+    ) -> Vec<(String, f64)> {
+        let mut aggregated: HashMap<String, f64> = HashMap::new();
+
+        for (model, tokens) in model_tokens {
+            if let Some(simplified) = Self::simplify_model_name(model) {
+                let cost = self.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
+                *aggregated.entry(simplified).or_insert(0.0) += cost;
+            }
+        }
+
+        let mut costs: Vec<(String, f64)> = aggregated.into_iter().collect();
+        costs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        costs
+    }
+
+    pub fn aggregate_tokens_by_model(
+        model_tokens: &std::collections::HashMap<String, TokenStats>,
+    ) -> std::collections::HashMap<String, TokenStats> {
+        let mut aggregated: HashMap<String, TokenStats> = HashMap::new();
+
+        for (model, tokens) in model_tokens {
+            if let Some(simplified) = Self::simplify_model_name(model) {
+                let entry = aggregated.entry(simplified).or_default();
+                entry.input_tokens += tokens.input_tokens;
+                entry.output_tokens += tokens.output_tokens;
+                entry.cache_creation_tokens += tokens.cache_creation_tokens;
+                entry.cache_read_tokens += tokens.cache_read_tokens;
+            }
+        }
+
+        aggregated
+    }
+
+    fn simplify_model_name(model: &str) -> Option<String> {
+        if model.starts_with('<') || model.is_empty() {
+            return Some("Other".to_string());
+        }
+        Some(normalize_model_name(model))
+    }
+
+    pub fn get_pricing(&self, model: Option<&str>) -> Option<&ModelPricing> {
+        let model_name = model?;
+
+        for key in &self.sorted_keys {
+            if let Some(pos) = model_name.find(key.as_str()) {
+                let after = &model_name[pos + key.len()..];
+                if Self::is_version_boundary(after) {
+                    return self.pricing.get(key);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn is_version_boundary(after: &str) -> bool {
+        if after.is_empty() {
+            return true;
+        }
+        let Some(rest) = after.strip_prefix('-') else {
+            return false;
+        };
+        let digit_count = rest.chars().take_while(char::is_ascii_digit).count();
+        // 1-3 digits after '-' = version continuation (e.g. "-6", "-45")
+        // 4+ digits = date suffix (e.g. "-20260101")
+        // 0 digits = other suffix, treat as boundary
+        digit_count == 0 || digit_count >= 4
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_known_models_have_pricing() {
+        let calculator = CostCalculator::new();
+        assert!(calculator.get_pricing(Some("claude-sonnet-4")).is_some());
+        assert!(calculator.get_pricing(Some("claude-opus-4-5")).is_some());
+    }
+
+    #[test]
+    fn test_get_pricing_unknown_model() {
+        let calculator = CostCalculator::new();
+        assert!(calculator.get_pricing(Some("unknown-model-xyz")).is_none());
+    }
+
+    #[test]
+    fn test_get_pricing_no_version_fallback() {
+        let calculator = CostCalculator::new();
+        // "claude-sonnet-5" is not defined; must NOT fall back to "claude-sonnet-4"
+        assert!(
+            calculator
+                .get_pricing(Some("claude-sonnet-5-20270101"))
+                .is_none(),
+            "should not fall back to claude-sonnet-4"
+        );
+        // "claude-sonnet-4-6" with date suffix should match
+        assert!(calculator
+            .get_pricing(Some("claude-sonnet-4-6-20260101"))
+            .is_some());
+        // "claude-sonnet-4" with date suffix should still match
+        assert!(calculator
+            .get_pricing(Some("claude-sonnet-4-20250514"))
+            .is_some());
+    }
+
+    #[test]
+    fn test_get_pricing_none() {
+        let calculator = CostCalculator::new();
+        assert!(calculator.get_pricing(None).is_none());
+    }
+
+    #[test]
+    fn test_get_pricing_known_model() {
+        let calculator = CostCalculator::new();
+        let pricing = calculator
+            .get_pricing(Some("claude-opus-4-5-20251101"))
+            .unwrap();
+        assert_eq!(pricing.input_cost_per_mtok, 5.0);
+        assert_eq!(pricing.output_cost_per_mtok, 25.0);
+    }
+
+    #[test]
+    fn test_calculate_cost_unknown_model_returns_none() {
+        let calculator = CostCalculator::new();
+        let tokens = TokenStats {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+        let cost = calculator.calculate_cost(&tokens, Some("unknown-model"));
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn test_calculate_cost_none_model_returns_none() {
+        let calculator = CostCalculator::new();
+        let tokens = TokenStats {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+        let cost = calculator.calculate_cost(&tokens, None);
+        assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn test_calculate_cost_basic() {
+        let calculator = CostCalculator::new();
+        let tokens = TokenStats {
+            input_tokens: 100_000,
+            output_tokens: 100_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+        let cost = calculator
+            .calculate_cost(&tokens, Some("claude-sonnet-4"))
+            .unwrap();
+        // 100K input @ $3/M = $0.30, 100K output @ $15/M = $1.50 → $1.80
+        assert!((cost - 1.80).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_simplify_model_name() {
+        assert_eq!(
+            CostCalculator::simplify_model_name("claude-opus-4-5-20251101"),
+            Some("Opus 4.5".to_string())
+        );
+        assert_eq!(
+            CostCalculator::simplify_model_name("claude-sonnet-4-20250514"),
+            Some("Sonnet 4".to_string())
+        );
+        assert_eq!(
+            CostCalculator::simplify_model_name("claude-3-5-haiku-20241022"),
+            Some("Haiku 3.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_calculate_cost_large_token_count() {
+        let calculator = CostCalculator::new();
+        // Flat rate regardless of token count (no tiered pricing)
+        let tokens = TokenStats {
+            input_tokens: 500_000,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+        let cost = calculator
+            .calculate_cost(&tokens, Some("claude-sonnet-4"))
+            .unwrap();
+        // 500K @ $3/M = $1.50
+        assert!(
+            (cost - 1.50).abs() < 0.01,
+            "Expected ~$1.50, got ${:.4}",
+            cost
+        );
+    }
+
+    #[test]
+    fn test_calculate_cost_with_cache_tokens() {
+        let calculator = CostCalculator::new();
+        let tokens = TokenStats {
+            input_tokens: 100_000,
+            output_tokens: 0,
+            cache_creation_tokens: 50_000,
+            cache_read_tokens: 25_000,
+        };
+        let cost = calculator
+            .calculate_cost(&tokens, Some("claude-sonnet-4"))
+            .unwrap();
+        // input: 100K @ $3/M = $0.30 (input_tokens is already non-cached per API spec)
+        // cache_write: 50K @ $3.75/M = $0.1875
+        // cache_read: 25K @ $0.30/M = $0.0075
+        // Total: ~$0.495
+        assert!(
+            (cost - 0.495).abs() < 0.01,
+            "Expected ~$0.495, got ${:.4}",
+            cost
+        );
+    }
+
+    #[test]
+    fn test_calculate_cost_opus() {
+        let calculator = CostCalculator::new();
+        let tokens = TokenStats {
+            input_tokens: 500_000,
+            output_tokens: 100_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        };
+        let cost = calculator
+            .calculate_cost(&tokens, Some("claude-opus-4-5"))
+            .unwrap();
+        // 500K @ $5/M = $2.50, 100K @ $25/M = $2.50 → total $5.00
+        assert!(
+            (cost - 5.00).abs() < 0.01,
+            "Expected ~$5.00, got ${:.4}",
+            cost
+        );
+    }
+
+    #[test]
+    fn test_simplify_model_name_unknown() {
+        assert_eq!(
+            CostCalculator::simplify_model_name("some-random-model"),
+            Some("Other".to_string())
+        );
+    }
+
+    #[test]
+    fn test_simplify_model_name_empty_and_placeholder() {
+        assert_eq!(
+            CostCalculator::simplify_model_name(""),
+            Some("Other".to_string())
+        );
+        assert_eq!(
+            CostCalculator::simplify_model_name("<unknown>"),
+            Some("Other".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_model_name_future_versions() {
+        assert_eq!(normalize_model_name("claude-opus-4-6-20260101"), "Opus 4.6");
+        assert_eq!(normalize_model_name("claude-sonnet-5-20260101"), "Sonnet 5");
+        assert_eq!(
+            normalize_model_name("claude-haiku-5-1-20260101"),
+            "Haiku 5.1"
+        );
+    }
+
+    #[test]
+    fn test_normalize_model_name_old_naming() {
+        assert_eq!(
+            normalize_model_name("claude-3-7-sonnet-20250219"),
+            "Sonnet 3.7"
+        );
+        assert_eq!(normalize_model_name("claude-3-opus-20240229"), "Opus 3");
+        assert_eq!(
+            normalize_model_name("claude-3-5-haiku-20241022"),
+            "Haiku 3.5"
+        );
+    }
+
+    #[test]
+    fn test_all_defined_models_have_pricing() {
+        let calculator = CostCalculator::new();
+        let expected_models = [
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "claude-opus-4-1",
+            "claude-opus-4",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4",
+            "claude-3-7-sonnet",
+            "claude-3-5-sonnet",
+            "claude-haiku-4-5",
+            "claude-3-5-haiku",
+            "claude-3-haiku",
+        ];
+        for model in expected_models {
+            assert!(
+                calculator.pricing.contains_key(model),
+                "Missing pricing for: {}",
+                model
+            );
+        }
+    }
+}

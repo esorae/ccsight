@@ -1,0 +1,2013 @@
+use std::collections::HashMap;
+
+use chrono::{Local, NaiveDate};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+
+use crate::aggregator::{CostCalculator, DailyGroup, DailyGrouper};
+use crate::conversation::{load_conversation, ConversationBlock, ConversationMessage};
+use crate::infrastructure::FileDiscovery;
+use crate::PeriodFilter;
+
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct CcsightServer {
+    limit: usize,
+    fixed_groups: Option<Vec<DailyGroup>>,
+    tool_router: ToolRouter<Self>,
+}
+
+struct LoadedData {
+    daily_groups: Vec<DailyGroup>,
+    summary_cache: HashMap<PathBuf, Option<String>>,
+    content_index: HashMap<PathBuf, String>,
+}
+
+fn load_fresh_data(limit: usize, need_content_index: bool) -> LoadedData {
+    let files = FileDiscovery::find_jsonl_files_with_limit(limit).unwrap_or_default();
+    let cache = crate::infrastructure::Cache::load().ok();
+    let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &cache);
+    build_loaded_data(daily_groups, need_content_index)
+}
+
+fn build_loaded_data(daily_groups: Vec<DailyGroup>, need_content_index: bool) -> LoadedData {
+    let mut summary_cache = HashMap::new();
+    let mut content_index = HashMap::new();
+
+    for group in &daily_groups {
+        for session in &group.sessions {
+            let path = &session.file_path;
+            if session.summary.is_none() && !summary_cache.contains_key(path) {
+                summary_cache.insert(path.clone(), derive_summary(path));
+            }
+            if need_content_index && !session.is_subagent && !content_index.contains_key(path)
+                && let Ok(messages) = load_conversation(path) {
+                    let text = build_search_text(&messages);
+                    if !text.is_empty() {
+                        content_index.insert(path.clone(), text);
+                    }
+                }
+        }
+    }
+
+    LoadedData {
+        daily_groups,
+        summary_cache,
+        content_index,
+    }
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct StatsParams {
+    #[schemars(description = "Period filter: \"today\", \"week\", \"month\", \"all\" (default). Ignored when start_date is set.")]
+    period: Option<String>,
+    #[schemars(description = "Custom start date (YYYY-MM-DD). Takes priority over period.")]
+    start_date: Option<String>,
+    #[schemars(description = "Custom end date (YYYY-MM-DD). Defaults to today if omitted.")]
+    end_date: Option<String>,
+    #[schemars(description = "Group results by: \"day\" (returns daily breakdown). Omit for totals only. Projects are always included.")]
+    group_by: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SessionsParams {
+    #[schemars(
+        description = "Session ID (first 8 chars) to get detail. When set, returns conversation, tool usage, and files touched."
+    )]
+    session_id: Option<String>,
+    #[schemars(description = "Search keyword (matches project, summary, branch, date)")]
+    query: Option<String>,
+    #[schemars(description = "Filter by project name (partial match)")]
+    project: Option<String>,
+    #[schemars(description = "Filter by exact date (YYYY-MM-DD). For ranges, use date_from/date_to instead.")]
+    date: Option<String>,
+    #[schemars(description = "Start date for range filter (YYYY-MM-DD)")]
+    date_from: Option<String>,
+    #[schemars(description = "End date for range filter (YYYY-MM-DD). Defaults to today.")]
+    date_to: Option<String>,
+    #[schemars(description = "Sort order: \"date\" (default), \"cost\", \"tokens\"")]
+    sort: Option<String>,
+    #[schemars(description = "Maximum number of results (default: 20)")]
+    limit: Option<usize>,
+    #[schemars(
+        description = "Max conversation entries in session_detail. Default: all. Set 0 to omit conversation entirely."
+    )]
+    conversation_limit: Option<usize>,
+    #[schemars(description = "Skip first N conversation entries (for pagination). Use with conversation_limit.")]
+    conversation_offset: Option<usize>,
+    #[schemars(description = "Filter to pinned sessions only")]
+    pinned: Option<bool>,
+}
+
+fn period_to_filter(period: Option<&str>) -> PeriodFilter {
+    match period {
+        Some("today") => PeriodFilter::Today,
+        Some("week") => PeriodFilter::Last7d,
+        Some("month") => PeriodFilter::Last30d,
+        _ => PeriodFilter::All,
+    }
+}
+
+fn filter_groups_by_date_range(
+    groups: &[DailyGroup],
+    start: Option<NaiveDate>,
+    end: Option<NaiveDate>,
+) -> Vec<&DailyGroup> {
+    groups
+        .iter()
+        .filter(|g| {
+            if let Some(s) = start
+                && g.date < s {
+                    return false;
+                }
+            if let Some(e) = end
+                && g.date > e {
+                    return false;
+                }
+            true
+        })
+        .collect()
+}
+
+#[tool_router]
+impl CcsightServer {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            fixed_groups: None,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_groups(daily_groups: Vec<DailyGroup>) -> Self {
+        Self {
+            limit: 0,
+            fixed_groups: Some(daily_groups),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    fn load(&self, need_content_index: bool) -> LoadedData {
+        if let Some(ref groups) = self.fixed_groups {
+            build_loaded_data(groups.clone(), need_content_index)
+        } else {
+            load_fresh_data(self.limit, need_content_index)
+        }
+    }
+
+    #[tool(description = "Get aggregated usage statistics: cost, tokens (input/output/cache), model breakdown, projects, hourly patterns, tool usage, languages. Use group_by=day for daily breakdown.")]
+    fn stats(
+        &self,
+        Parameters(params): Parameters<StatsParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (start, end) = if let Some(ref sd) = params.start_date {
+            let s = sd.parse::<NaiveDate>().ok();
+            let e = params
+                .end_date
+                .as_deref()
+                .and_then(|d| d.parse::<NaiveDate>().ok());
+            (s, e)
+        } else {
+            let filter = period_to_filter(params.period.as_deref());
+            filter.date_range()
+        };
+        let data = self.load(false);
+        let filtered = filter_groups_by_date_range(&data.daily_groups, start, end);
+
+        let calculator = CostCalculator::global();
+        let mut total_cost = 0.0;
+        let mut total_input = 0u64;
+        let mut total_output = 0u64;
+        let mut session_count = 0usize;
+        let mut model_agg: HashMap<String, (f64, u64)> = HashMap::new();
+        let mut project_agg: HashMap<String, (usize, u64, f64)> = HashMap::new();
+        let mut hourly_agg: HashMap<u8, u64> = HashMap::new();
+        let group_by = params.group_by.as_deref();
+        let mut daily_agg: HashMap<NaiveDate, (f64, usize, u64)> = HashMap::new();
+        let mut total_cache_creation = 0u64;
+        let mut total_cache_read = 0u64;
+        let mut tool_counts: HashMap<String, usize> = HashMap::new();
+        let mut lang_counts: HashMap<String, usize> = HashMap::new();
+
+        for group in &filtered {
+            for session in &group.sessions {
+                let mut session_cost = 0.0;
+                for (model, tokens) in &session.day_tokens_by_model {
+                    let cost = calculator.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
+                    session_cost += cost;
+                    total_cost += cost;
+                    total_cache_creation += tokens.cache_creation_tokens;
+                    total_cache_read += tokens.cache_read_tokens;
+                    let entry = model_agg
+                        .entry(crate::aggregator::normalize_model_name(model))
+                        .or_default();
+                    entry.0 += cost;
+                    entry.1 += tokens.work_tokens();
+                }
+
+                total_input += session.day_input_tokens;
+                total_output += session.day_output_tokens;
+
+                if session.is_subagent {
+                    continue;
+                }
+
+                session_count += 1;
+
+                if group_by == Some("day") {
+                    let day = daily_agg.entry(group.date).or_default();
+                    day.0 += session_cost;
+                    day.1 += 1;
+                    day.2 += session.day_input_tokens + session.day_output_tokens;
+                }
+
+                let proj = project_agg.entry(session.project_name.clone()).or_default();
+                proj.0 += 1;
+                proj.1 += session.day_input_tokens + session.day_output_tokens;
+                proj.2 += session_cost;
+
+                for (hour, tokens) in &session.day_hourly_work_tokens {
+                    *hourly_agg.entry(*hour).or_default() += tokens;
+                }
+
+                for (tool, count) in &session.day_tool_usage {
+                    *tool_counts.entry(tool.clone()).or_default() += count;
+                }
+                for (lang, count) in &session.day_language_usage {
+                    *lang_counts.entry(lang.clone()).or_default() += count;
+                }
+            }
+        }
+
+        let mut model_breakdown: Vec<serde_json::Value> = model_agg
+            .into_iter()
+            .map(|(model, (cost, tokens))| {
+                serde_json::json!({
+                    "model": model,
+                    "cost_usd": (cost * 100.0).round() / 100.0,
+                    "tokens": tokens,
+                })
+            })
+            .collect();
+        model_breakdown.sort_by(|a, b| {
+            b["cost_usd"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&a["cost_usd"].as_f64().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut projects: Vec<serde_json::Value> = project_agg
+            .into_iter()
+            .map(|(project, (sessions, work_tokens, cost))| {
+                serde_json::json!({
+                    "project": project,
+                    "sessions": sessions,
+                    "work_tokens": work_tokens,
+                    "cost_usd": (cost * 100.0).round() / 100.0,
+                })
+            })
+            .collect();
+        projects.sort_by(|a, b| {
+            b["cost_usd"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&a["cost_usd"].as_f64().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut hourly_pattern: HashMap<String, u64> = HashMap::new();
+        for (hour, tokens) in &hourly_agg {
+            hourly_pattern.insert(hour.to_string(), *tokens);
+        }
+
+        let today = Local::now().date_naive();
+        let period_label = if params.start_date.is_some() {
+            "custom"
+        } else {
+            params.period.as_deref().unwrap_or("all")
+        };
+        let date_range = match (start, end) {
+            (Some(s), Some(e)) => serde_json::json!({"start": s.to_string(), "end": e.to_string()}),
+            (Some(s), None) => {
+                serde_json::json!({"start": s.to_string(), "end": today.to_string()})
+            }
+            _ => serde_json::json!(null),
+        };
+
+        let cache_hit_rate = if total_input + total_cache_read > 0 {
+            (total_cache_read as f64 / (total_input + total_cache_read) as f64 * 1000.0).round()
+                / 10.0
+        } else {
+            0.0
+        };
+
+        let total_tool_calls: usize = tool_counts.values().sum();
+        let mut top_tools: Vec<serde_json::Value> = tool_counts
+            .into_iter()
+            .map(|(tool, count)| serde_json::json!({"tool": tool, "count": count}))
+            .collect();
+        top_tools.sort_by(|a, b| {
+            b["count"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["count"].as_u64().unwrap_or(0))
+        });
+        top_tools.truncate(10);
+
+        let mut languages: Vec<serde_json::Value> = lang_counts
+            .into_iter()
+            .map(|(lang, count)| serde_json::json!({"language": lang, "count": count}))
+            .collect();
+        languages.sort_by(|a, b| {
+            b["count"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["count"].as_u64().unwrap_or(0))
+        });
+
+        let mut result = serde_json::json!({
+            "period": period_label,
+            "date_range": date_range,
+            "total_cost_usd": (total_cost * 100.0).round() / 100.0,
+            "total_sessions": session_count,
+            "tokens": {
+                "input": total_input,
+                "output": total_output,
+                "cache_creation": total_cache_creation,
+                "cache_read": total_cache_read,
+                "total_work": total_input + total_output,
+            },
+            "cache_hit_rate_pct": cache_hit_rate,
+            "model_breakdown": model_breakdown,
+            "projects": projects,
+            "hourly_pattern": hourly_pattern,
+            "tool_calls": total_tool_calls,
+            "top_tools": top_tools,
+            "languages": languages,
+        });
+
+        if group_by == Some("day") {
+            let mut daily: Vec<serde_json::Value> = daily_agg
+                .into_iter()
+                .map(|(date, (cost, sessions, tokens))| {
+                    serde_json::json!({
+                        "date": date.to_string(),
+                        "cost_usd": (cost * 100.0).round() / 100.0,
+                        "sessions": sessions,
+                        "work_tokens": tokens,
+                    })
+                })
+                .collect();
+            daily.sort_by(|a, b| a["date"].as_str().cmp(&b["date"].as_str()));
+            result["daily"] = serde_json::json!(daily);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(description = "Search/list sessions, or get session detail. With session_id: returns conversation (user+assistant), tool usage, files touched. Without: lists sessions filtered by query/project/date with sort and date range options.")]
+    fn sessions(
+        &self,
+        Parameters(params): Parameters<SessionsParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let need_content = params.session_id.is_none() && params.query.is_some();
+        let data = self.load(need_content);
+
+        if let Some(ref sid) = params.session_id {
+            return Self::session_detail_inner_with_data(
+                &data,
+                sid,
+                params.date.as_deref(),
+                params.conversation_limit,
+                params.conversation_offset,
+            );
+        }
+
+        let limit = params.limit.unwrap_or(20);
+        let calculator = CostCalculator::global();
+        let mut sessions_out: Vec<serde_json::Value> = Vec::new();
+
+        let date_exact = params.date.as_deref().and_then(|d| d.parse::<NaiveDate>().ok());
+        let date_from = params
+            .date_from
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok());
+        let date_to = params
+            .date_to
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok());
+
+        let date_matches = |group_date: NaiveDate| -> bool {
+            if let Some(exact) = date_exact {
+                return group_date == exact;
+            }
+            if let Some(from) = date_from
+                && group_date < from {
+                    return false;
+                }
+            if let Some(to) = date_to
+                && group_date > to {
+                    return false;
+                }
+            true
+        };
+
+        let pins = if params.pinned == Some(true) {
+            Some(crate::pins::Pins::load().unwrap_or_else(|_| crate::pins::Pins::empty()))
+        } else {
+            None
+        };
+
+        let should_include =
+            |group: &DailyGroup, session: &crate::aggregator::SessionInfo| -> bool {
+                if !date_matches(group.date) {
+                    return false;
+                }
+                if let Some(ref project) = params.project
+                    && !session
+                        .project_name
+                        .to_lowercase()
+                        .contains(&project.to_lowercase())
+                    {
+                        return false;
+                    }
+                if let Some(ref p) = pins
+                    && !p.is_pinned(&session.file_path) {
+                        return false;
+                    }
+                true
+            };
+
+        for group in &data.daily_groups {
+            for session in &group.sessions {
+                if session.is_subagent {
+                    continue;
+                }
+                if !should_include(group, session) {
+                    continue;
+                }
+                let mut json = build_session_json(group.date, session, calculator, &data.summary_cache);
+                let auto = json["summary"]
+                    .as_str()
+                    .is_some_and(|s| AUTO_PREFIXES.iter().any(|p| s.starts_with(p)));
+                if auto {
+                    json["auto"] = serde_json::json!(true);
+                }
+                if let Some(ref query) = params.query {
+                    let q = query.to_lowercase();
+                    let meta_match = session.project_name.to_lowercase().contains(&q)
+                        || json["summary"]
+                            .as_str()
+                            .is_some_and(|s| s.to_lowercase().contains(&q))
+                        || session
+                            .git_branch
+                            .as_deref()
+                            .is_some_and(|b| b.to_lowercase().contains(&q))
+                        || group.date.to_string().contains(&q);
+                    let content_match = !meta_match
+                        && data
+                            .content_index
+                            .get(&session.file_path)
+                            .is_some_and(|text| text.contains(&q));
+                    if !meta_match && !content_match {
+                        continue;
+                    }
+                    if content_match {
+                        if let Some(text) = data.content_index.get(&session.file_path) {
+                            let snippet = extract_content_snippet(text, &q, 80);
+                            json["match_snippet"] = serde_json::json!(snippet);
+                        }
+                        if let Ok(msgs) = load_conversation(&session.file_path) {
+                            let conv = extract_conversation(&msgs);
+                            if let Some(idx) = conv.iter().position(|c| {
+                                c["text"]
+                                    .as_str()
+                                    .is_some_and(|t| t.to_lowercase().contains(&q))
+                            }) {
+                                json["match_offset"] = serde_json::json!(idx);
+                            }
+                        }
+                    }
+                }
+                sessions_out.push(json);
+            }
+        }
+
+        match params.sort.as_deref() {
+            Some("cost") => sessions_out.sort_by(|a, b| {
+                b["cost_usd"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a["cost_usd"].as_f64().unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            Some("tokens") => sessions_out.sort_by(|a, b| {
+                let ta = a["tokens"]["input"].as_u64().unwrap_or(0)
+                    + a["tokens"]["output"].as_u64().unwrap_or(0);
+                let tb = b["tokens"]["input"].as_u64().unwrap_or(0)
+                    + b["tokens"]["output"].as_u64().unwrap_or(0);
+                tb.cmp(&ta)
+            }),
+            _ => {}
+        }
+
+        sessions_out.truncate(limit);
+
+        let result = serde_json::json!({
+            "count": sessions_out.len(),
+            "sessions": sessions_out,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap_or_default(),
+        )]))
+    }
+}
+
+impl CcsightServer {
+    fn session_detail_inner_with_data(
+        data: &LoadedData,
+        session_id: &str,
+        date_str: Option<&str>,
+        conv_limit: Option<usize>,
+        conv_offset: Option<usize>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let date_filter = date_str.and_then(|d| d.parse::<NaiveDate>().ok());
+
+        let found = data
+            .daily_groups
+            .iter()
+            .filter(|g| date_filter.is_none() || Some(g.date) == date_filter)
+            .flat_map(|g| g.sessions.iter().map(move |s| (g.date, s)))
+            .find(|(_, s)| {
+                s.file_path
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(session_id))
+            });
+
+        let Some((date, session)) = found else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::json!({"error": "Session not found"}).to_string(),
+            )]));
+        };
+
+        let calculator = CostCalculator::global();
+        let session_json = build_session_json(date, session, calculator, &data.summary_cache);
+
+        let messages = load_conversation(&session.file_path).unwrap_or_default();
+        let files_touched = extract_files_touched(&messages);
+
+        let max_conv = conv_limit.unwrap_or(usize::MAX);
+        let offset = conv_offset.unwrap_or(0);
+        let conversation_full = extract_conversation(&messages);
+        let total = conversation_full.len();
+        let conversation = if max_conv == 0 {
+            vec![]
+        } else if offset > 0 {
+            let start = offset.min(total);
+            let end = (start + max_conv).min(total);
+            conversation_full[start..end].to_vec()
+        } else if total <= max_conv {
+            conversation_full
+        } else {
+            let head = max_conv * 2 / 3;
+            let tail = max_conv - head;
+            let mut v = conversation_full[..head].to_vec();
+            v.push(serde_json::json!({
+                "role": "...",
+                "text": format!("({} entries omitted. Use conversation_offset to paginate, e.g. offset={} limit={})", total - head - tail, head, max_conv),
+            }));
+            v.extend_from_slice(&conversation_full[total - tail..]);
+            v
+        };
+
+        let result = serde_json::json!({
+            "session": session_json,
+            "conversation": conversation,
+            "conversation_total": total,
+            "tool_usage": session.day_tool_usage,
+            "files_touched": files_touched,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap_or_default(),
+        )]))
+    }
+}
+
+fn clean_summary(text: &str) -> String {
+    let text = text.trim();
+    if text.starts_with("Implement the following plan:") || text.starts_with("/plan") {
+        for line in text.lines().skip(1) {
+            let line = line.trim();
+            if let Some(title) = line.strip_prefix("# ") {
+                return truncate(title.trim(), 120);
+            }
+            if !line.is_empty() && !line.starts_with('#') && line.len() > 5 {
+                return truncate(line, 120);
+            }
+        }
+    }
+    truncate(text, 120)
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    let truncated: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn extract_content_snippet(text: &str, query: &str, max_len: usize) -> String {
+    if let Some(byte_pos) = text.find(query) {
+        let chars: Vec<char> = text.chars().collect();
+        let char_pos = text[..byte_pos].chars().count();
+        let query_chars = query.chars().count();
+        let start = char_pos.saturating_sub(max_len / 2);
+        let end = (char_pos + query_chars + max_len / 2).min(chars.len());
+        let mut snippet = String::new();
+        if start > 0 {
+            snippet.push_str("...");
+        }
+        snippet.extend(&chars[start..end]);
+        if end < chars.len() {
+            snippet.push_str("...");
+        }
+        snippet
+    } else {
+        text.chars().take(max_len).collect()
+    }
+}
+
+fn build_search_text(messages: &[ConversationMessage]) -> String {
+    let mut parts = Vec::new();
+    for msg in messages {
+        if msg.role != "user" && msg.role != "assistant" {
+            continue;
+        }
+        for block in &msg.blocks {
+            match block {
+                ConversationBlock::Text(t) => {
+                    let t = t.trim();
+                    if !t.is_empty() && !t.starts_with('<') {
+                        parts.push(t.to_string());
+                    }
+                }
+                ConversationBlock::ToolUse {
+                    name,
+                    input_summary,
+                } => {
+                    if !input_summary.is_empty() {
+                        parts.push(format!("{name}:{input_summary}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.join(" ").to_lowercase()
+}
+
+fn extract_conversation(messages: &[ConversationMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .filter_map(|msg| {
+            let text: String = msg
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ConversationBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() {
+                return None;
+            }
+            let max_len = if msg.role == "user" { 300 } else { 200 };
+            Some(serde_json::json!({
+                "role": msg.role,
+                "time": msg.timestamp,
+                "text": truncate(&text, max_len),
+            }))
+        })
+        .collect()
+}
+
+fn extract_files_touched(messages: &[ConversationMessage]) -> Vec<String> {
+    let mut files = std::collections::HashSet::new();
+    for msg in messages {
+        for block in &msg.blocks {
+            if let ConversationBlock::ToolUse {
+                name,
+                input_summary,
+            } = block
+                && matches!(name.as_str(), "Read" | "Edit" | "Write" | "MultiEdit")
+                    && !input_summary.is_empty()
+                {
+                    files.insert(input_summary.clone());
+                }
+        }
+    }
+    let mut sorted: Vec<String> = files.into_iter().collect();
+    sorted.sort();
+    sorted
+}
+
+const AUTO_PREFIXES: &[&str] = &[
+    "You are a rule generator",
+    "Generate a git commit message",
+];
+
+fn derive_summary(file_path: &std::path::Path) -> Option<String> {
+    use crate::domain::EntryType;
+    use crate::parser::JsonlParser;
+
+    let entries = JsonlParser::parse_file(file_path).ok()?;
+
+    for entry in entries.iter().take(50) {
+        if entry.entry_type != EntryType::User {
+            continue;
+        }
+        let message = entry.message.as_ref()?;
+        let text = message.content.extract_text();
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('<') || text.starts_with('[') {
+            continue;
+        }
+        if AUTO_PREFIXES.iter().any(|p| text.starts_with(p)) {
+            continue;
+        }
+        return Some(clean_summary(text));
+    }
+    None
+}
+
+fn build_session_json(
+    date: NaiveDate,
+    session: &crate::aggregator::SessionInfo,
+    calculator: &CostCalculator,
+    summary_cache: &HashMap<PathBuf, Option<String>>,
+) -> serde_json::Value {
+    let mut cost = 0.0;
+    let mut cache_creation = 0u64;
+    let mut cache_read = 0u64;
+    for (model, tokens) in &session.day_tokens_by_model {
+        cost += calculator.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
+        cache_creation += tokens.cache_creation_tokens;
+        cache_read += tokens.cache_read_tokens;
+    }
+
+    let first_local = session.day_first_timestamp.with_timezone(&Local);
+    let last_local = session.day_last_timestamp.with_timezone(&Local);
+    let time_range = format!(
+        "{}–{}",
+        first_local.format("%H:%M"),
+        last_local.format("%H:%M")
+    );
+    let duration_mins = (session.day_last_timestamp - session.day_first_timestamp).num_minutes();
+
+    let session_id = session
+        .file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .chars()
+        .take(8)
+        .collect::<String>();
+
+    let model_display = session
+        .model
+        .as_deref()
+        .map(crate::aggregator::normalize_model_name)
+        .unwrap_or_default();
+
+    let summary = session.summary.clone().or_else(|| {
+        summary_cache
+            .get(&session.file_path)
+            .and_then(Clone::clone)
+    });
+
+    serde_json::json!({
+        "session_id": session_id,
+        "date": date.to_string(),
+        "time": time_range,
+        "project": session.project_name,
+        "model": model_display,
+        "tokens": {
+            "input": session.day_input_tokens,
+            "output": session.day_output_tokens,
+            "cache_creation": cache_creation,
+            "cache_read": cache_read,
+        },
+        "cost_usd": (cost * 100.0).round() / 100.0,
+        "summary": summary,
+        "git_branch": session.git_branch,
+        "duration_mins": duration_mins,
+    })
+}
+
+#[tool_handler]
+impl ServerHandler for CcsightServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: Default::default(),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "ccsight".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: None,
+                description: None,
+                icons: None,
+                website_url: None,
+            },
+            instructions: Some(
+                "Claude Code usage analytics. Use 'stats' for aggregated metrics, 'sessions' to search sessions.".to_string(),
+            ),
+        }
+    }
+}
+
+pub async fn run_mcp_server(limit: usize) -> anyhow::Result<()> {
+    let server = CcsightServer::new(limit);
+    let service = server.serve(rmcp::transport::stdio()).await?;
+    service.waiting().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::test_helpers::helpers::{make_daily_group, make_session, make_session_with_tokens};
+
+    struct TempFile(PathBuf);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    impl TempFile {
+        fn new(prefix: &str) -> Self {
+            let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!("{prefix}_{id}.jsonl")))
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn write_jsonl(&self, entries: &[serde_json::Value]) {
+            let mut f = std::fs::File::create(&self.0).unwrap();
+            for e in entries {
+                writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+            }
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).ok();
+        }
+    }
+
+    fn extract_json(result: &CallToolResult) -> serde_json::Value {
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => &t.text,
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn call_stats(server: &CcsightServer, period: Option<&str>) -> serde_json::Value {
+        let params = StatsParams {
+            period: period.map(String::from),
+            start_date: None,
+            end_date: None,
+            group_by: None,
+        };
+        extract_json(&server.stats(Parameters(params)).unwrap())
+    }
+
+    fn call_stats_range(
+        server: &CcsightServer,
+        start: &str,
+        end: Option<&str>,
+    ) -> serde_json::Value {
+        let params = StatsParams {
+            period: None,
+            start_date: Some(start.to_string()),
+            end_date: end.map(String::from),
+            group_by: None,
+        };
+        extract_json(&server.stats(Parameters(params)).unwrap())
+    }
+
+    fn call_sessions(
+        server: &CcsightServer,
+        query: Option<&str>,
+        project: Option<&str>,
+        date: Option<&str>,
+        limit: Option<usize>,
+    ) -> serde_json::Value {
+        let params = SessionsParams {
+            session_id: None,
+            query: query.map(String::from),
+            project: project.map(String::from),
+            date: date.map(String::from),
+            date_from: None,
+            date_to: None,
+            sort: None,
+            limit,
+            conversation_limit: None,
+            conversation_offset: None,
+            pinned: None,
+        };
+        extract_json(&server.sessions(Parameters(params)).unwrap())
+    }
+
+    fn call_session_detail(
+        server: &CcsightServer,
+        session_id: &str,
+        date: Option<&str>,
+    ) -> serde_json::Value {
+        let params = SessionsParams {
+            session_id: Some(session_id.to_string()),
+            query: None,
+            project: None,
+            date: date.map(String::from),
+            date_from: None,
+            date_to: None,
+            sort: None,
+            limit: None,
+            conversation_limit: None,
+            conversation_offset: None,
+            pinned: None,
+        };
+        extract_json(&server.sessions(Parameters(params)).unwrap())
+    }
+
+    fn make_test_groups() -> Vec<DailyGroup> {
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let last_week = today - chrono::Duration::days(8);
+
+        vec![
+            make_daily_group(
+                today,
+                vec![
+                    make_session_with_tokens("~/projects/app-a", 100_000, 50_000, "claude-sonnet-4-20250514"),
+                    {
+                        let mut s = make_session_with_tokens("~/projects/other", 50_000, 25_000, "claude-sonnet-4-20250514");
+                        s.summary = Some("Fix login bug".to_string());
+                        s.git_branch = Some("fix/login".to_string());
+                        s
+                    },
+                ],
+            ),
+            make_daily_group(
+                yesterday,
+                vec![make_session_with_tokens("~/projects/app-a", 80_000, 40_000, "claude-opus-4-5-20251101")],
+            ),
+            make_daily_group(
+                last_week,
+                vec![make_session_with_tokens("~/projects/old-project", 30_000, 10_000, "claude-sonnet-4-20250514")],
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_period_to_filter_mappings() {
+        assert_eq!(period_to_filter(Some("today")), PeriodFilter::Today);
+        assert_eq!(period_to_filter(Some("week")), PeriodFilter::Last7d);
+        assert_eq!(period_to_filter(Some("month")), PeriodFilter::Last30d);
+        assert_eq!(period_to_filter(Some("all")), PeriodFilter::All);
+        assert_eq!(period_to_filter(None), PeriodFilter::All);
+        assert_eq!(period_to_filter(Some("unknown")), PeriodFilter::All);
+    }
+
+    #[test]
+    fn test_filter_groups_by_date_range_no_filter() {
+        let groups = make_test_groups();
+        let filtered = filter_groups_by_date_range(&groups, None, None);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_filter_groups_by_date_range_start_only() {
+        let groups = make_test_groups();
+        let today = Local::now().date_naive();
+        let filtered = filter_groups_by_date_range(&groups, Some(today), None);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].date, today);
+    }
+
+    #[test]
+    fn test_filter_groups_by_date_range_start_and_end() {
+        let groups = make_test_groups();
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let filtered = filter_groups_by_date_range(&groups, Some(yesterday), Some(today));
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_groups_empty_result() {
+        let groups = make_test_groups();
+        let future = Local::now().date_naive() + chrono::Duration::days(30);
+        let filtered = filter_groups_by_date_range(&groups, Some(future), None);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_json_fields() {
+        let session = make_session_with_tokens("~/projects/myapp", 100_000, 50_000, "claude-sonnet-4-20250514");
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        let calculator = CostCalculator::global();
+
+        let json = build_session_json(date, &session, calculator, &HashMap::new());
+
+        assert_eq!(json["date"], "2026-03-19");
+        assert_eq!(json["project"], "~/projects/myapp");
+        assert_eq!(json["model"], "Sonnet 4");
+        assert_eq!(json["tokens"]["input"], 100_000);
+        assert_eq!(json["tokens"]["output"], 50_000);
+        assert!(json["cost_usd"].as_f64().unwrap() > 0.0);
+        assert!(json["duration_mins"].is_number());
+        assert!(json["time"].is_string());
+    }
+
+    #[test]
+    fn test_build_session_json_with_summary_and_branch() {
+        let mut session = make_session("~/projects/app", Some("Added MCP support"), Some("feature/mcp"));
+        session.model = Some("claude-sonnet-4-20250514".to_string());
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
+
+        assert_eq!(json["summary"], "Added MCP support");
+        assert_eq!(json["git_branch"], "feature/mcp");
+    }
+
+    #[test]
+    fn test_build_session_json_null_optional_fields() {
+        let session = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
+
+        assert!(json["summary"].is_null());
+        assert!(json["git_branch"].is_null());
+    }
+
+    #[test]
+    fn test_build_session_json_session_id_truncated() {
+        let mut session = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        session.file_path = std::path::PathBuf::from("/tmp/abcdefghijklmnop.jsonl");
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
+
+        assert_eq!(json["session_id"].as_str().unwrap().len(), 8);
+        assert_eq!(json["session_id"], "abcdefgh");
+    }
+
+    #[test]
+    fn test_stats_all_period() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_stats(&server, None);
+
+        assert_eq!(json["period"], "all");
+        assert_eq!(json["total_sessions"], 4);
+        assert!(json["total_cost_usd"].as_f64().unwrap() > 0.0);
+        assert!(json["tokens"]["input"].as_u64().unwrap() > 0);
+        assert!(json["tokens"]["output"].as_u64().unwrap() > 0);
+        assert!(!json["model_breakdown"].as_array().unwrap().is_empty());
+        assert!(!json["projects"].as_array().unwrap().is_empty());
+        assert!(json["projects"][0]["cost_usd"].as_f64().is_some());
+        assert!(json["cache_hit_rate_pct"].as_f64().is_some());
+        assert!(json["tokens"]["cache_creation"].as_u64().is_some());
+        assert!(json["tokens"]["cache_read"].as_u64().is_some());
+    }
+
+    #[test]
+    fn test_stats_today_period() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_stats(&server, Some("today"));
+
+        assert_eq!(json["period"], "today");
+        assert_eq!(json["total_sessions"], 2);
+    }
+
+    #[test]
+    fn test_stats_week_period() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_stats(&server, Some("week"));
+
+        assert_eq!(json["period"], "week");
+        assert_eq!(json["total_sessions"], 3, "should include today + yesterday but not last_week");
+    }
+
+    #[test]
+    fn test_stats_subagent_cost_included_sessions_excluded() {
+        let today = Local::now().date_naive();
+        let mut subagent = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        subagent.is_subagent = true;
+
+        let groups = vec![make_daily_group(
+            today,
+            vec![
+                make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514"),
+                subagent,
+            ],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_stats(&server, None);
+
+        assert_eq!(json["total_sessions"], 1, "session count excludes subagents");
+        assert_eq!(json["tokens"]["input"], 2000, "token counts include subagents");
+        assert!(json["total_cost_usd"].as_f64().unwrap() > 0.0, "cost includes subagents");
+
+        let single = call_stats(&CcsightServer::from_groups(vec![make_daily_group(
+            today,
+            vec![make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514")],
+        )]), None);
+        let cost_without = single["total_cost_usd"].as_f64().unwrap();
+        let cost_with = json["total_cost_usd"].as_f64().unwrap();
+        assert!(cost_with > cost_without, "cost with subagent should be higher");
+    }
+
+    #[test]
+    fn test_stats_projects_returns_all() {
+        let today = Local::now().date_naive();
+        let sessions: Vec<_> = (0..8)
+            .map(|i| make_session_with_tokens(&format!("~/projects/project-{i}"), 1000, 500, "claude-sonnet-4-20250514"))
+            .collect();
+        let server = CcsightServer::from_groups(vec![make_daily_group(today, sessions)]);
+        let json = call_stats(&server, None);
+
+        assert_eq!(json["projects"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn test_stats_empty_groups() {
+        let server = CcsightServer::from_groups(vec![]);
+        let json = call_stats(&server, None);
+
+        assert_eq!(json["total_sessions"], 0);
+        assert_eq!(json["total_cost_usd"], 0.0);
+        assert_eq!(json["tokens"]["input"], 0);
+    }
+
+    #[test]
+    fn test_stats_model_breakdown_sorted_by_cost() {
+        let today = Local::now().date_naive();
+        let groups = vec![make_daily_group(
+            today,
+            vec![
+                make_session_with_tokens("~/projects/app", 100_000, 50_000, "claude-opus-4-5-20251101"),
+                make_session_with_tokens("~/projects/app", 100_000, 50_000, "claude-sonnet-4-20250514"),
+            ],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_stats(&server, None);
+
+        let breakdown = json["model_breakdown"].as_array().unwrap();
+        assert!(breakdown.len() >= 2);
+        let first_cost = breakdown[0]["cost_usd"].as_f64().unwrap();
+        let second_cost = breakdown[1]["cost_usd"].as_f64().unwrap();
+        assert!(first_cost >= second_cost);
+    }
+
+    #[test]
+    fn test_stats_hourly_work_tokens() {
+        let today = Local::now().date_naive();
+        let mut session = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        session.day_hourly_work_tokens.insert(10, 5000);
+        session.day_hourly_work_tokens.insert(14, 3000);
+
+        let server = CcsightServer::from_groups(vec![make_daily_group(today, vec![session])]);
+        let json = call_stats(&server, None);
+
+        let hourly = json["hourly_pattern"].as_object().unwrap();
+        assert_eq!(hourly["10"], 5000);
+        assert_eq!(hourly["14"], 3000);
+    }
+
+    #[test]
+    fn test_stats_date_range_for_all() {
+        let server = CcsightServer::from_groups(vec![]);
+        let json = call_stats(&server, Some("all"));
+        assert!(json["date_range"].is_null());
+    }
+
+    #[test]
+    fn test_stats_date_range_for_today() {
+        let server = CcsightServer::from_groups(vec![]);
+        let json = call_stats(&server, Some("today"));
+        let today = Local::now().date_naive().to_string();
+        assert_eq!(json["date_range"]["start"], today);
+        assert_eq!(json["date_range"]["end"], today);
+    }
+
+    #[test]
+    fn test_stats_tokens_total_work_equals_input_plus_output() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_stats(&server, None);
+
+        let input = json["tokens"]["input"].as_u64().unwrap();
+        let output = json["tokens"]["output"].as_u64().unwrap();
+        let total_work = json["tokens"]["total_work"].as_u64().unwrap();
+        assert_eq!(total_work, input + output);
+    }
+
+    #[test]
+    fn test_sessions_no_filter() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_sessions(&server, None, None, None, None);
+
+        assert_eq!(json["count"], 4);
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_sessions_project_filter() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_sessions(&server, None, Some("app-a"), None, None);
+
+        assert_eq!(json["count"], 2);
+        for s in json["sessions"].as_array().unwrap() {
+            assert!(s["project"].as_str().unwrap().contains("app-a"));
+        }
+    }
+
+    #[test]
+    fn test_sessions_date_filter() {
+        let today = Local::now().date_naive();
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_sessions(&server, None, None, Some(&today.to_string()), None);
+
+        assert_eq!(json["count"], 2);
+        for s in json["sessions"].as_array().unwrap() {
+            assert_eq!(s["date"].as_str().unwrap(), today.to_string());
+        }
+    }
+
+    #[test]
+    fn test_sessions_query_filter() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_sessions(&server, Some("login"), None, None, None);
+
+        assert_eq!(json["count"], 1);
+        assert_eq!(json["sessions"][0]["summary"], "Fix login bug");
+    }
+
+    #[test]
+    fn test_sessions_limit() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_sessions(&server, None, None, None, Some(2));
+        assert_eq!(json["count"], 2);
+    }
+
+    #[test]
+    fn test_sessions_excludes_subagents() {
+        let today = Local::now().date_naive();
+        let mut subagent = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        subagent.is_subagent = true;
+
+        let groups = vec![make_daily_group(
+            today,
+            vec![
+                make_session_with_tokens("~/projects/app", 2000, 1000, "claude-sonnet-4-20250514"),
+                subagent,
+            ],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_sessions(&server, None, None, None, None);
+        assert_eq!(json["count"], 1);
+    }
+
+    #[test]
+    fn test_sessions_empty_groups() {
+        let server = CcsightServer::from_groups(vec![]);
+        let json = call_sessions(&server, None, None, None, None);
+
+        assert_eq!(json["count"], 0);
+        assert!(json["sessions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_sessions_no_match_query() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_sessions(&server, Some("nonexistent-xyz-123"), None, None, None);
+        assert_eq!(json["count"], 0);
+    }
+
+    #[test]
+    fn test_sessions_project_case_insensitive() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_sessions(&server, None, Some("APP-A"), None, None);
+        assert_eq!(json["count"], 2);
+    }
+
+    #[test]
+    fn test_sessions_query_excludes_subagents() {
+        let today = Local::now().date_naive();
+        let mut subagent = make_session("~/projects/app", Some("Fix login bug"), Some("main"));
+        subagent.is_subagent = true;
+        let normal = make_session("~/projects/app", Some("Fix login issue"), Some("main"));
+
+        let groups = vec![make_daily_group(today, vec![normal, subagent])];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_sessions(&server, Some("login"), None, None, None);
+
+        assert_eq!(json["count"], 1, "query results should exclude subagents");
+    }
+
+    #[test]
+    fn test_sessions_query_with_project_filter() {
+        let today = Local::now().date_naive();
+        let groups = vec![make_daily_group(
+            today,
+            vec![
+                make_session("~/projects/app-a", Some("Fix login bug"), None),
+                make_session("~/projects/app-b", Some("Fix login issue"), None),
+            ],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_sessions(&server, Some("login"), Some("app-a"), None, None);
+
+        assert_eq!(json["count"], 1);
+        assert_eq!(json["sessions"][0]["project"], "~/projects/app-a");
+    }
+
+    #[test]
+    fn test_sessions_query_with_date_filter() {
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let groups = vec![
+            make_daily_group(today, vec![make_session("~/projects/app", Some("Fix login today"), None)]),
+            make_daily_group(yesterday, vec![make_session("~/projects/app", Some("Fix login yesterday"), None)]),
+        ];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_sessions(&server, Some("login"), None, Some(&today.to_string()), None);
+
+        assert_eq!(json["count"], 1);
+        assert_eq!(json["sessions"][0]["date"], today.to_string());
+    }
+
+    #[test]
+    fn test_sessions_query_with_limit() {
+        let today = Local::now().date_naive();
+        let groups = vec![make_daily_group(
+            today,
+            vec![
+                make_session("~/projects/app", Some("Fix bug one"), None),
+                make_session("~/projects/app", Some("Fix bug two"), None),
+                make_session("~/projects/app", Some("Fix bug three"), None),
+            ],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_sessions(&server, Some("bug"), None, None, Some(2));
+
+        assert_eq!(json["count"], 2);
+    }
+
+    #[test]
+    fn test_server_info() {
+        let server = CcsightServer::from_groups(vec![]);
+        let info = server.get_info();
+
+        assert_eq!(info.server_info.name, "ccsight");
+        assert!(info.instructions.is_some());
+        assert!(info.instructions.unwrap().contains("stats"));
+    }
+
+    #[test]
+    fn test_session_detail_not_found() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_session_detail(&server, "nonexist", None);
+        assert_eq!(json["error"], "Session not found");
+    }
+
+    #[test]
+    fn test_session_detail_found_by_id() {
+        let today = Local::now().date_naive();
+        let mut session =
+            make_session_with_tokens("~/projects/app", 5000, 2000, "claude-sonnet-4-20250514");
+        session.file_path = std::path::PathBuf::from("/tmp/abcd1234-rest-of-id.jsonl");
+        session.summary = Some("Test summary".to_string());
+        session.day_tool_usage.insert("Read".to_string(), 5);
+        session.day_tool_usage.insert("Edit".to_string(), 3);
+
+        let groups = vec![make_daily_group(today, vec![session])];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_session_detail(&server, "abcd1234", None);
+
+        assert!(json["error"].is_null(), "should find the session");
+        assert_eq!(json["session"]["session_id"], "abcd1234");
+        assert_eq!(json["session"]["project"], "~/projects/app");
+        assert_eq!(json["tool_usage"]["Read"], 5);
+        assert_eq!(json["tool_usage"]["Edit"], 3);
+    }
+
+    #[test]
+    fn test_session_detail_with_date_filter() {
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let mut s1 = make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514");
+        s1.file_path = std::path::PathBuf::from("/tmp/sameid12-today.jsonl");
+        let mut s2 = make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514");
+        s2.file_path = std::path::PathBuf::from("/tmp/sameid12-yesterday.jsonl");
+
+        let groups = vec![
+            make_daily_group(today, vec![s1]),
+            make_daily_group(yesterday, vec![s2]),
+        ];
+        let server = CcsightServer::from_groups(groups);
+
+        let json = call_session_detail(&server, "sameid12", Some(&today.to_string()));
+        assert_eq!(json["session"]["project"], "~/projects/a");
+
+        let json2 = call_session_detail(&server, "sameid12", Some(&yesterday.to_string()));
+        assert_eq!(json2["session"]["project"], "~/projects/b");
+    }
+
+    #[test]
+    fn test_extract_conversation_basic() {
+        let messages = vec![
+            ConversationMessage {
+                role: "user".to_string(),
+                blocks: vec![ConversationBlock::Text(
+                    "Please fix the login bug".to_string(),
+                )],
+                timestamp: Some("10:00:00".to_string()),
+                model: None,
+                tokens: None,
+            },
+            ConversationMessage {
+                role: "assistant".to_string(),
+                blocks: vec![ConversationBlock::Text("I'll fix that.".to_string())],
+                timestamp: Some("10:00:05".to_string()),
+                model: Some("claude-sonnet-4".to_string()),
+                tokens: Some((1000, 500)),
+            },
+            ConversationMessage {
+                role: "user".to_string(),
+                blocks: vec![ConversationBlock::Text("Now add tests".to_string())],
+                timestamp: Some("10:05:00".to_string()),
+                model: None,
+                tokens: None,
+            },
+        ];
+        let conv = extract_conversation(&messages);
+        assert_eq!(conv.len(), 3);
+        assert_eq!(conv[0]["role"], "user");
+        assert!(conv[0]["text"].as_str().unwrap().contains("login bug"));
+        assert_eq!(conv[1]["role"], "assistant");
+        assert!(conv[1]["text"].as_str().unwrap().contains("fix that"));
+        assert_eq!(conv[2]["role"], "user");
+        assert!(conv[2]["text"].as_str().unwrap().contains("add tests"));
+    }
+
+    #[test]
+    fn test_extract_conversation_includes_assistant() {
+        let messages = vec![ConversationMessage {
+            role: "assistant".to_string(),
+            blocks: vec![ConversationBlock::Text("response text".to_string())],
+            timestamp: None,
+            model: None,
+            tokens: None,
+        }];
+        let conv = extract_conversation(&messages);
+        assert_eq!(conv.len(), 1);
+        assert_eq!(conv[0]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_extract_conversation_skips_tool_only_assistant() {
+        let messages = vec![ConversationMessage {
+            role: "assistant".to_string(),
+            blocks: vec![ConversationBlock::ToolUse {
+                name: "Read".to_string(),
+                input_summary: "/tmp/x".to_string(),
+            }],
+            timestamp: None,
+            model: None,
+            tokens: None,
+        }];
+        let conv = extract_conversation(&messages);
+        assert!(conv.is_empty(), "tool-only assistant messages should be skipped");
+    }
+
+    #[test]
+    fn test_extract_conversation_truncates_long_text() {
+        let long_text = "a".repeat(500);
+        let messages = vec![ConversationMessage {
+            role: "user".to_string(),
+            blocks: vec![ConversationBlock::Text(long_text)],
+            timestamp: None,
+            model: None,
+            tokens: None,
+        }];
+        let conv = extract_conversation(&messages);
+        let text = conv[0]["text"].as_str().unwrap();
+        assert!(text.len() <= 304);
+        assert!(text.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_conversation_skips_empty() {
+        let messages = vec![ConversationMessage {
+            role: "user".to_string(),
+            blocks: vec![ConversationBlock::ToolUse {
+                name: "Read".to_string(),
+                input_summary: "/tmp/x".to_string(),
+            }],
+            timestamp: None,
+            model: None,
+            tokens: None,
+        }];
+        let conv = extract_conversation(&messages);
+        assert!(conv.is_empty());
+    }
+
+    #[test]
+    fn test_extract_files_touched() {
+        let messages = vec![ConversationMessage {
+            role: "assistant".to_string(),
+            blocks: vec![
+                ConversationBlock::ToolUse {
+                    name: "Read".to_string(),
+                    input_summary: "/src/main.rs".to_string(),
+                },
+                ConversationBlock::ToolUse {
+                    name: "Edit".to_string(),
+                    input_summary: "/src/lib.rs".to_string(),
+                },
+                ConversationBlock::ToolUse {
+                    name: "Read".to_string(),
+                    input_summary: "/src/main.rs".to_string(),
+                },
+                ConversationBlock::ToolUse {
+                    name: "Bash".to_string(),
+                    input_summary: "cargo test".to_string(),
+                },
+            ],
+            timestamp: None,
+            model: None,
+            tokens: None,
+        }];
+        let files = extract_files_touched(&messages);
+        assert_eq!(files, vec!["/src/lib.rs", "/src/main.rs"]);
+    }
+
+    #[test]
+    fn test_extract_files_touched_empty() {
+        let messages = vec![ConversationMessage {
+            role: "assistant".to_string(),
+            blocks: vec![ConversationBlock::Text("hello".to_string())],
+            timestamp: None,
+            model: None,
+            tokens: None,
+        }];
+        let files = extract_files_touched(&messages);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_stats_custom_date_range_single_day() {
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let groups = vec![
+            make_daily_group(today, vec![make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514")]),
+            make_daily_group(yesterday, vec![make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514")]),
+        ];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_stats_range(&server, &yesterday.to_string(), Some(&yesterday.to_string()));
+
+        assert_eq!(json["period"], "custom");
+        assert_eq!(json["total_sessions"], 1);
+        assert_eq!(json["tokens"]["input"], 2000);
+    }
+
+    #[test]
+    fn test_stats_custom_date_range_overrides_period() {
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let groups = vec![
+            make_daily_group(today, vec![make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514")]),
+            make_daily_group(yesterday, vec![make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514")]),
+        ];
+        let server = CcsightServer::from_groups(groups);
+
+        let params = StatsParams {
+            period: Some("today".to_string()),
+            start_date: Some(yesterday.to_string()),
+            end_date: None,
+            group_by: None,
+        };
+        let json = extract_json(&server.stats(Parameters(params)).unwrap());
+
+        assert_eq!(json["period"], "custom");
+        assert_eq!(json["total_sessions"], 2, "start_date should override period");
+    }
+
+    #[test]
+    fn test_stats_custom_start_date_only() {
+        let today = Local::now().date_naive();
+        let old = today - chrono::Duration::days(30);
+        let groups = vec![
+            make_daily_group(today, vec![make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514")]),
+            make_daily_group(old, vec![make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514")]),
+        ];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_stats_range(&server, &today.to_string(), None);
+
+        assert_eq!(json["total_sessions"], 1, "only today should be included");
+    }
+
+    #[test]
+    fn test_derive_summary_from_file() {
+        let tmp = TempFile::new("ccsight_derive_summary.jsonl");
+        tmp.write_jsonl(&[serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-03-20T10:00:00Z",
+            "message": {"role": "user", "content": "Add MCP server support to the project"}
+        })]);
+        assert_eq!(derive_summary(tmp.path()).as_deref(), Some("Add MCP server support to the project"));
+    }
+
+    #[test]
+    fn test_derive_summary_skips_system_tags() {
+        let tmp = TempFile::new("ccsight_derive_skip_tags.jsonl");
+        tmp.write_jsonl(&[
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:00:00Z",
+                "message": {"role": "user", "content": "<local-command-caveat>system noise</local-command-caveat>"}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:01:00Z",
+                "message": {"role": "user", "content": "Fix the login bug"}
+            }),
+        ]);
+        assert_eq!(derive_summary(tmp.path()).as_deref(), Some("Fix the login bug"));
+    }
+
+    #[test]
+    fn test_derive_summary_no_user_message() {
+        let tmp = TempFile::new("ccsight_derive_no_user.jsonl");
+        tmp.write_jsonl(&[serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-03-20T10:00:00Z",
+            "message": {"role": "assistant", "content": "Hello"}
+        })]);
+        assert!(derive_summary(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn test_derive_summary_truncates_long() {
+        let tmp = TempFile::new("ccsight_derive_long.jsonl");
+        let long = "x".repeat(300);
+        tmp.write_jsonl(&[serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-03-20T10:00:00Z",
+            "message": {"role": "user", "content": long}
+        })]);
+        let result = derive_summary(tmp.path()).unwrap();
+        assert!(result.len() <= 124);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_sessions_date_from_to() {
+        let today = Local::now().date_naive();
+        let d1 = today - chrono::Duration::days(3);
+        let d2 = today - chrono::Duration::days(2);
+        let d3 = today - chrono::Duration::days(1);
+        let groups = vec![
+            make_daily_group(d1, vec![make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514")]),
+            make_daily_group(d2, vec![make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514")]),
+            make_daily_group(d3, vec![make_session_with_tokens("~/projects/c", 3000, 1500, "claude-sonnet-4-20250514")]),
+            make_daily_group(today, vec![make_session_with_tokens("~/projects/d", 4000, 2000, "claude-sonnet-4-20250514")]),
+        ];
+        let server = CcsightServer::from_groups(groups);
+        let params = SessionsParams {
+            session_id: None,
+            query: None,
+            project: None,
+            date: None,
+            date_from: Some(d2.to_string()),
+            date_to: Some(d3.to_string()),
+            sort: None,
+            limit: None,
+            conversation_limit: None,
+            conversation_offset: None,
+            pinned: None,
+        };
+        let json = extract_json(&server.sessions(Parameters(params)).unwrap());
+        assert_eq!(json["count"], 2);
+    }
+
+    #[test]
+    fn test_sessions_sort_by_cost() {
+        let today = Local::now().date_naive();
+        let groups = vec![make_daily_group(
+            today,
+            vec![
+                make_session_with_tokens("~/projects/cheap", 1000, 500, "claude-sonnet-4-20250514"),
+                make_session_with_tokens("~/projects/expensive", 100_000, 50_000, "claude-opus-4-5-20251101"),
+            ],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let params = SessionsParams {
+            session_id: None,
+            query: None,
+            project: None,
+            date: None,
+            date_from: None,
+            date_to: None,
+            sort: Some("cost".to_string()),
+            limit: None,
+            conversation_limit: None,
+            conversation_offset: None,
+            pinned: None,
+        };
+        let json = extract_json(&server.sessions(Parameters(params)).unwrap());
+        let sessions = json["sessions"].as_array().unwrap();
+        assert!(sessions[0]["cost_usd"].as_f64().unwrap() > sessions[1]["cost_usd"].as_f64().unwrap());
+    }
+
+    #[test]
+    fn test_sessions_sort_by_tokens() {
+        let today = Local::now().date_naive();
+        let groups = vec![make_daily_group(
+            today,
+            vec![
+                make_session_with_tokens("~/projects/small", 1000, 500, "claude-sonnet-4-20250514"),
+                make_session_with_tokens("~/projects/large", 100_000, 50_000, "claude-sonnet-4-20250514"),
+            ],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let params = SessionsParams {
+            session_id: None,
+            query: None,
+            project: None,
+            date: None,
+            date_from: None,
+            date_to: None,
+            sort: Some("tokens".to_string()),
+            limit: None,
+            conversation_limit: None,
+            conversation_offset: None,
+            pinned: None,
+        };
+        let json = extract_json(&server.sessions(Parameters(params)).unwrap());
+        let sessions = json["sessions"].as_array().unwrap();
+        let t0 = sessions[0]["tokens"]["input"].as_u64().unwrap() + sessions[0]["tokens"]["output"].as_u64().unwrap();
+        let t1 = sessions[1]["tokens"]["input"].as_u64().unwrap() + sessions[1]["tokens"]["output"].as_u64().unwrap();
+        assert!(t0 > t1);
+    }
+
+    #[test]
+    fn test_session_detail_conversation_truncated() {
+        let today = Local::now().date_naive();
+        let mut session = make_session("~/projects/app", Some("Many messages"), None);
+
+        let tmp = TempFile::new("ccsight_truncation.jsonl");
+        let entries: Vec<serde_json::Value> = (0..30)
+            .map(|i| serde_json::json!({
+                "type": "user",
+                "timestamp": format!("2026-03-20T10:{i:02}:00Z"),
+                "message": {"role": "user", "content": format!("request {i}")}
+            }))
+            .collect();
+        tmp.write_jsonl(&entries);
+        session.file_path = tmp.path().to_path_buf();
+
+        let groups = vec![make_daily_group(today, vec![session])];
+        let server = CcsightServer::from_groups(groups);
+
+        let params = SessionsParams {
+            session_id: Some("ccsight_t".to_string()),
+            query: None,
+            project: None,
+            date: None,
+            date_from: None,
+            date_to: None,
+            sort: None,
+            limit: None,
+            conversation_limit: Some(15),
+            conversation_offset: None,
+            pinned: None,
+        };
+        let json = extract_json(&server.sessions(Parameters(params)).unwrap());
+
+        assert_eq!(json["conversation_total"], 30);
+        let conv = json["conversation"].as_array().unwrap();
+        assert!(conv.len() <= 16, "should be head + omission marker + tail");
+        assert_eq!(conv[0]["text"].as_str().unwrap(), "request 0");
+        assert!(conv.iter().any(|c| c["role"] == "..."), "should have omission marker");
+        let last = conv.last().unwrap();
+        assert_eq!(last["text"].as_str().unwrap(), "request 29");
+    }
+
+    #[test]
+    fn test_query_searches_derived_summary() {
+        let today = Local::now().date_naive();
+        let mut session = make_session("~/projects/app", None, None);
+        session.summary = None;
+
+        let tmp = TempFile::new("ccsight_query_summary.jsonl");
+        tmp.write_jsonl(&[serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-03-20T10:00:00Z",
+            "message": {"role": "user", "content": "Fix the pagination bug in user list"}
+        })]);
+        session.file_path = tmp.path().to_path_buf();
+
+        let groups = vec![make_daily_group(today, vec![session])];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_sessions(&server, Some("pagination"), None, None, None);
+
+        assert_eq!(json["count"], 1, "query should match derived summary");
+    }
+
+    #[test]
+    fn test_clean_summary_extracts_plan_title() {
+        let text = "Implement the following plan:\n\n# Fix user authentication flow\n\n## Context\nsome details";
+        assert_eq!(clean_summary(text), "Fix user authentication flow");
+    }
+
+    #[test]
+    fn test_clean_summary_plain_text() {
+        assert_eq!(clean_summary("Fix the login bug"), "Fix the login bug");
+    }
+
+    #[test]
+    fn test_clean_summary_truncates() {
+        let long = "x".repeat(200);
+        let result = clean_summary(&long);
+        assert!(result.len() <= 124);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_stats_group_by_day() {
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let groups = vec![
+            make_daily_group(today, vec![
+                make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514"),
+                make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514"),
+            ]),
+            make_daily_group(yesterday, vec![
+                make_session_with_tokens("~/projects/c", 3000, 1500, "claude-sonnet-4-20250514"),
+            ]),
+        ];
+        let server = CcsightServer::from_groups(groups);
+        let params = StatsParams {
+            period: None,
+            start_date: None,
+            end_date: None,
+            group_by: Some("day".to_string()),
+        };
+        let json = extract_json(&server.stats(Parameters(params)).unwrap());
+
+        let daily = json["daily"].as_array().unwrap();
+        assert_eq!(daily.len(), 2);
+        assert_eq!(daily[0]["date"].as_str().unwrap(), yesterday.to_string());
+        assert_eq!(daily[1]["date"].as_str().unwrap(), today.to_string());
+        assert_eq!(daily[1]["sessions"], 2);
+        assert!(daily[1]["cost_usd"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_stats_without_group_by_has_no_daily() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let json = call_stats(&server, None);
+        assert!(json.get("daily").is_none());
+    }
+
+    #[test]
+    fn test_query_searches_conversation_content() {
+        let today = Local::now().date_naive();
+        let mut session = make_session("~/projects/app", Some("Setup project"), None);
+
+        let tmp = TempFile::new("ccsight_content_search.jsonl");
+        tmp.write_jsonl(&[
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:00:00Z",
+                "message": {"role": "user", "content": "Setup project"}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:05:00Z",
+                "message": {"role": "user", "content": "The database connection pool is exhausting under load"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-03-20T10:05:30Z",
+                "message": {"role": "assistant", "content": "I'll increase the max pool size and add connection timeout handling."}
+            }),
+        ]);
+        session.file_path = tmp.path().to_path_buf();
+
+        let groups = vec![make_daily_group(today, vec![session])];
+        let server = CcsightServer::from_groups(groups);
+
+        let json = call_sessions(&server, Some("connection pool"), None, None, None);
+
+        assert_eq!(json["count"], 1, "should find session by conversation content");
+        assert!(json["sessions"][0]["match_snippet"].is_string(), "should include match snippet");
+        let snippet = json["sessions"][0]["match_snippet"].as_str().unwrap();
+        assert!(snippet.contains("connection pool"), "snippet should contain the matched term");
+        assert_eq!(
+            json["sessions"][0]["match_offset"], 1,
+            "match_offset should point to the second conversation entry"
+        );
+    }
+
+    #[test]
+    fn test_query_prefers_metadata_over_content() {
+        let today = Local::now().date_naive();
+        let mut session = make_session("~/projects/myproject", Some("Add retry logic to API client"), None);
+
+        let tmp = TempFile::new("ccsight_meta_priority.jsonl");
+        tmp.write_jsonl(&[serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-03-20T10:00:00Z",
+            "message": {"role": "user", "content": "Add retry logic to API client"}
+        })]);
+        session.file_path = tmp.path().to_path_buf();
+
+        let groups = vec![make_daily_group(today, vec![session])];
+        let server = CcsightServer::from_groups(groups);
+
+        let json = call_sessions(&server, Some("retry"), None, None, None);
+
+        assert_eq!(json["count"], 1);
+        assert!(json["sessions"][0].get("match_snippet").is_none(),
+            "metadata match should not have match_snippet");
+    }
+
+    #[test]
+    fn test_extract_content_snippet_basic() {
+        let text = "we need to refactor the database connection pool to handle more concurrent requests";
+        let snippet = extract_content_snippet(text, "connection pool", 30);
+        assert!(snippet.contains("connection pool"));
+    }
+
+    #[test]
+    fn test_extract_content_snippet_at_end() {
+        let text = "the api response parsing failed on edge case with timeout";
+        let snippet = extract_content_snippet(text, "timeout", 20);
+        assert!(snippet.contains("timeout"));
+    }
+
+    #[test]
+    fn test_build_search_text_skips_system_tags() {
+        let messages = vec![
+            ConversationMessage {
+                role: "user".to_string(),
+                blocks: vec![ConversationBlock::Text("<system>noise</system>".to_string())],
+                timestamp: None,
+                model: None,
+                tokens: None,
+            },
+            ConversationMessage {
+                role: "user".to_string(),
+                blocks: vec![ConversationBlock::Text("Add rate limiting to the API endpoints".to_string())],
+                timestamp: None,
+                model: None,
+                tokens: None,
+            },
+        ];
+        let text = build_search_text(&messages);
+        assert!(!text.contains("noise"));
+        assert!(text.contains("rate limiting"));
+    }
+
+    #[test]
+    fn test_build_search_text_includes_tool_names() {
+        let messages = vec![ConversationMessage {
+            role: "assistant".to_string(),
+            blocks: vec![ConversationBlock::ToolUse {
+                name: "Edit".to_string(),
+                input_summary: "/src/config.rs".to_string(),
+            }],
+            timestamp: None,
+            model: None,
+            tokens: None,
+        }];
+        let text = build_search_text(&messages);
+        assert!(text.contains("edit:/src/config.rs"));
+    }
+}
