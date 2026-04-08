@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use chrono::Local;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
@@ -535,7 +535,7 @@ fn compute_search_matches(
 }
 
 pub fn update_pane_search_matches(pane: &mut ConversationPane) {
-    pane.search_matches = compute_search_matches(&pane.rendered, &pane.search_query);
+    pane.search_matches = compute_search_matches(&pane.rendered, &pane.search_input.text);
     pane.search_current = 0;
     if let Some(&first_match) = pane.search_matches.first() {
         pane.scroll = first_match;
@@ -1090,6 +1090,10 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
                 Style::default().fg(theme::DIM),
             ));
         }
+
+    if state.index_build_task.is_some() {
+        spans.push(Span::styled("  ·  indexing...", Style::default().fg(theme::DIM)));
+    }
 
     let title = Paragraph::new(Line::from(spans));
     frame.render_widget(title, area);
@@ -2323,7 +2327,7 @@ fn draw_conversation_pane(
         pane.message_lines = rendered.1.clone();
         pane.rendered = Some((rendered.0, rendered.1, rendered.2, focused_msg_idx));
 
-        if !pane.search_query.is_empty() {
+        if !pane.search_input.text.is_empty() {
             update_pane_search_matches(pane);
         }
 
@@ -2343,7 +2347,7 @@ fn draw_conversation_pane(
 
     let cached = pane.rendered.as_ref()?;
 
-    let search_bar_height = if pane.search_mode || !pane.search_query.is_empty() {
+    let search_bar_height = if pane.search_mode || !pane.search_input.text.is_empty() {
         1
     } else {
         0
@@ -2404,7 +2408,7 @@ fn draw_conversation_pane(
     pane.scroll = pane.scroll.min(max_scroll);
     let scroll = pane.scroll;
 
-    let query_lower = pane.search_query.to_lowercase();
+    let query_lower = pane.search_input.text.to_lowercase();
 
     let visible_lines: Vec<Line> = cached
         .0
@@ -2450,7 +2454,7 @@ fn draw_conversation_pane(
 
     if search_bar_height > 0 {
         let match_info = if pane.search_matches.is_empty() {
-            if pane.search_query.is_empty() {
+            if pane.search_input.text.is_empty() {
                 String::new()
             } else {
                 " (no match)".to_string()
@@ -2462,19 +2466,28 @@ fn draw_conversation_pane(
                 pane.search_matches.len()
             )
         };
-        let search_text = format!("/{}", pane.search_query);
-        let cursor = if pane.search_mode { "█" } else { "" };
         let hint = if pane.search_mode {
-            "  [Enter: confirm, Esc: cancel]"
+            "  [Enter/S-Enter: \u{2193}\u{2191}  Esc: close]"
         } else {
-            "  [n/N: next/prev, Esc: close]"
+            "  [n/N: next/prev, Esc: clear]"
         };
-        let search_line = Line::from(vec![
-            Span::styled(&search_text, Style::default().fg(theme::WARM)),
-            Span::styled(cursor, Style::default().fg(theme::WARM)),
-            Span::styled(&match_info, Style::default().fg(theme::DIM)),
-            Span::styled(hint, Style::default().fg(theme::DIM)),
-        ]);
+        let search_line = if pane.search_mode {
+            let mut spans = pane.search_input.render_spans(
+                "/",
+                Style::default().fg(theme::WARM),
+                Style::default().fg(theme::TEXT_BRIGHT).bg(theme::PRIMARY),
+            );
+            spans.push(Span::styled(match_info.clone(), Style::default().fg(theme::DIM)));
+            spans.push(Span::styled(hint, Style::default().fg(theme::DIM)));
+            Line::from(spans)
+        } else {
+            let search_text = format!("/{}", pane.search_input.text);
+            Line::from(vec![
+                Span::styled(search_text, Style::default().fg(theme::WARM)),
+                Span::styled(&match_info, Style::default().fg(theme::DIM)),
+                Span::styled(hint, Style::default().fg(theme::DIM)),
+            ])
+        };
         frame.render_widget(Paragraph::new(search_line), search_area);
     }
 
@@ -3522,22 +3535,13 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         } else {
             theme::TEXT_BRIGHT
         };
-        let byte_cursor = state.filter_input.char_indices()
-            .nth(state.filter_input_cursor)
-            .map_or(state.filter_input.len(), |(i, _)| i);
-        let (before, after) = state.filter_input.split_at(byte_cursor);
-        let cursor_char_len = after.chars().next().map_or(0, char::len_utf8);
-        let cursor_char = if after.is_empty() { "_" } else { &after[..cursor_char_len] };
-        let rest = if after.is_empty() { "" } else { &after[cursor_char_len..] };
-        lines.push(Line::from(vec![
-            Span::styled("   > ", Style::default().fg(theme::DIM)),
-            Span::styled(before.to_string(), Style::default().fg(input_color)),
-            Span::styled(
-                cursor_char.to_string(),
-                Style::default().fg(theme::TEXT_BRIGHT).bg(theme::PRIMARY),
-            ),
-            Span::styled(rest.to_string(), Style::default().fg(input_color)),
-        ]));
+        let mut spans = vec![Span::styled("   ", Style::default().fg(theme::DIM))];
+        spans.extend(state.filter_input.render_spans(
+            "> ",
+            Style::default().fg(input_color),
+            Style::default().fg(theme::TEXT_BRIGHT).bg(theme::PRIMARY),
+        ));
+        lines.push(Line::from(spans));
     }
 
     let footer = if state.filter_input_mode {
@@ -3803,7 +3807,9 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
     state.search_results_area = Some(inner[1]);
 
     let title = if state.searching {
-        " Search (Esc: cancel, Enter: select) [Searching...] "
+        " Search [Searching...] "
+    } else if state.search_index.is_none() && state.index_build_task.is_some() {
+        " Search [Indexing...] "
     } else {
         " Search (Esc: cancel, Enter: select) "
     };
@@ -3813,10 +3819,12 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         .border_style(Style::default().fg(theme::PRIMARY))
         .title(Span::styled(title, Style::default().fg(theme::PRIMARY)));
 
-    let input_text = format!("/{}", state.search_query);
-    let input = Paragraph::new(input_text)
-        .style(Style::default().fg(theme::TEXT_BRIGHT))
-        .block(input_block);
+    let input_line = Line::from(state.search_input.render_spans(
+        "/",
+        Style::default().fg(theme::TEXT_BRIGHT),
+        Style::default().fg(theme::TEXT_BRIGHT).bg(theme::PRIMARY),
+    ));
+    let input = Paragraph::new(input_line).block(input_block);
     frame.render_widget(input, inner[0]);
 
     let results_block = Block::default()
@@ -3824,7 +3832,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         .border_style(Style::default().fg(theme::PRIMARY));
 
     if state.search_results.is_empty() {
-        let no_results = if state.search_query.is_empty() {
+        let no_results = if state.search_input.text.is_empty() {
             "Type to search projects, summaries, branches, dates, content..."
         } else if state.searching {
             "Searching content..."
@@ -3875,6 +3883,25 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                 let snippet_text = result.snippet.as_deref().unwrap_or(summary);
                 let snippet = truncate_to_display_width(snippet_text, inner_w.saturating_sub(8));
 
+                let time_range = {
+                    use chrono::Timelike;
+                    let first = session.day_first_timestamp.with_timezone(&chrono::Local);
+                    let last = session.day_last_timestamp.with_timezone(&chrono::Local);
+                    format!("{:02}:{:02}-{:02}:{:02}", first.hour(), first.minute(), last.hour(), last.minute())
+                };
+                let tokens = crate::format_number(session.day_input_tokens + session.day_output_tokens);
+                let meta_len = date_str.len() + project.len() + branch.len() + time_range.len() + tokens.len() + match_indicator.len() + 8;
+                let summary_short = truncate_to_display_width(summary, inner_w.saturating_sub(meta_len));
+
+                let match_color = match result.match_type {
+                    search::SearchMatchType::ProjectName => theme::SECONDARY,
+                    search::SearchMatchType::Summary => theme::SUCCESS,
+                    search::SearchMatchType::GitBranch => theme::BRANCH,
+                    search::SearchMatchType::SessionId => theme::MUTED,
+                    search::SearchMatchType::Date => theme::PRIMARY,
+                    search::SearchMatchType::Content => theme::ACCENT,
+                };
+
                 let selected = i == state.search_selected;
                 let sel_style = Style::default().bg(theme::FAINT).fg(theme::TEXT_BRIGHT);
 
@@ -3884,18 +3911,34 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                         if selected { sel_style } else { Style::default().fg(theme::PRIMARY) },
                     ),
                     Span::styled(
-                        format!("{project}{branch} "),
-                        if selected { sel_style } else { Style::default().fg(theme::TEXT_BRIGHT) },
+                        project.to_string(),
+                        if selected { sel_style } else { Style::default().fg(theme::SECONDARY) },
                     ),
                     Span::styled(
-                        match_indicator,
+                        format!("{branch} "),
+                        if selected { sel_style } else { Style::default().fg(theme::BRANCH) },
+                    ),
+                    Span::styled(
+                        format!("{time_range} "),
                         if selected { sel_style } else { Style::default().fg(theme::DIM) },
+                    ),
+                    Span::styled(
+                        format!("{tokens} "),
+                        if selected { sel_style } else { Style::default().fg(theme::WARM) },
+                    ),
+                    Span::styled(
+                        format!("{match_indicator} "),
+                        if selected { sel_style } else { Style::default().fg(match_color) },
+                    ),
+                    Span::styled(
+                        summary_short,
+                        if selected { sel_style } else { Style::default().fg(theme::LABEL_SUBTLE) },
                     ),
                 ]);
                 let line2 = Line::from(vec![
                     Span::styled(
                         format!("  {snippet}"),
-                        if selected { sel_style } else { Style::default().fg(theme::LABEL_SUBTLE) },
+                        if selected { sel_style } else { Style::default().fg(theme::LABEL_MUTED) },
                     ),
                 ]);
                 ListItem::new(vec![line1, line2])
@@ -3910,6 +3953,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::TextInput;
 
     #[test]
     fn test_calc_scroll_basic() {
@@ -4317,11 +4361,15 @@ mod tests {
             dashboard_scroll: [0; 7],
             show_dashboard_detail: false,
             search_mode: false,
-            search_query: String::new(),
+            search_input: TextInput::default(),
             search_results: Vec::new(),
             search_selected: 0,
             search_task: None,
             searching: false,
+            search_preview_mode: false,
+            search_saved_state: None,
+            search_index: None,
+            index_build_task: None,
             ctrl_c_pressed: false,
             last_click_time: None,
             last_click_pos: (0, 0),
@@ -4366,8 +4414,7 @@ mod tests {
             show_filter_popup: false,
             filter_popup_selected: 0,
             filter_input_mode: false,
-            filter_input: String::new(),
-            filter_input_cursor: 0,
+            filter_input: TextInput::default(),
             filter_input_error: false,
             project_filter: None,
             show_project_popup: false,

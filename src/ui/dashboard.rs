@@ -1,15 +1,58 @@
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame,
 };
 
+use std::collections::HashMap;
+
+use chrono::NaiveDate;
+
 use crate::aggregator::CostCalculator;
 use crate::AppState;
 use super::theme;
 use super::{cost_style, calc_scroll};
+
+fn resample_sparkline(
+    data: &[(NaiveDate, u64)],
+    width: usize,
+    global_first: NaiveDate,
+    global_last: NaiveDate,
+) -> Vec<u64> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let total_days = (global_last - global_first).num_days().max(1) as usize;
+    let mut buckets = vec![0u64; width];
+    for &(date, val) in data {
+        let day_offset = (date - global_first).num_days().max(0) as usize;
+        let bucket = (day_offset * width / total_days.max(1)).min(width.saturating_sub(1));
+        buckets[bucket] += val;
+    }
+    buckets
+}
+
+fn render_sparkline(values: &[u64], global_max: u64, color: Color) -> Vec<Span<'static>> {
+    const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max_val = global_max.max(1);
+    let spark: String = values
+        .iter()
+        .map(|&v| {
+            if v == 0 {
+                ' '
+            } else {
+                let idx = ((v as f64 / max_val as f64) * 7.0) as usize;
+                SPARK_CHARS[idx.min(7)]
+            }
+        })
+        .collect();
+    vec![
+        Span::raw("       "),
+        Span::styled(spark, Style::default().fg(color)),
+    ]
+}
 
 pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let chunks = Layout::vertical([
@@ -540,11 +583,7 @@ fn draw_top_projects(
     };
 
     let title = if selected {
-        if let Some((full_path, _)) = projects.get(scroll) {
-            format!(" ◈ {full_path}")
-        } else {
-            format!(" ◈ Projects {}/{}", scroll + 1, projects.len().max(1))
-        }
+        format!(" ◈ Projects {}/{}", scroll + 1, projects.len().max(1))
     } else {
         format!(" ◇ Projects {}/{}", scroll + 1, projects.len().max(1))
     };
@@ -924,7 +963,8 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         _ => 0,
     };
     let items_per_screen = match state.dashboard_panel {
-        2 => visible_height / 3,
+        1 => visible_height / 3,
+        2 => visible_height / 5,
         _ => visible_height,
     };
 
@@ -1010,13 +1050,64 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             let mut lines: Vec<Line> = vec![Line::from("")];
             let max_tokens = projects.first().map_or(1, |(_, s)| s.work_tokens);
             let bar_width = 12usize;
-            let name_width = content_width.saturating_sub(45);
+            let name_width = content_width.saturating_sub(8);
+            let spark_width = content_width.saturating_sub(10);
 
+            let today = chrono::Local::now().date_naive();
+            let global_first = state.daily_groups.last().map_or(today, |g| g.date);
+            let global_last = state.daily_groups.first().map_or(today, |g| g.date);
+
+            let mut project_daily_tokens: HashMap<String, Vec<(NaiveDate, u64)>> = HashMap::new();
+            for group in state.daily_groups.iter().rev() {
+                for session in group.sessions.iter().filter(|s| !s.is_subagent) {
+                    let work = session.day_input_tokens + session.day_output_tokens;
+                    let daily = project_daily_tokens.entry(session.project_name.clone()).or_default();
+                    if let Some(entry) = daily.last_mut().filter(|e| e.0 == group.date) {
+                        entry.1 += work;
+                    } else {
+                        daily.push((group.date, work));
+                    }
+                }
+            }
+            let all_resampled: HashMap<String, Vec<u64>> = project_daily_tokens
+                .iter()
+                .map(|(name, daily)| {
+                    (name.clone(), resample_sparkline(daily, spark_width, global_first, global_last))
+                })
+                .collect();
+            let global_spark_max: u64 = all_resampled
+                .values()
+                .flat_map(|v| v.iter())
+                .copied()
+                .max()
+                .unwrap_or(1);
+
+            let calculator = CostCalculator::global();
+            let mut project_cost: HashMap<String, f64> = HashMap::new();
+            let mut project_last_date: HashMap<String, NaiveDate> = HashMap::new();
+            let mut project_active_days: HashMap<String, usize> = HashMap::new();
+            for group in &state.daily_groups {
+                for session in group.sessions.iter().filter(|s| !s.is_subagent) {
+                    for (model, tokens) in &session.day_tokens_by_model {
+                        let cost = calculator.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
+                        *project_cost.entry(session.project_name.clone()).or_default() += cost;
+                    }
+                    let last = project_last_date.entry(session.project_name.clone()).or_insert(group.date);
+                    if group.date > *last {
+                        *last = group.date;
+                    }
+                }
+            }
+            for (name, daily) in &project_daily_tokens {
+                project_active_days.insert(name.clone(), daily.len());
+            }
+
+            let items_visible = visible_height / 3;
             for (i, (name, stats)) in projects
                 .iter()
                 .enumerate()
                 .skip(scroll)
-                .take(visible_height)
+                .take(items_visible)
             {
                 let ratio = stats.work_tokens as f64 / max_tokens as f64;
                 let filled = (ratio * bar_width as f64).round() as usize;
@@ -1028,24 +1119,49 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     (180.0 + 75.0 * intensity) as u8,
                 );
                 let display_name = truncate(name, name_width);
+                let cost = project_cost.get(name.as_str()).copied().unwrap_or(0.0);
+                let active_days = project_active_days.get(name.as_str()).copied().unwrap_or(0);
+                let latest = project_last_date
+                    .get(name.as_str())
+                    .map(|d| format!("latest:{}", d.format("%m-%d")))
+                    .unwrap_or_default();
 
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
                     Span::styled(
-                        format!("{display_name:<name_width$}"),
+                        display_name,
                         Style::default().fg(theme::SECONDARY),
                     ),
-                    Span::raw(" "),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("       "),
                     Span::styled(bar, Style::default().fg(bar_color)),
                     Span::styled(
-                        format!(" {:>9}", crate::format_number(stats.work_tokens)),
+                        format!(" {}", crate::format_number(stats.work_tokens)),
                         Style::default().fg(theme::LABEL_MUTED),
                     ),
                     Span::styled(
-                        format!(" {:>2}s", stats.sessions),
+                        format!("  {}s", stats.sessions),
+                        Style::default().fg(theme::DIM),
+                    ),
+                    Span::styled(
+                        format!("  {}", super::format_cost(cost, 0)),
+                        super::cost_style(cost),
+                    ),
+                    Span::styled(
+                        format!("  {active_days}d"),
+                        Style::default().fg(theme::DIM),
+                    ),
+                    Span::styled(
+                        format!("  {latest}"),
                         Style::default().fg(theme::DIM),
                     ),
                 ]));
+                if let Some(values) = all_resampled.get(name.as_str())
+                    && values.iter().any(|&v| v > 0)
+                {
+                    lines.push(Line::from(render_sparkline(values, global_spark_max, bar_color)));
+                }
             }
             (title, lines)
         }
@@ -1054,19 +1170,42 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             let mut lines: Vec<Line> = vec![Line::from("")];
             let calculator = CostCalculator::global();
 
-            let mut model_last_used: std::collections::HashMap<String, chrono::NaiveDate> =
-                std::collections::HashMap::new();
-            for group in &state.daily_groups {
-                for session in &group.sessions {
-                    for model_name in session.day_tokens_by_model.keys() {
+            let mut model_last_used: HashMap<String, NaiveDate> = HashMap::new();
+            let mut model_daily_tokens: HashMap<String, Vec<(NaiveDate, u64)>> = HashMap::new();
+            for group in state.daily_groups.iter().rev() {
+                for session in group.sessions.iter().filter(|s| !s.is_subagent) {
+                    for (model_name, ts) in &session.day_tokens_by_model {
                         let normalized = crate::aggregator::normalize_model_name(model_name);
-                        let entry = model_last_used.entry(normalized).or_insert(group.date);
-                        if group.date > *entry {
-                            *entry = group.date;
+                        let last = model_last_used.entry(normalized.clone()).or_insert(group.date);
+                        if group.date > *last {
+                            *last = group.date;
+                        }
+                        let daily = model_daily_tokens.entry(normalized).or_default();
+                        let work = ts.input_tokens + ts.output_tokens;
+                        if let Some(entry) = daily.last_mut().filter(|e| e.0 == group.date) {
+                            entry.1 += work;
+                        } else {
+                            daily.push((group.date, work));
                         }
                     }
                 }
             }
+            let spark_width = content_width.saturating_sub(10);
+            let today = chrono::Local::now().date_naive();
+            let global_first = state.daily_groups.last().map_or(today, |g| g.date);
+            let global_last = state.daily_groups.first().map_or(today, |g| g.date);
+            let all_resampled: HashMap<String, Vec<u64>> = model_daily_tokens
+                .iter()
+                .map(|(name, daily)| {
+                    (name.clone(), resample_sparkline(daily, spark_width, global_first, global_last))
+                })
+                .collect();
+            let global_spark_max: u64 = all_resampled
+                .values()
+                .flat_map(|v| v.iter())
+                .copied()
+                .max()
+                .unwrap_or(1);
 
             let mut models: Vec<_> = state
                 .aggregated_model_tokens
@@ -1203,6 +1342,11 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                             Style::default().fg(theme::DIM),
                         ),
                     ]));
+                }
+                if let Some(values) = all_resampled.get(model)
+                    && values.iter().any(|&v| v > 0)
+                {
+                    lines.push(Line::from(render_sparkline(values, global_spark_max, bar_color)));
                 }
             }
             (title, lines)

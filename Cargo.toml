@@ -1,6 +1,6 @@
 [package]
 name = "ccsight"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "Claude Code log viewer with integrated statistics and daily summaries"
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 # TUI
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 
 # Async runtime
@@ -48,8 +48,14 @@ unicode-width = "0.2"
 arboard = "3"
 
 # MCP server
-rmcp = { version = "0.16", features = ["server", "transport-io"] }
+rmcp = { version = "1.3", features = ["server", "transport-io"] }
 schemars = "1"
+
+# Full-text search
+tantivy = "0.26"
+
+# Parallel processing
+rayon = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

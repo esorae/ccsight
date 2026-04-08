@@ -32,7 +32,8 @@ use chrono::{Local, NaiveDate};
 use clap::Parser;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, MouseEventKind,
     },
     execute,
     terminal::{
@@ -42,7 +43,7 @@ use crossterm::{
 };
 use ratatui::DefaultTerminal;
 
-use crate::aggregator::{CostCalculator, DailyGrouper, Stats, StatsAggregator};
+use crate::aggregator::{CostCalculator, DailyGroup, DailyGrouper, Stats, StatsAggregator};
 use crate::infrastructure::{check_cleanup_period, FileDiscovery};
 
 #[derive(Parser, Debug)]
@@ -120,6 +121,9 @@ fn main() -> io::Result<()> {
                 println!("No cache file found");
             }
         }
+        if infrastructure::SearchIndex::clear_index().is_ok() {
+            println!("Search index cleared");
+        }
         return Ok(());
     }
 
@@ -139,18 +143,18 @@ fn main() -> io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
         original_hook(panic_info);
     }));
 
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
 
     let result = run(terminal, args.limit);
 
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     result
 }
 
@@ -193,11 +197,15 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
         dashboard_scroll: [0; 7],
         show_dashboard_detail: false,
         search_mode: false,
-        search_query: String::new(),
+        search_input: TextInput::default(),
         search_results: Vec::new(),
         search_selected: 0,
         search_task: None,
         searching: false,
+        search_preview_mode: false,
+        search_saved_state: None,
+        search_index: None,
+        index_build_task: None,
         ctrl_c_pressed: false,
         last_click_time: None,
         last_click_pos: (0, 0),
@@ -242,8 +250,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
         show_filter_popup: false,
         filter_popup_selected: 0,
         filter_input_mode: false,
-        filter_input: String::new(),
-        filter_input_cursor: 0,
+        filter_input: TextInput::default(),
         filter_input_error: false,
         project_filter: None,
         show_project_popup: false,
@@ -294,8 +301,9 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             || state.data_reload_task.is_some()
             || state.summary_task.is_some()
             || state.search_task.is_some()
+            || state.index_build_task.is_some()
             || state.panes.iter().any(|p| p.loading);
-        if has_pending {
+        if has_pending && state.index_build_task.is_none() {
             state.needs_draw = true;
         }
 
@@ -316,6 +324,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     Ok(data) => {
                         state.apply_loaded_data(data);
                         state.loading = false;
+                        start_index_build(&mut state);
                     }
                     Err(e) => {
                         state.error = Some(e);
@@ -341,6 +350,14 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     }
                     state.search_results.clear();
                     state.search_selected = 0;
+                    start_index_build(&mut state);
+                    if state.search_mode && !state.search_input.text.is_empty() {
+                        state.search_results = search::perform_search(
+                            &state.daily_groups,
+                            &state.search_input.text,
+                        );
+                        start_content_search(&mut state);
+                    }
                 }
             }
 
@@ -462,9 +479,15 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                 state.summary_task = None;
             }
 
+        if let Some(ref index_rx) = state.index_build_task
+            && let Ok(index) = index_rx.try_recv() {
+                state.search_index = Some(index);
+                state.index_build_task = None;
+            }
+
         if let Some((ref rx, ref query)) = state.search_task
             && let Ok(content_results) = rx.try_recv() {
-                if *query == state.search_query {
+                if *query == state.search_input.text {
                     for result in content_results {
                         if !state.search_results.iter().any(|r| {
                             r.day_idx == result.day_idx && r.session_idx == result.session_idx
@@ -593,6 +616,32 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     }
                     _ => {}
                 },
+                Event::Paste(text) => {
+                    if state.search_mode {
+                        for c in text.chars() {
+                            state.search_input.insert_char(c);
+                        }
+                        state.search_results = search::perform_search(
+                            &state.daily_groups,
+                            &state.search_input.text,
+                        );
+                        state.search_selected = 0;
+                        start_content_search(&mut state);
+                    } else if state.filter_input_mode {
+                        for c in text.chars() {
+                            state.filter_input.insert_char(c);
+                        }
+                        state.filter_input_error = false;
+                    } else if let Some(idx) = state.active_pane_index
+                        && let Some(pane) = state.panes.get_mut(idx)
+                        && pane.search_mode
+                    {
+                        for c in text.chars() {
+                            pane.search_input.insert_char(c);
+                        }
+                        ui::update_pane_search_matches(pane);
+                    }
+                }
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
                         use crossterm::event::KeyModifiers;
@@ -633,56 +682,32 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                     KeyCode::Esc => {
                                         state.filter_input_mode = false;
                                         state.filter_input.clear();
-                                        state.filter_input_cursor = 0;
                                         state.filter_input_error = false;
                                     }
                                     KeyCode::Enter => {
                                         if let Some(filter) =
-                                            PeriodFilter::parse_custom(&state.filter_input)
+                                            PeriodFilter::parse_custom(&state.filter_input.text)
                                         {
                                             state.period_filter = filter;
                                             state.apply_filter();
                                             state.show_filter_popup = false;
                                             state.filter_input_mode = false;
                                             state.filter_input.clear();
-                                            state.filter_input_cursor = 0;
                                             state.filter_input_error = false;
                                         } else {
                                             state.filter_input_error = true;
                                         }
                                     }
                                     KeyCode::Backspace => {
-                                        if state.filter_input_cursor > 0 {
-                                            state.filter_input_cursor -= 1;
-                                            let byte_pos = state.filter_input.char_indices()
-                                                .nth(state.filter_input_cursor)
-                                                .map_or(state.filter_input.len(), |(i, _)| i);
-                                            state.filter_input.remove(byte_pos);
-                                            state.filter_input_error = false;
-                                        }
+                                        state.filter_input.delete_back();
+                                        state.filter_input_error = false;
                                     }
-                                    KeyCode::Left => {
-                                        if state.filter_input_cursor > 0 {
-                                            state.filter_input_cursor -= 1;
-                                        }
-                                    }
-                                    KeyCode::Right => {
-                                        if state.filter_input_cursor < state.filter_input.chars().count() {
-                                            state.filter_input_cursor += 1;
-                                        }
-                                    }
-                                    KeyCode::Home => {
-                                        state.filter_input_cursor = 0;
-                                    }
-                                    KeyCode::End => {
-                                        state.filter_input_cursor = state.filter_input.chars().count();
-                                    }
+                                    KeyCode::Left => { state.filter_input.move_left(); }
+                                    KeyCode::Right => { state.filter_input.move_right(); }
+                                    KeyCode::Home => { state.filter_input.move_home(); }
+                                    KeyCode::End => { state.filter_input.move_end(); }
                                     KeyCode::Char(c) => {
-                                        let byte_pos = state.filter_input.char_indices()
-                                            .nth(state.filter_input_cursor)
-                                            .map_or(state.filter_input.len(), |(i, _)| i);
-                                        state.filter_input.insert(byte_pos, c);
-                                        state.filter_input_cursor += 1;
+                                        state.filter_input.insert_char(c);
                                         state.filter_input_error = false;
                                     }
                                     _ => {}
@@ -712,7 +737,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                             state.show_filter_popup = false;
                                         } else {
                                             state.filter_input_mode = true;
-                                            state.filter_input = match state.period_filter {
+                                            let text = match state.period_filter {
                                                 PeriodFilter::Custom(s, Some(e)) if s == e => {
                                                     s.format("%Y-%m-%d").to_string()
                                                 }
@@ -728,7 +753,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                                 }
                                                 _ => String::new(),
                                             };
-                                            state.filter_input_cursor = state.filter_input.chars().count();
+                                            state.filter_input.set(text);
                                             state.filter_input_error = false;
                                         }
                                     }
@@ -818,63 +843,43 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                             match key.code {
                                                 KeyCode::Esc => {
                                                     pane.search_mode = false;
-                                                    pane.search_query.clear();
-                                                    pane.search_matches.clear();
-                                                    if let Some((saved_scroll, saved_msg)) = pane.search_saved_scroll.take() {
-                                                        pane.scroll = saved_scroll;
-                                                        pane.selected_message = saved_msg;
+                                                    if pane.search_matches.is_empty() {
+                                                        pane.search_input.clear();
+                                                        if let Some((saved_scroll, saved_msg)) = pane.search_saved_scroll.take() {
+                                                            pane.scroll = saved_scroll;
+                                                            pane.selected_message = saved_msg;
+                                                        }
+                                                    } else {
+                                                        pane.search_saved_scroll = None;
                                                     }
                                                 }
                                                 KeyCode::Enter => {
-                                                    pane.search_saved_scroll = None;
-                                                    if pane.search_matches.is_empty() {
-                                                        pane.search_mode = false;
-                                                        pane.search_query.clear();
-                                                    } else {
-                                                        pane.search_mode = false;
+                                                    if !pane.search_matches.is_empty() {
+                                                        if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                                                            pane.search_current = pane
+                                                                .search_current
+                                                                .checked_sub(1)
+                                                                .unwrap_or(pane.search_matches.len() - 1);
+                                                        } else {
+                                                            pane.search_current = (pane.search_current + 1)
+                                                                % pane.search_matches.len();
+                                                        }
+                                                        pane.scroll = pane.search_matches[pane.search_current];
+                                                        if let Some(msg_idx) = pane.message_lines.iter().rposition(|&(start, _)| start <= pane.scroll) {
+                                                            pane.selected_message = msg_idx;
+                                                        }
                                                     }
                                                 }
                                                 KeyCode::Backspace => {
-                                                    pane.search_query.pop();
+                                                    pane.search_input.delete_back();
                                                     ui::update_pane_search_matches(pane);
                                                 }
-                                                KeyCode::Char('n')
-                                                    if key.modifiers.contains(
-                                                        crossterm::event::KeyModifiers::CONTROL,
-                                                    ) =>
-                                                {
-                                                    if !pane.search_matches.is_empty() {
-                                                        pane.search_current = (pane.search_current
-                                                            + 1)
-                                                            % pane.search_matches.len();
-                                                        pane.scroll = pane.search_matches
-                                                            [pane.search_current];
-                                                        if let Some(msg_idx) = pane.message_lines.iter().rposition(|&(start, _)| start <= pane.scroll) {
-                                                            pane.selected_message = msg_idx;
-                                                        }
-                                                    }
-                                                }
-                                                KeyCode::Char('p')
-                                                    if key.modifiers.contains(
-                                                        crossterm::event::KeyModifiers::CONTROL,
-                                                    ) =>
-                                                {
-                                                    if !pane.search_matches.is_empty() {
-                                                        pane.search_current = pane
-                                                            .search_current
-                                                            .checked_sub(1)
-                                                            .unwrap_or(
-                                                                pane.search_matches.len() - 1,
-                                                            );
-                                                        pane.scroll = pane.search_matches
-                                                            [pane.search_current];
-                                                        if let Some(msg_idx) = pane.message_lines.iter().rposition(|&(start, _)| start <= pane.scroll) {
-                                                            pane.selected_message = msg_idx;
-                                                        }
-                                                    }
-                                                }
+                                                KeyCode::Left => { pane.search_input.move_left(); }
+                                                KeyCode::Right => { pane.search_input.move_right(); }
+                                                KeyCode::Home => { pane.search_input.move_home(); }
+                                                KeyCode::End => { pane.search_input.move_end(); }
                                                 KeyCode::Char(c) => {
-                                                    pane.search_query.push(c);
+                                                    pane.search_input.insert_char(c);
                                                     ui::update_pane_search_matches(pane);
                                                 }
                                                 _ => {}
@@ -932,11 +937,12 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                         KeyCode::Esc | KeyCode::Char('q') => {
                                             let has_search = state.active_pane_index
                                                 .and_then(|i| state.panes.get(i))
-                                                .is_some_and(|p| !p.search_query.is_empty());
+                                                .is_some_and(|p| !p.search_input.text.is_empty());
                                             if has_search {
                                                 if let Some(idx) = state.active_pane_index
                                                     && let Some(pane) = state.panes.get_mut(idx) {
-                                                        pane.search_query.clear();
+                                                        pane.search_input.text.clear();
+                                                        pane.search_input.cursor = 0;
                                                         pane.search_matches.clear();
                                                         pane.search_current = 0;
                                                         if let Some((saved_scroll, saved_msg)) = pane.search_saved_scroll.take() {
@@ -944,6 +950,17 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                                             pane.selected_message = saved_msg;
                                                         }
                                                     }
+                                            } else if state.search_preview_mode {
+                                                state.show_conversation = false;
+                                                for pane in &mut state.panes { pane.clear(); }
+                                                state.active_pane_index = None;
+                                                if let Some((tab, day, session, _)) = &state.search_saved_state {
+                                                    state.tab = *tab;
+                                                    state.selected_day = *day;
+                                                    state.selected_session = *session;
+                                                }
+                                                state.search_mode = true;
+                                                state.search_preview_mode = false;
                                             } else if state.active_pane_index.is_none() {
                                                 if !state.panes.is_empty() {
                                                     state.active_pane_index = Some(0);
@@ -1000,7 +1017,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                                 && let Some(pane) = state.panes.get_mut(idx) {
                                                     pane.search_saved_scroll = Some((pane.scroll, pane.selected_message));
                                                     pane.search_mode = true;
-                                                    pane.search_query.clear();
+                                                    pane.search_input.clear();
                                                     pane.search_matches.clear();
                                                     pane.search_current = 0;
                                                 }
@@ -1510,39 +1527,55 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             match key.code {
                                 KeyCode::Esc => {
                                     state.search_mode = false;
-                                    state.search_query.clear();
+                                    state.search_input.clear();
                                     state.search_results.clear();
                                     state.search_selected = 0;
                                     state.search_task = None;
                                     state.searching = false;
+                                    if let Some((tab, day, session, show_conv)) = state.search_saved_state.take() {
+                                        state.tab = tab;
+                                        state.selected_day = day;
+                                        state.selected_session = session;
+                                        state.show_conversation = show_conv;
+                                    }
+                                    state.search_preview_mode = false;
                                 }
                                 KeyCode::Enter => {
                                     if !state.search_results.is_empty() {
                                         let result = state.search_results[state.search_selected].clone();
-                                        let query = state.search_query.clone();
+                                        let query = state.search_input.text.clone();
                                         let is_content = matches!(result.match_type, search::SearchMatchType::Content);
+                                        if state.search_saved_state.is_none() {
+                                            state.search_saved_state = Some((
+                                                state.tab,
+                                                state.selected_day,
+                                                state.selected_session,
+                                                state.show_conversation,
+                                            ));
+                                        }
                                         state.selected_day = result.day_idx;
                                         state.selected_session = result.session_idx;
                                         state.tab = Tab::Daily;
                                         state.search_mode = false;
+                                        state.search_preview_mode = true;
                                         state.search_task = None;
                                         state.searching = false;
                                         open_conversation_in_pane(&mut state);
                                         if is_content
                                             && let Some(idx) = state.active_pane_index
                                                 && let Some(pane) = state.panes.get_mut(idx) {
-                                                    pane.search_query = query;
+                                                    pane.search_input.set(query);
                                                     pane.search_mode = true;
                                                 }
                                     }
                                 }
-                                KeyCode::Down | KeyCode::Char('n') => {
+                                KeyCode::Down => {
                                     if !state.search_results.is_empty() {
                                         state.search_selected = (state.search_selected + 1)
                                             % state.search_results.len();
                                     }
                                 }
-                                KeyCode::Up | KeyCode::Char('p') => {
+                                KeyCode::Up => {
                                     if !state.search_results.is_empty() {
                                         state.search_selected = state
                                             .search_selected
@@ -1551,19 +1584,23 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                     }
                                 }
                                 KeyCode::Backspace => {
-                                    state.search_query.pop();
+                                    state.search_input.delete_back();
                                     state.search_results = search::perform_search(
                                         &state.daily_groups,
-                                        &state.search_query,
+                                        &state.search_input.text,
                                     );
                                     state.search_selected = 0;
                                     start_content_search(&mut state);
                                 }
+                                KeyCode::Left => { state.search_input.move_left(); }
+                                KeyCode::Right => { state.search_input.move_right(); }
+                                KeyCode::Home => { state.search_input.move_home(); }
+                                KeyCode::End => { state.search_input.move_end(); }
                                 KeyCode::Char(c) => {
-                                    state.search_query.push(c);
+                                    state.search_input.insert_char(c);
                                     state.search_results = search::perform_search(
                                         &state.daily_groups,
-                                        &state.search_query,
+                                        &state.search_input.text,
                                     );
                                     state.search_selected = 0;
                                     start_content_search(&mut state);
@@ -1728,6 +1765,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                 }
                                 KeyCode::Char('/') => {
                                     state.search_mode = true;
+                                    state.search_input.move_end();
                                 }
                                 KeyCode::Tab
                                 | KeyCode::Char('1')
@@ -2087,7 +2125,6 @@ fn dismiss_overlay(state: &mut AppState) {
         if state.filter_input_mode {
             state.filter_input_mode = false;
             state.filter_input.clear();
-            state.filter_input_cursor = 0;
             state.filter_input_error = false;
         } else {
             state.show_filter_popup = false;
@@ -2104,11 +2141,18 @@ fn dismiss_overlay(state: &mut AppState) {
     }
     if state.search_mode {
         state.search_mode = false;
-        state.search_query.clear();
+        state.search_input.clear();
         state.search_results.clear();
         state.search_selected = 0;
         state.search_task = None;
         state.searching = false;
+        if let Some((tab, day, session, show_conv)) = state.search_saved_state.take() {
+            state.tab = tab;
+            state.selected_day = day;
+            state.selected_session = session;
+            state.show_conversation = show_conv;
+        }
+        state.search_preview_mode = false;
         return;
     }
     if state.show_detail {
@@ -2185,7 +2229,7 @@ fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
             state.show_filter_popup = false;
         } else {
             state.filter_input_mode = true;
-            state.filter_input = match state.period_filter {
+            let text = match state.period_filter {
                 PeriodFilter::Custom(s, Some(e)) if s == e => s.format("%Y-%m-%d").to_string(),
                 PeriodFilter::Custom(s, Some(e)) => {
                     format!("{}..{}", s.format("%Y-%m-%d"), e.format("%Y-%m-%d"))
@@ -2193,7 +2237,7 @@ fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
                 PeriodFilter::Custom(s, None) => s.format("%Y-%m-%d").to_string(),
                 _ => String::new(),
             };
-            state.filter_input_cursor = state.filter_input.chars().count();
+            state.filter_input.set(text);
             state.filter_input_error = false;
         }
         return;
@@ -3006,11 +3050,26 @@ fn start_content_search(state: &mut AppState) {
     state.search_task = None;
     state.searching = false;
 
-    if state.search_query.len() < 2 {
+    if state.search_input.text.len() < 2 {
         return;
     }
 
-    let query = state.search_query.clone();
+    let query = state.search_input.text.clone();
+
+    if let Some(ref index) = state.search_index {
+        let results = index.search(&query, 200, 50);
+        for result in results {
+            if !state
+                .search_results
+                .iter()
+                .any(|r| r.day_idx == result.day_idx && r.session_idx == result.session_idx)
+            {
+                state.search_results.push(result);
+            }
+        }
+        return;
+    }
+
     let groups_data: Vec<(usize, Vec<(usize, PathBuf)>)> = state
         .daily_groups
         .iter()
@@ -3057,6 +3116,20 @@ fn start_content_search(state: &mut AppState) {
         }
 
         let _ = tx.send(results);
+    });
+}
+
+fn start_index_build(state: &mut AppState) {
+    use std::sync::Arc;
+
+    let groups: Vec<DailyGroup> = state.daily_groups.clone();
+    let (tx, rx) = mpsc::channel();
+    state.index_build_task = Some(rx);
+
+    std::thread::spawn(move || {
+        if let Ok(index) = infrastructure::SearchIndex::update_or_build(&groups) {
+            let _ = tx.send(Arc::new(index));
+        }
     });
 }
 
@@ -3305,6 +3378,74 @@ mod tests {
         for i in 1..groups.len() {
             assert!(groups[i - 1].date >= groups[i].date);
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_search_index() {
+        let _ = infrastructure::SearchIndex::clear_index();
+        let result = load_data(0).unwrap();
+        if result.daily_groups.is_empty() {
+            return;
+        }
+        let groups = &result.daily_groups;
+        let session_count: usize = groups
+            .iter()
+            .map(|g| g.sessions.iter().filter(|s| !s.is_subagent).count())
+            .sum();
+        println!("Sessions: {session_count}");
+
+        let start = Instant::now();
+        let index = infrastructure::SearchIndex::update_or_build(groups).unwrap();
+        let build_time = start.elapsed();
+        println!("Index build: {build_time:?}");
+
+        let queries = ["cargo", "hello", "commit", "error", "ratatui", "日本語テスト"];
+        println!("\n--- Search breakdown ---");
+        for q in &queries {
+            let start = Instant::now();
+            let results = index.search(q, 200, 50);
+            let total = start.elapsed();
+            println!("'{q}': {total:?} total, {} results", results.len());
+        }
+
+        println!("\n--- Warm search (2nd call) ---");
+        for q in &queries {
+            let start = Instant::now();
+            let results = index.search(q, 200, 50);
+            let total = start.elapsed();
+            println!("'{q}': {total:?} total, {} results", results.len());
+        }
+
+        println!("\n--- Fallback regex path ---");
+        let special_queries = ["cargo build", "hello world", "fn main()", "state.search_"];
+        for q in &special_queries {
+            let start = Instant::now();
+            let results = index.search(q, 200, 50);
+            let total = start.elapsed();
+            println!("'{q}': {total:?} total, {} results", results.len());
+        }
+
+        println!("\n--- Linear scan comparison ---");
+        let start = Instant::now();
+        let mut linear_count = 0;
+        let mut searched = 0;
+        for group in groups {
+            for session in group.sessions.iter().filter(|s| !s.is_subagent) {
+                if searched >= 100 { break; }
+                if search::search_session_content(&session.file_path, "cargo").is_some() {
+                    linear_count += 1;
+                }
+                searched += 1;
+            }
+        }
+        let linear_time = start.elapsed();
+        println!("Linear 'cargo' ({searched} files): {linear_time:?} ({linear_count} matches)");
+
+        println!("\n--- 2nd update_or_build (no changes) ---");
+        let start = Instant::now();
+        let _index2 = infrastructure::SearchIndex::update_or_build(groups).unwrap();
+        println!("Open existing: {:?}", start.elapsed());
     }
 
     #[test]

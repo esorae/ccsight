@@ -1,12 +1,85 @@
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use chrono::NaiveDate;
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 
 use crate::aggregator::{CacheStats, CostCalculator, DailyGroup, Stats, TokenStats};
-use crate::infrastructure::RetentionWarning;
+use crate::infrastructure::{RetentionWarning, SearchIndex};
 use crate::{pins, search, ConversationMessage};
+
+#[derive(Default, Clone)]
+pub struct TextInput {
+    pub text: String,
+    pub cursor: usize,
+}
+
+impl TextInput {
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.text.char_indices()
+            .nth(self.cursor)
+            .map_or(self.text.len(), |(i, _)| i);
+        self.text.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_back(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.text.char_indices()
+                .nth(self.cursor)
+                .map_or(self.text.len(), |(i, _)| i);
+            self.text.remove(byte_pos);
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        if self.cursor < self.text.chars().count() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.text.chars().count();
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    pub fn set(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.text = text;
+    }
+
+    pub fn render_spans(&self, prefix: &str, style: Style, cursor_style: Style) -> Vec<Span<'static>> {
+        let byte_cursor = self.text.char_indices()
+            .nth(self.cursor)
+            .map_or(self.text.len(), |(i, _)| i);
+        let (before, after) = self.text.split_at(byte_cursor);
+        let cursor_char_len = after.chars().next().map_or(0, char::len_utf8);
+        let cursor_char = if after.is_empty() { " " } else { &after[..cursor_char_len] };
+        let rest = if after.is_empty() { "" } else { &after[cursor_char_len..] };
+        vec![
+            Span::styled(prefix.to_string(), style),
+            Span::styled(before.to_string(), style),
+            Span::styled(cursor_char.to_string(), cursor_style),
+            Span::styled(rest.to_string(), style),
+        ]
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -154,7 +227,7 @@ pub struct ConversationPane {
     pub selected_message: usize,
     pub focused_timestamp: Option<String>,
     pub search_mode: bool,
-    pub search_query: String,
+    pub search_input: TextInput,
     pub search_matches: Vec<usize>,
     pub search_current: usize,
     pub search_saved_scroll: Option<(usize, usize)>,
@@ -175,7 +248,7 @@ impl ConversationPane {
         self.selected_message = 0;
         self.focused_timestamp = None;
         self.search_mode = false;
-        self.search_query.clear();
+        self.search_input.clear();
         self.search_matches.clear();
         self.search_current = 0;
         self.search_saved_scroll = None;
@@ -234,11 +307,15 @@ pub struct AppState {
     pub dashboard_scroll: [usize; 7],
     pub show_dashboard_detail: bool,
     pub search_mode: bool,
-    pub search_query: String,
+    pub search_input: TextInput,
     pub search_results: Vec<search::SearchResult>,
     pub search_selected: usize,
     pub search_task: Option<(mpsc::Receiver<Vec<search::SearchResult>>, String)>,
     pub searching: bool,
+    pub search_preview_mode: bool,
+    pub search_saved_state: Option<(Tab, usize, usize, bool)>,
+    pub search_index: Option<Arc<SearchIndex>>,
+    pub index_build_task: Option<mpsc::Receiver<Arc<SearchIndex>>>,
     pub ctrl_c_pressed: bool,
     pub last_click_time: Option<std::time::Instant>,
     pub last_click_pos: (u16, u16),
@@ -289,8 +366,7 @@ pub struct AppState {
     pub show_filter_popup: bool,
     pub filter_popup_selected: usize,
     pub filter_input_mode: bool,
-    pub filter_input: String,
-    pub filter_input_cursor: usize,
+    pub filter_input: TextInput,
     pub filter_input_error: bool,
     pub project_filter: Option<String>,
     pub show_project_popup: bool,

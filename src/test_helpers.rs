@@ -6,6 +6,7 @@ pub mod helpers {
     use chrono::{NaiveDate, Utc};
 
     use crate::aggregator::{DailyGroup, ModelTokens, SessionInfo};
+    use crate::state::TextInput;
 
     pub fn make_session(project: &str, summary: Option<&str>, branch: Option<&str>) -> SessionInfo {
         SessionInfo {
@@ -113,11 +114,15 @@ pub mod helpers {
             dashboard_scroll: [0; 7],
             show_dashboard_detail: false,
             search_mode: false,
-            search_query: String::new(),
+            search_input: TextInput::default(),
             search_results: Vec::new(),
             search_selected: 0,
             search_task: None,
             searching: false,
+            search_preview_mode: false,
+            search_saved_state: None,
+            search_index: None,
+            index_build_task: None,
             ctrl_c_pressed: false,
             last_click_time: None,
             last_click_pos: (0, 0),
@@ -162,8 +167,7 @@ pub mod helpers {
             show_filter_popup: false,
             filter_popup_selected: 0,
             filter_input_mode: false,
-            filter_input: String::new(),
-            filter_input_cursor: 0,
+            filter_input: TextInput::default(),
             filter_input_error: false,
             project_filter: None,
             show_project_popup: false,

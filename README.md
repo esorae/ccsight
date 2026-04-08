@@ -8,10 +8,10 @@ A Rust TUI for viewing Claude Code session logs with statistics, cost analysis, 
 - **Daily View**: Day-by-day sessions with activity graph, breakdown, conversation viewer
 - **Insights**: Metrics, today vs average, weekly/monthly trends with detail popups
 - **Conversation**: Multi-pane browsing with syntax highlighting, search, copy
-- **Search**: Find sessions by project, summary, branch, session ID, date, or content
+- **Search**: Full-text search across all sessions (tantivy, multilingual)
 - **Pin**: Mark important sessions, browse across dates
-- **MCP Server**: Expose stats/sessions tools via stdio transport
-- **Caching**: Fast startup with JSON cache at `~/.cache/ccsight/`
+- **MCP Server**: 3 tools — `stats`, `sessions`, `search`
+- **Caching**: Fast startup with JSON cache and search index at `~/.cache/ccsight/`
 
 ## Installation
 
@@ -34,7 +34,7 @@ cargo install --path .
 ccsight                    # Run TUI
 ccsight --daily            # Print daily cost summary to stdout
 ccsight --mcp              # Run as MCP server
-ccsight --clear-cache      # Clear cache and reparse all files
+ccsight --clear-cache      # Clear cache and search index
 ccsight --limit 50         # Limit to 50 most recent sessions
 ```
 
