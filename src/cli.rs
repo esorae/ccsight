@@ -37,7 +37,10 @@ pub fn show_daily_costs(limit: usize) {
         let mut day_cache_r: u64 = 0;
         let mut day_cost: f64 = 0.0;
 
-        for session in group.sessions.iter().filter(|s| !s.is_subagent) {
+        // Include subagents so `--daily` total matches the TUI Overview /
+        // Costs panel. Subagent dispatch is real Anthropic spend tied to the
+        // day it ran on.
+        for session in &group.sessions {
             for (model, tokens) in &session.day_tokens_by_model {
                 day_input += tokens.input_tokens;
                 day_output += tokens.output_tokens;

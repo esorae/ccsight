@@ -1,2 +1,8 @@
 /target
 .DS_Store
+
+# Local denylist for `scripts/lint.sh` — contains domain-specific terms (real
+# org/product/MCP/skill names) that must never appear in committed code.
+# The file itself is the leak, so it is NEVER committed. See
+# `.lint-forbidden-terms.example` for the format.
+/.lint-forbidden-terms

@@ -47,7 +47,21 @@ impl Pins {
                         data.pins.iter().map(|e| e.path.clone()).collect();
                     (data.pins, lookup)
                 }
-                _ => (Vec::new(), HashSet::new()),
+                _ => {
+                    // Parse failure or version mismatch. Silently zeroing the
+                    // entries here is dangerous: the next pin toggle would
+                    // call save(), overwriting the on-disk file with just the
+                    // one new pin and losing every prior pin. Move the
+                    // unparseable file aside so the user can recover it later
+                    // (and so we never overwrite real data with an empty
+                    // list). Best-effort: failure to rename is silent.
+                    let backup = data_path.with_extension(format!(
+                        "json.corrupt-{}",
+                        chrono::Utc::now().format("%Y%m%dT%H%M%S")
+                    ));
+                    let _ = fs::rename(&data_path, &backup);
+                    (Vec::new(), HashSet::new())
+                }
             }
         } else {
             (Vec::new(), HashSet::new())
@@ -61,6 +75,14 @@ impl Pins {
     }
 
     pub fn save(&self) -> Result<()> {
+        // Reject the `/dev/null` placeholder used by `Pins::empty()` when HOME is unset.
+        // Saving to /dev/null on Linux silently succeeds but never persists, masking the
+        // failure. Surface it as an error so callers can inform the user.
+        if self.data_path.as_os_str() == "/dev/null" {
+            return Err(anyhow::anyhow!(
+                "Cannot save pins: HOME is not set (data_path is /dev/null fallback)"
+            ));
+        }
         if let Some(parent) = self.data_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -122,8 +144,7 @@ impl Pins {
     }
 
     fn default_path() -> Result<PathBuf> {
-        let home = std::env::var("HOME")?;
-        Ok(PathBuf::from(home).join(".config/ccsight/pins.json"))
+        crate::infrastructure::pins_path()
     }
 }
 
@@ -166,5 +187,56 @@ mod tests {
 
         assert_eq!(pins.entries[0].path, p2);
         assert_eq!(pins.entries[1].path, p1);
+    }
+
+    #[test]
+    fn test_empty_pins_save_returns_error() {
+        // Regression: Pins::empty() falls back to /dev/null when HOME is unset. save()
+        // must return an error rather than silently writing to /dev/null.
+        let pins = Pins::empty();
+        if pins.data_path.as_os_str() == "/dev/null" {
+            let err = pins.save().expect_err("save() should fail on /dev/null fallback");
+            assert!(
+                err.to_string().contains("HOME is not set"),
+                "error message should mention HOME, got: {err}"
+            );
+        }
+        // If HOME is set, default path is real and save would succeed; skip the assertion.
+    }
+
+    #[test]
+    fn test_save_load_roundtrip() {
+        // Regression: writing pins to disk and reading them back must reproduce the
+        // exact entry list (order + paths). Guards against accidental schema drift.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ccsight-pins-roundtrip-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut pins = Pins {
+            data_path: path.clone(),
+            entries: Vec::new(),
+            lookup: HashSet::new(),
+        };
+        let p1 = PathBuf::from("/tmp/a.jsonl");
+        let p2 = PathBuf::from("/tmp/b.jsonl");
+        pins.toggle(&p1);
+        pins.toggle(&p2);
+        pins.save().expect("save pins");
+
+        // Reload from the same on-disk file.
+        let file = File::open(&path).expect("open saved pins");
+        let reader = BufReader::new(file);
+        let data: PinsData = serde_json::from_reader(reader).expect("parse pins");
+
+        assert_eq!(data.version, PINS_VERSION);
+        assert_eq!(data.pins.len(), 2);
+        // Most recently toggled is at the front.
+        assert_eq!(data.pins[0].path, p2);
+        assert_eq!(data.pins[1].path, p1);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

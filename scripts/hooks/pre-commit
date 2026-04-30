@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# ccsight pre-commit hook.
+#
+# Runs cargo test, cargo clippy, and the project lint before each commit. The
+# full suite finishes in roughly a second on this codebase, so it is cheap
+# enough to keep in an interactive hook. If you genuinely need to bypass it for
+# a WIP commit, use `git commit --no-verify` sparingly.
+#
+# To install: `bash scripts/install-hooks.sh` (configures `core.hooksPath`).
+
+set -e
+
+# Locate repo root regardless of where git invokes the hook from.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "[pre-commit] cargo test ..."
+if ! cargo test --quiet 2>&1; then
+    echo "[pre-commit] FAILED: cargo test reported failures."
+    exit 1
+fi
+
+echo "[pre-commit] cargo clippy -- -D warnings ..."
+if ! cargo clippy --quiet -- -D warnings 2>&1; then
+    echo "[pre-commit] FAILED: clippy reported warnings/errors. Fix them or commit with --no-verify."
+    exit 1
+fi
+
+echo "[pre-commit] bash scripts/lint.sh ..."
+if ! bash scripts/lint.sh; then
+    echo "[pre-commit] FAILED: project lint blocked the commit."
+    exit 1
+fi
+
+echo "[pre-commit] OK"

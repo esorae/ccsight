@@ -5,6 +5,17 @@ use chrono::Local;
 use crate::domain::{ContentBlock, EntryType, MessageContent, Role};
 use crate::parser::JsonlParser;
 
+/// Maximum characters of a `thinking` block to keep in the conversation preview.
+/// Long thinking blocks are common; truncation keeps the popup readable.
+const MAX_THINKING_PREVIEW_CHARS: usize = 500;
+
+/// Maximum characters of a tool result to keep in the conversation preview.
+/// Some tool outputs (search hits, file dumps) can be huge.
+const MAX_TOOL_RESULT_PREVIEW_CHARS: usize = 2000;
+
+/// Maximum characters of a Bash `command` value rendered in the tool-input summary.
+const MAX_BASH_COMMAND_PREVIEW_CHARS: usize = 80;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationBlock {
     Text(String),
@@ -84,7 +95,8 @@ pub fn load_conversation(
                             if thinking.is_empty() {
                                 None
                             } else {
-                                let truncated: String = thinking.chars().take(500).collect();
+                                let truncated: String =
+                                    thinking.chars().take(MAX_THINKING_PREVIEW_CHARS).collect();
                                 Some(ConversationBlock::Thinking(truncated))
                             }
                         }
@@ -99,16 +111,22 @@ pub fn load_conversation(
                             content, is_error, ..
                         } => {
                             let content_str = match content {
-                                serde_json::Value::String(s) => s.chars().take(2000).collect(),
+                                serde_json::Value::String(s) => {
+                                    s.chars().take(MAX_TOOL_RESULT_PREVIEW_CHARS).collect()
+                                }
                                 serde_json::Value::Array(arr) => {
                                     let joined = arr
                                         .iter()
                                         .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
                                         .collect::<Vec<_>>()
                                         .join("\n");
-                                    joined.chars().take(2000).collect()
+                                    joined.chars().take(MAX_TOOL_RESULT_PREVIEW_CHARS).collect()
                                 }
-                                _ => content.to_string().chars().take(2000).collect(),
+                                _ => content
+                                    .to_string()
+                                    .chars()
+                                    .take(MAX_TOOL_RESULT_PREVIEW_CHARS)
+                                    .collect(),
                             };
                             Some(ConversationBlock::ToolResult {
                                 content: content_str,
@@ -150,41 +168,53 @@ pub fn load_conversation(
 }
 
 fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
-    match name {
-        "Read" | "Write" | "Edit" => input
-            .get("file_path")
+    let str_field = |key: &str| {
+        input
+            .get(key)
             .and_then(|v| v.as_str())
             .map(ToString::to_string)
-            .unwrap_or_default(),
+    };
+    match name {
+        "Read" | "Write" | "Edit" => str_field("file_path").unwrap_or_default(),
         "Bash" => input
             .get("command")
             .and_then(|v| v.as_str())
             .map(|s| {
-                let cmd: String = s.chars().take(80).collect();
-                if s.len() > 80 {
+                let cmd: String = s.chars().take(MAX_BASH_COMMAND_PREVIEW_CHARS).collect();
+                if s.chars().count() > MAX_BASH_COMMAND_PREVIEW_CHARS {
                     format!("{cmd}...")
                 } else {
                     cmd
                 }
             })
             .unwrap_or_default(),
-        "Glob" | "Grep" => input
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string)
-            .unwrap_or_default(),
-        "Task" => input
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string)
-            .unwrap_or_default(),
-        "WebFetch" | "WebSearch" => input
-            .get("url")
-            .or_else(|| input.get("query"))
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string)
+        "Glob" | "Grep" => str_field("pattern").unwrap_or_default(),
+        // `Task` / `Agent` carry `subagent_type`; show that plus optional description.
+        "Task" | "Agent" => {
+            let subagent = str_field("subagent_type");
+            let desc = str_field("description");
+            match (subagent, desc) {
+                (Some(s), Some(d)) => format!("{s}: {d}"),
+                (Some(s), None) => s,
+                (None, Some(d)) => d,
+                (None, None) => String::new(),
+            }
+        }
+        // `Skill` carries `skill` (the skill name). `args` is freeform.
+        "Skill" => {
+            let skill = str_field("skill").unwrap_or_default();
+            let args = str_field("args");
+            match args {
+                Some(a) if !a.is_empty() => format!("{skill}: {a}"),
+                _ => skill,
+            }
+        }
+        "WebFetch" | "WebSearch" => str_field("url")
+            .or_else(|| str_field("query"))
             .unwrap_or_default(),
         _ => {
+            // MCP tools (mcp__server__action / mcp__plugin_*) end up here. Show first
+            // few input keys as a hint.
             let keys: Vec<_> = input
                 .as_object()
                 .map(|o| o.keys().take(3).cloned().collect())

@@ -8,27 +8,41 @@ pub mod helpers {
     use crate::aggregator::{DailyGroup, ModelTokens, SessionInfo};
     use crate::state::TextInput;
 
-    pub fn make_session(project: &str, summary: Option<&str>, branch: Option<&str>) -> SessionInfo {
+    /// Default `SessionInfo` skeleton — every field zeroed/empty. Other helpers
+    /// in this module mutate the bits they care about, keeping each helper
+    /// focused on its discriminating fields rather than re-listing 18 defaults.
+    fn default_session() -> SessionInfo {
         SessionInfo {
             file_path: PathBuf::from("/tmp/test.jsonl"),
-            project_name: project.to_string(),
-            git_branch: branch.map(|s| s.to_string()),
+            project_name: String::new(),
+            git_branch: None,
             session_first_timestamp: Utc::now(),
             day_first_timestamp: Utc::now(),
             day_last_timestamp: Utc::now(),
-            day_input_tokens: 1000,
-            day_output_tokens: 500,
+            day_input_tokens: 0,
+            day_output_tokens: 0,
             day_tokens_by_model: HashMap::new(),
             day_hourly_activity: HashMap::new(),
             day_hourly_work_tokens: HashMap::new(),
             day_tool_usage: HashMap::new(),
             day_language_usage: HashMap::new(),
             day_extension_usage: HashMap::new(),
-            summary: summary.map(|s| s.to_string()),
+            summary: None,
             custom_title: None,
             model: None,
             is_subagent: false,
             is_continued: false,
+        }
+    }
+
+    pub fn make_session(project: &str, summary: Option<&str>, branch: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            project_name: project.to_string(),
+            git_branch: branch.map(|s| s.to_string()),
+            day_input_tokens: 1000,
+            day_output_tokens: 500,
+            summary: summary.map(|s| s.to_string()),
+            ..default_session()
         }
     }
 
@@ -49,25 +63,12 @@ pub mod helpers {
             },
         );
         SessionInfo {
-            file_path: PathBuf::from("/tmp/test.jsonl"),
             project_name: project.to_string(),
-            git_branch: None,
-            session_first_timestamp: Utc::now(),
-            day_first_timestamp: Utc::now(),
-            day_last_timestamp: Utc::now(),
             day_input_tokens: input_tokens,
             day_output_tokens: output_tokens,
             day_tokens_by_model: tokens_by_model,
-            day_hourly_activity: HashMap::new(),
-            day_hourly_work_tokens: HashMap::new(),
-            day_tool_usage: HashMap::new(),
-            day_language_usage: HashMap::new(),
-            day_extension_usage: HashMap::new(),
-            summary: None,
-            custom_title: None,
             model: Some(model.to_string()),
-            is_subagent: false,
-            is_continued: false,
+            ..default_session()
         }
     }
 
@@ -85,7 +86,6 @@ pub mod helpers {
             conv_list_mode: crate::ConvListMode::Day,
             stats: crate::aggregator::Stats::default(),
             total_cost: daily_costs.len() as f64,
-            cost_without_subagents: daily_costs.len() as f64,
             model_costs: Vec::new(),
             aggregated_model_tokens: HashMap::new(),
             models_without_pricing: std::collections::HashSet::new(),
@@ -113,6 +113,10 @@ pub mod helpers {
             dashboard_panel: 0,
             dashboard_scroll: [0; 7],
             show_dashboard_detail: false,
+            tools_detail_section: 0,
+            mcp_expanded_servers: std::collections::HashSet::new(),
+            mcp_selected_server: 0,
+            mcp_selected_tool: None,
             search_mode: false,
             search_input: TextInput::default(),
             search_results: Vec::new(),
@@ -121,6 +125,9 @@ pub mod helpers {
             searching: false,
             search_preview_mode: false,
             search_saved_state: None,
+            mcp_status: Vec::new(),
+            configured_resources: crate::infrastructure::ConfiguredResources::default(),
+            tool_last_used: HashMap::new(),
             search_index: None,
             index_build_task: None,
             ctrl_c_pressed: false,
@@ -141,20 +148,24 @@ pub mod helpers {
             retention_warning_dismissed: false,
             show_insights_detail: false,
             insights_detail_scroll: 0,
+            session_detail_scroll: 0,
             insights_panel: 0,
             toast_message: None,
             toast_time: None,
             panes: Vec::new(),
             active_pane_index: None,
             session_list_hidden: false,
-            show_conversation_detail: false,
             tab_areas: Vec::new(),
+            tools_detail_tab_areas: Vec::new(),
+            tools_panel_category_areas: Vec::new(),
+            mcp_server_row_areas: Vec::new(),
             pane_areas: Vec::new(),
             dashboard_panel_areas: Vec::new(),
             insights_panel_areas: Vec::new(),
             session_list_area: None,
             breakdown_panel_area: None,
             summary_popup_area: None,
+            active_popup_area: None,
             daily_header_area: None,
             filter_popup_area_trigger: None,
             project_popup_area_trigger: None,
@@ -178,7 +189,6 @@ pub mod helpers {
             original_daily_costs: daily_costs.clone(),
             original_stats: crate::aggregator::Stats::default(),
             original_total_cost: daily_costs.len() as f64,
-            original_cost_without_subagents: daily_costs.len() as f64,
             original_model_costs: Vec::new(),
             original_aggregated_model_tokens: HashMap::new(),
         }

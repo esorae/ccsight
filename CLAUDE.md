@@ -10,85 +10,126 @@ cargo run                    # Run TUI
 cargo test                   # Run tests
 cargo clippy -- -D warnings  # Lint (warnings are errors)
 bash scripts/lint.sh         # Project lint (UI patterns, safety)
+bash scripts/install-hooks.sh   # One-time pre-commit hook setup
 ```
 
-**Before committing, always run all 3 checks and fix any issues:**
-```bash
-cargo test && cargo clippy -- -D warnings && bash scripts/lint.sh
-```
+The pre-commit hook runs the three checks above on every commit.
 
-**Visual UI verification (tmux headless capture):**
-```bash
-cargo build --release
-tmux new-session -d -s ccsight_test -x 120 -y 40 'target/release/ccsight'
-sleep 3
-tmux send-keys -t ccsight_test '3' && sleep 1        # Switch to Insights tab
-tmux send-keys -t ccsight_test 'i' && sleep 1        # Open detail popup
-tmux capture-pane -t ccsight_test -p                  # Print to stdout
-tmux kill-session -t ccsight_test 2>/dev/null
-```
-- `cargo clippy -- -D warnings` must pass (warnings are errors)
-- `scripts/lint.sh` must exit 0
-- `cargo test` must pass all tests
+## Smoke test (tmux)
+
+The TUI can't launch from a non-interactive shell — use tmux at **140x45** (the
+size popup-width math assumes; smaller terminals truncate rightmost columns).
+Wait `sleep 5` after launch for data + tantivy index, `sleep 1` between keys.
+A reference scenario covering Tools popup, search → conv pane, filter / project
+popups, and Insights detail lives in `scripts/smoke.sh`. Watch for: rightmost
+column truncation, popup borders missing `border_style`, `▼/▶` arrow inversion,
+"Searching..." stuck after Enter (index not committed — see lint #18).
+
+## Monkey test
+
+When asked to "broadly inspect ccsight" or after large refactors, use the smoke
+script as a starting point but go beyond — visit every popup and tab, compare
+the same number across surfaces, and flag anything that disagrees. Past
+sessions caught regressions matching these patterns:
+
+- **Same number, different views**: TUI Overview vs Costs panel vs `--daily`
+  CLI total. Dashboard preview's stale count vs the popup's `⚠ N stale`. The
+  Insights metrics row vs the detail popup's "Usage by category".
+- **Same word, different meanings**: "groups" once meant 31 in the popup and
+  61 in the preview. "stale" once mixed `>30` and `>=30` thresholds.
+- **Tab/section indices**: Help text says `1-N`; verify each digit jumps to
+  the named section. Cycle with Tab/h/l and ensure the order matches.
+- **Configured but unused**: every category (Skills / Commands / Subagents /
+  MCP) should surface installed-but-never-invoked entries. If a tab only
+  shows entries from `tool_usage`, it's missing them.
+- **Empty / loading state**: searching while the index hasn't committed must
+  show "Searching...", not "No results". Same for data reload.
+- **Truncation & ellipsis**: long names should end with `…`, never raw cut.
+- **Mid-session mutability**: model badges, custom titles, branches must
+  reflect the LAST value, not the first (see `extract_session_model`).
+- **Scroll bounds**: scrollbar `N/M` should reach M, not stop short. j/k past
+  the visible end should not produce blank rows.
+
+When you find a discrepancy, prefer surfacing all of them in one report
+before fixing — fixes often fan out into multiple sites that share a value.
 
 ## Architecture
 
+`ls src/` shows the file tree; this section only covers modules whose purpose
+isn't obvious from the filename.
+
+| Module | Why it exists |
+|--------|---------------|
+| `aggregator/mod.rs` | `extract_session_model` walks entries reverse so mid-session `/model` switches are reflected in the badge. |
+| `aggregator/pricing.rs` | `models_without_pricing` set — models absent from the pricing table are surfaced (Overview `*`, Insights, MCP `stats.pricing_gap`) instead of silently $0. |
+| `aggregator/tool_category.rs` | Classifies every tool key into `BuiltIn` / `Mcp` / `Skill` / `Agent` / `Command`. UI order: **Tools (Built-in + MCP) → Skills → Commands → Subagents**. `format_tool_short` strips the `skill:` / `agent:` / `command:` prefix (sections already convey category). |
+| `infrastructure/mcp_config.rs` | Joins `~/.claude.json` + plugin `.mcp.json` with observed `tool_usage`. `is_underutilized(now, 30)` is the canonical "stale" predicate. Servers in logs but absent from current config are **inactive**, not stale. |
+| `infrastructure/resource_config.rs` | `discover_configured_resources()` walks `~/.claude/{skills,commands,agents}/` plus enabled plugin paths so the Tools popup can show 0-call rows for installed-but-unused entries. |
+| `infrastructure/cowork_source.rs` | Claude Desktop Cowork audit logs (Anthropic-private format — undocumented, may break between Claude Desktop releases). Discovery is silent on parse failure so per-file errors don't crash the TUI. |
+| `infrastructure/search_index.rs` | tantivy ngram(2,3) index at `~/.ccsight/index/`. `update_or_build()` handles fresh / incremental / reuse. |
+| `infrastructure/state_dir.rs` | Single source of truth for on-disk state paths (`~/.ccsight/{cache.json,index/,pins.json}`). `migrate_legacy_state_dirs()` is called at startup to relocate pre-1.1 paths. |
+| `handlers/mcp_popup.rs` | Tools-tab cursor row math. Coord origin must match the body slicing in `dashboard.rs::draw_dashboard_detail_popup` (see doc comment). |
+| `state.rs` | `AppState`, `ConversationPane`, `TextInput`. Adding a field is compiler-checked at every `AppState { ... }` literal. |
+| `test_helpers.rs` | `#[cfg(test)]` fixtures. `create_test_state()` returns an `AppState` with deterministic token / cost values. |
+
+## Rules
+
+**Lint-enforced** (single source of truth: `scripts/lint.sh`):
+
+```bash
+rg '^# [0-9]+\.' scripts/lint.sh   # current rule list
 ```
-src/
-├── main.rs              # Entry point, event loop
-├── state.rs             # AppState, ConversationPane, TextInput, Tab
-├── ui/
-│   ├── mod.rs           # draw(), daily, conversation, popups
-│   ├── dashboard.rs     # Dashboard panels + detail popup + sparklines
-│   └── insights.rs      # Insights panels + detail popup
-├── search.rs            # Metadata search + content fallback
-├── mcp.rs               # MCP server (stats/sessions/search tools)
-├── domain.rs            # LogEntry, Message, ContentBlock
-├── parser.rs            # JSONL parsing
-├── aggregator/          # Stats, pricing, daily grouping
-└── infrastructure/
-    ├── cache.rs         # JSON cache (~/.cache/ccsight/cache.json)
-    ├── file_discovery.rs
-    └── search_index.rs  # tantivy full-text index (~/.cache/ccsight/index/)
-```
 
-## Rules (lint enforced)
+Add new rules by copying an existing block and bumping the number.
 
-Checked by `scripts/lint.sh`. Violations block commit.
+**Not lint-enforceable** — these live as doc comments next to the code they
+govern, so they're seen at the moment of violation:
 
-| Rule | Bad | Good |
-|------|-----|------|
-| Borders need style | `.borders(Borders::ALL)` | `.borders(Borders::ALL).border_style(theme::BORDER)` |
-| Titles need Span | `.title("Foo")` | `.title(Span::styled(" Foo ", theme::PRIMARY))` |
-| No raw u16 subtract | `area.height - 4` | `area.height.saturating_sub(4)` |
-| Date format | `%y/`, `%m/%d`, `%b` | `%Y-%m-%d` or `%m-%d` |
-| Cost formatting | `format!("${cost:.2}")` | `format_cost(cost, 2)` |
-| Scroll indicators | `↑↓` in content | `▲▼` (↑↓ only for keybind help) |
-| Project name | `Path::new(&name).file_name()` | `shorten_project(&name)` |
-| Conv loading | `ui::load_conversation(...)` | `spawn_load_conversation(...)` |
-| Scrollbar | `Scrollbar::new` | `draw_scrollbar()` |
-| Legacy fields | `state.conversation_messages` | `state.panes` |
-| Pane init | `pane.load_task = Some(spawn_...)` | `ConversationPane::load_from()` |
-| sessions[] index | `group.sessions[idx]` | `.iter().filter().nth()` or `.get()` |
-| Text input | `.remove(cursor)` / `.insert(cursor,c)` | `TextInput` methods |
+- Popup overlay guards (4 sites) → `main.rs::dismiss_overlay`
+- TextInput / UTF-8 safety → `state.rs::TextInput`
+- Scroll / cursor coord unity → `handlers::mcp_popup::mcp_pre_server_offset`
+- Session-representative value → `aggregator::extract_session_model`
+- Footer span format → first `let help_spans = vec![ ... ]` in `ui/dashboard.rs`
 
-## Rules (manual review)
+**Compiler-enforced** (no rule needed):
+- AppState init parity — every `AppState { ... }` literal lists every field.
+- Real-world identifier shapes — fully covered by lint #16 / #17 / #21.
 
-| Rule | Detail |
-|------|--------|
-| Footer format | `key: action` with double-space separator |
-| Session enumerate | `.filter(!is_subagent).enumerate()` — never enumerate before filter |
-| Popup overlay guards | Guards in ALL 4: `handle_mouse_click`, `handle_double_click`, `handle_mouse_scroll`, `dismiss_overlay` |
-| AppState new field | Update ALL: `state.rs`, `run()` init, `test_helpers.rs`, `ui/mod.rs` test init |
-| TextInput usage | All text inputs use `TextInput` struct — never raw `String` + `usize` cursor |
-| Search preview | Enter saves state via `search_saved_state`, Esc restores original tab/position |
+## Tests — three layers
+
+| Layer | When | How |
+|-------|------|-----|
+| Unit (`#[test]`) | Pure logic (aggregation, formatting, classifiers). | `cargo test`; lives next to the code. |
+| Render (`TestBackend`) | UI text / layout / row regression. | `render_to_text(&mut state, w, h)` in `ui/mod.rs::tests`. Use `create_test_state()`. Test 120x35, 140x45 (popup math), 60x20 (narrow). |
+| Smoke (tmux) | Real-data, async paths (index build, summary), cross-popup key sequences. | `scripts/smoke.sh`; capture with `tmux capture-pane -p`. |
+
+Pick the lowest layer that exercises what you changed.
+
+## Tools detail popup
+
+Tab order: **0=Tools, 1=Skills, 2=Commands, 3=Subagents** (`tools_detail_section`).
+The Tools tab merges Built-in tools and MCP servers into one expandable list;
+the other three each render their own category. Every tab also surfaces
+"configured but never used" entries as zero-call rows (`░░░ 0 0% · never` in
+`LABEL_SUBTLE`) sourced from `state.mcp_status` (Tools) or
+`state.configured_resources` (Skills / Commands / Subagents).
+
+Cursor / scroll math has to agree across four sites:
+
+1. Body layout in `dashboard.rs::draw_dashboard_detail_popup` active==0
+2. Group enumeration in `mcp_popup::collect_mcp_servers`
+3. `mcp_pre_server_offset` (header row count)
+4. `dashboard::tool_usage_line_count` (scroll bound = rendered rows)
+
+Stale = configured & `is_underutilized(now, 30)`. This single predicate powers
+the preview legend, the popup `⚠`, and the Tier 3 alert — never re-implement
+the threshold inline (lint #19).
 
 ## Key Patterns
 
-- **Full-text search**: tantivy ngram(2,3). `SearchIndex::update_or_build()` handles build/incremental/reuse. Parallel parsing with rayon. `--clear-cache` clears index too.
-- **TextInput**: Shared struct for all inputs. Methods: `insert_char`, `delete_back`, `move_left/right/home/end`, `clear`, `set`, `render_spans`.
-- **Search state**: `[Normal] → / → [Search] → Enter → [Preview] → Esc → [Search] → Esc → [Normal]`
-- **Pane search**: VS Code style — Enter/Shift+Enter = next/prev match, Esc closes bar (n/N still work after).
-- **Sparklines**: Models/Projects detail popups show usage sparklines with shared X/Y axes.
-- **Async**: Background threads for data loading, summary, index building. `mpsc::channel` for results.
-- **MCP tools**: `stats` (metrics), `sessions` (list/detail + `conversation_query`), `search` (tantivy full-text). All share `date_from`/`date_to` param naming. Local timezone.
+- **Search state**: `[Normal] → / → [Search] → Enter → [Preview] → Esc → [Search] → Esc → [Normal]`. Preview saves tab/position via `search_saved_state`.
+- **Pane search**: VS Code style — Enter/Shift+Enter = next/prev, Esc closes the bar (n/N still work).
+- **Async**: Background threads for data load, summary, index build via `mpsc::channel`. UI must show "Searching..." (not "No results") while a loading flag is set.
+- **MCP tools** (`mcp.rs`): `stats` (+ per-server `mcp_servers` snapshot), `sessions`, `search`. All share `date_from` / `date_to` (`YYYY-MM-DD`, local timezone).
+- **Costs include subagents**: Overview, Costs panel, and `--daily` CLI all sum over `group.sessions` so totals match. `cost_without_subagents` was renamed `daily_costs_total`.
+- **stderr is forbidden** — writes corrupt the TUI rendering. Lint #20 enforces.

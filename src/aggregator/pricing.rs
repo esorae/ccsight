@@ -55,7 +55,14 @@ pub fn normalize_model_name(model: &str) -> String {
         return display.to_string();
     }
 
-    "Other".to_string()
+    // Unknown model family — keep the raw API name so the UI can show it individually
+    // (and flag it with a "no pricing" badge) rather than collapsing every unknown
+    // model into a single "Other" bucket. Empty input falls back to literal "unknown".
+    if model.is_empty() {
+        "unknown".to_string()
+    } else {
+        model.to_string()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +106,17 @@ impl CostCalculator {
 
     pub fn new() -> Self {
         let mut pricing = HashMap::new();
+
+        // Claude Opus 4.7: $5/$25 per MTok (same as Opus 4.6, official rates pending)
+        pricing.insert(
+            "claude-opus-4-7".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 5.0,
+                output_cost_per_mtok: 25.0,
+                cache_write_cost_per_mtok: 6.25,
+                cache_read_cost_per_mtok: 0.50,
+            },
+        );
 
         // Claude Opus 4.6: $5/$25 per MTok
         pricing.insert(
@@ -368,6 +386,14 @@ impl CostCalculator {
         if after.is_empty() {
             return true;
         }
+        // Context-window suffix like `[1m]` (1M-context variant — Cowork emits
+        // `claude-opus-4-7[1m]`) is appended directly with no `-` separator, so
+        // accept it as a valid boundary. Also covers `(beta)` / `:thinking`
+        // style qualifiers if Anthropic adds them later. Without this, the
+        // model fails pricing lookup and cost silently rounds to $0.
+        if matches!(after.chars().next(), Some('[' | '(' | ':')) {
+            return true;
+        }
         let Some(rest) = after.strip_prefix('-') else {
             return false;
         };
@@ -394,6 +420,23 @@ mod tests {
     fn test_get_pricing_unknown_model() {
         let calculator = CostCalculator::new();
         assert!(calculator.get_pricing(Some("unknown-model-xyz")).is_none());
+    }
+
+    #[test]
+    fn test_get_pricing_context_window_suffix() {
+        // Claude Code's 1M-context variant carries a `[1m]` suffix on the model
+        // ID (e.g. Cowork audit.jsonl: `claude-opus-4-7[1m]`). Without explicit
+        // boundary handling this would not match the base `claude-opus-4-7`
+        // pricing entry and cost would silently fall through to $0.
+        let calculator = CostCalculator::new();
+        assert!(
+            calculator.get_pricing(Some("claude-opus-4-7[1m]")).is_some(),
+            "[1m] context-window suffix should match the base opus-4-7 pricing"
+        );
+        assert!(
+            calculator.get_pricing(Some("claude-sonnet-4-6[1m]")).is_some(),
+            "[1m] suffix should also work for other families"
+        );
     }
 
     #[test]
@@ -555,15 +598,19 @@ mod tests {
     }
 
     #[test]
-    fn test_simplify_model_name_unknown() {
+    fn test_simplify_model_name_unknown_keeps_raw() {
+        // Unknown model families now keep their raw API name so the UI can list them
+        // individually (and flag them as missing pricing). Avoids collapsing distinct
+        // unknown models into a single opaque "Other" bucket.
         assert_eq!(
             CostCalculator::simplify_model_name("some-random-model"),
-            Some("Other".to_string())
+            Some("some-random-model".to_string())
         );
     }
 
     #[test]
     fn test_simplify_model_name_empty_and_placeholder() {
+        // Empty / placeholder values still go to "Other" because they are not real models.
         assert_eq!(
             CostCalculator::simplify_model_name(""),
             Some("Other".to_string())

@@ -79,7 +79,7 @@ fn register_tokenizer(index: &Index) {
 fn build_file_map(daily_groups: &[DailyGroup]) -> HashMap<String, u64> {
     daily_groups
         .iter()
-        .flat_map(|g| g.sessions.iter().filter(|s| !s.is_subagent))
+        .flat_map(crate::aggregator::DailyGroup::user_sessions)
         .map(|s| {
             let key = s.file_path.to_string_lossy().to_string();
             let mtime = fs::metadata(&s.file_path)
@@ -353,6 +353,7 @@ impl SearchIndex {
 
             let day_idx = get_u64(&doc, self.fields.day_idx) as usize;
             let session_idx = get_u64(&doc, self.fields.session_idx) as usize;
+            let session_path = get_str(&doc, self.fields.session_path);
 
             if seen.contains_key(&(day_idx, session_idx)) {
                 continue;
@@ -368,6 +369,11 @@ impl SearchIndex {
                 session_idx,
                 snippet: Some(format!("[{role}] {snippet}")),
                 match_type: SearchMatchType::Content,
+                // The (day_idx, session_idx) pair was captured at index build
+                // time. After a project/period filter shrinks the live
+                // daily_groups, the caller must remap using this path before
+                // pushing the result into `state.search_results`.
+                session_path: Some(session_path),
             });
         }
 
@@ -409,8 +415,7 @@ impl SearchIndex {
     }
 
     fn index_path() -> anyhow::Result<PathBuf> {
-        let home = std::env::var("HOME")?;
-        Ok(PathBuf::from(home).join(".cache/ccsight/index"))
+        super::index_dir()
     }
 
     fn save_manifest(daily_groups: &[DailyGroup], index_dir: &Path) -> anyhow::Result<()> {
@@ -432,7 +437,7 @@ mod tests {
     #[test]
     fn test_index_path() {
         let path = SearchIndex::index_path().unwrap();
-        assert!(path.to_string_lossy().contains(".cache/ccsight/index"));
+        assert!(path.to_string_lossy().contains(".ccsight/index"));
     }
 
     #[test]

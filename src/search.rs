@@ -6,10 +6,20 @@ use crate::parser::JsonlParser;
 
 #[derive(Clone)]
 pub struct SearchResult {
+    /// Position in `daily_groups` that the result currently refers to. The
+    /// tantivy index uses positions captured at build time; when a project /
+    /// period filter shrinks `daily_groups`, callers must remap these indices
+    /// (using `session_path` as the stable lookup key) before pushing into
+    /// `state.search_results`. Stale indices crash the renderer.
     pub day_idx: usize,
     pub session_idx: usize,
     pub snippet: Option<String>,
     pub match_type: SearchMatchType,
+    /// Absolute session-file path stored in the search index. Used as the
+    /// stable identifier for remapping `day_idx` / `session_idx` after
+    /// filter changes. `None` for non-index searches (where indices already
+    /// reflect the current filtered set).
+    pub session_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -43,6 +53,7 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
                     session_idx,
                     snippet: Some(session.project_name.clone()),
                     match_type: SearchMatchType::ProjectName,
+                    session_path: None,
                 });
                 continue;
             }
@@ -55,6 +66,7 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
                         session_idx,
                         snippet: Some(snippet),
                         match_type: SearchMatchType::Summary,
+                        session_path: None,
                     });
                     continue;
                 }
@@ -66,6 +78,7 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
                         session_idx,
                         snippet: Some(branch.clone()),
                         match_type: SearchMatchType::GitBranch,
+                        session_path: None,
                     });
                     continue;
                 }
@@ -80,6 +93,7 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
                         session_idx,
                         snippet: Some(session_id.to_string()),
                         match_type: SearchMatchType::SessionId,
+                        session_path: None,
                     });
                     continue;
                 }
@@ -95,6 +109,7 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
                     session_idx,
                     snippet: None,
                     match_type: SearchMatchType::Date,
+                    session_path: None,
                 });
                 continue;
             }

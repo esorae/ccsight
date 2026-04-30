@@ -19,7 +19,7 @@ pub struct RetentionWarning {
 }
 
 pub fn check_cleanup_period() -> Option<RetentionWarning> {
-    let home = dirs::home_dir()?;
+    let home = home::home_dir()?;
     let settings_path = home.join(".claude/settings.json");
 
     if !settings_path.exists() {
@@ -48,18 +48,26 @@ pub fn check_cleanup_period() -> Option<RetentionWarning> {
 impl FileDiscovery {
     pub fn find_jsonl_files_with_limit(limit: usize) -> Result<Vec<PathBuf>> {
         let home =
-            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+            home::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
 
         let claude_projects = home.join(".claude/projects");
 
-        if !claude_projects.exists() {
-            return Ok(Vec::new());
-        }
+        let mut files: Vec<PathBuf> = if claude_projects.exists() {
+            let pattern = claude_projects.join("*/*.jsonl");
+            let pattern_str = pattern.to_string_lossy();
+            glob(&pattern_str)?
+                .filter_map(std::result::Result::ok)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        let pattern = claude_projects.join("*/*.jsonl");
-        let pattern_str = pattern.to_string_lossy();
-
-        let mut files: Vec<PathBuf> = glob(&pattern_str)?.filter_map(std::result::Result::ok).collect();
+        // Cowork session logs (Claude Desktop sandbox) live outside `~/.claude/`
+        // and use the same JSONL line shape with a few field renames the
+        // parser handles. Empty on platforms without the dir. Discovery is
+        // silent here — printing to stderr corrupts the TUI; future format
+        // breakage surfaces via per-file parse warnings instead.
+        files.extend(super::cowork_source::find_cowork_audit_files());
 
         files.sort_by(|a, b| {
             let a_modified = a.metadata().and_then(|m| m.modified()).ok();
@@ -75,7 +83,8 @@ impl FileDiscovery {
     }
 }
 
-mod dirs {
+/// Local stub for home directory lookup — avoids pulling in the `dirs` crate.
+mod home {
     use std::path::PathBuf;
 
     pub fn home_dir() -> Option<PathBuf> {

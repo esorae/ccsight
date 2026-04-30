@@ -11,6 +11,44 @@ use crate::infrastructure::{
 };
 use crate::parser::JsonlParser;
 
+/// Pull the slash-command name out of a Claude Code "command invocation"
+/// user message. Real invocations have a tiny body that is wholly the XML
+/// metadata block (`<command-name>`, `<command-message>`, `<command-args>`),
+/// so we accept a message only when:
+///
+/// 1. The message contains **exactly one** `<command-name>` tag (summary
+///    regeneration prompts list dozens of historical commands as text and
+///    must not be counted), AND
+/// 2. The body is short (< 500 chars — real invocations are ~100-200; the
+///    cap rejects large prompts that happen to contain a single tag).
+///
+/// Returns at most one command name (without the leading `/`).
+pub(crate) fn extract_command_names(text: &str) -> Vec<String> {
+    if text.len() >= 500 {
+        return Vec::new();
+    }
+    if text.matches("<command-name>").count() != 1 {
+        return Vec::new();
+    }
+    let Some(open) = text.find("<command-name>") else {
+        return Vec::new();
+    };
+    let after_open = &text[open + "<command-name>".len()..];
+    let Some(close) = after_open.find("</command-name>") else {
+        return Vec::new();
+    };
+    let raw = after_open[..close].trim();
+    let name = raw.strip_prefix('/').unwrap_or(raw);
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+    {
+        return Vec::new();
+    }
+    vec![name.to_string()]
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     pub total_entries: usize,
@@ -32,6 +70,22 @@ pub struct Stats {
     pub branch_stats: HashMap<String, BranchStats>,
     pub language_usage: HashMap<String, usize>,
     pub extension_usage: HashMap<String, usize>,
+    /// Per-tool/Skills/Subagents/MCP key: distinct session-days that used this key at least once.
+    pub tool_sessions: HashMap<String, usize>,
+    /// Per-MCP-server: distinct session-days that used at least one tool from this server.
+    /// A session that uses two tools from the same server still counts as 1. Keyed by the
+    /// normalized server name (e.g. `serverA`, `orgA/serverB` for plugin-form servers).
+    pub mcp_server_sessions: HashMap<String, usize>,
+    /// Session-days that used at least one Skills entry (key starts with `skill:`).
+    pub sessions_using_skills: usize,
+    /// Session-days that used at least one Subagents entry (key starts with `agent:`).
+    pub sessions_using_subagents: usize,
+    /// Session-days that used at least one MCP tool (key starts with `mcp__`).
+    pub sessions_using_mcp: usize,
+    /// Session-days that invoked at least one slash command (key starts with `command:`).
+    pub sessions_using_commands: usize,
+    /// Total session-days (non-subagent). Denominator for adoption rate calculations.
+    pub total_session_days: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -126,6 +180,55 @@ pub struct CacheStats {
 }
 
 impl StatsAggregator {
+    /// For one session-day (iterator over the keys used in that day), increment adoption
+    /// counters and per-tool `tool_sessions` in `stats`. Each key in the iterator contributes
+    /// exactly +1 to `tool_sessions[key]`. The `sessions_using_*` counters are incremented at
+    /// most once per call (regardless of how many keys of a category appear).
+    pub(crate) fn add_session_adoption<'a, I: IntoIterator<Item = &'a String>>(
+        stats: &mut Stats,
+        keys: I,
+    ) {
+        let mut used_skill = false;
+        let mut used_subagent = false;
+        let mut used_mcp = false;
+        let mut used_command = false;
+        // Collect MCP servers touched in this session-day. Using a local set so a session
+        // that hits two tools from the same server increments `mcp_server_sessions` only
+        // once.
+        let mut servers_seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for key in keys {
+            if key.starts_with("skill:") {
+                used_skill = true;
+            } else if key.starts_with("agent:") {
+                used_subagent = true;
+            } else if key.starts_with("command:") {
+                used_command = true;
+            } else if key.starts_with("mcp__") {
+                used_mcp = true;
+                if let Some(server) = crate::aggregator::mcp_server_of(key) {
+                    servers_seen.insert(server);
+                }
+            }
+            *stats.tool_sessions.entry(key.clone()).or_insert(0) += 1;
+        }
+        if used_skill {
+            stats.sessions_using_skills += 1;
+        }
+        if used_subagent {
+            stats.sessions_using_subagents += 1;
+        }
+        if used_mcp {
+            stats.sessions_using_mcp += 1;
+        }
+        if used_command {
+            stats.sessions_using_commands += 1;
+        }
+        for server in servers_seen {
+            *stats.mcp_server_sessions.entry(server).or_insert(0) += 1;
+        }
+    }
+
 
     pub fn aggregate_with_shared_cache(files: &[PathBuf], mut cache: Cache) -> (Stats, CacheStats) {
         let mut stats = Stats::default();
@@ -145,7 +248,15 @@ impl StatsAggregator {
                 }
 
             if let Ok(entries) = JsonlParser::parse_file(file) {
-                let project_name = Self::extract_project_name_from_entries(&entries);
+                // For Cowork audit.jsonl the in-stream `cwd` is meaningless
+                // (sandbox / outputs subdir); `resolve_project_name` swaps in
+                // the sibling metadata's `processName`. Non-cowork files are
+                // unaffected. This is the single source of truth used by both
+                // the cache writer here and the grouper in `grouping.rs`.
+                let project_name = crate::infrastructure::resolve_project_name(
+                    file,
+                    Self::extract_project_name_from_entries(&entries),
+                );
                 let file_stats =
                     Self::aggregate_file_entries(&mut stats, &entries, &project_name, file);
 
@@ -239,6 +350,15 @@ impl StatsAggregator {
 
         for (tool, count) in &cached.tool_usage {
             *stats.tool_usage.entry(tool.clone()).or_insert(0) += count;
+        }
+
+        // Per-session-day adoption counts (skip subagent sessions). Denominator is
+        // `total_session_days` (also incremented per-day here).
+        if !cached.is_subagent {
+            for ds in cached.daily_stats.values() {
+                Self::add_session_adoption(stats, ds.tool_usage.keys());
+                stats.total_session_days += 1;
+            }
         }
 
         for (model, count) in &cached.model_usage {
@@ -346,7 +466,13 @@ impl StatsAggregator {
         if let Some(first) = entries_with_ts.first() {
             file_stats.first_timestamp = first.timestamp;
             file_stats.session_id = first.session_id.clone();
-            file_stats.git_branch = first.git_branch.clone();
+            // git_branch is mutable mid-session (`git checkout`); use the
+            // LATEST value, not the first. Matches `grouping.rs` and the
+            // session-representative-value rule.
+            file_stats.git_branch = entries_with_ts
+                .iter()
+                .rev()
+                .find_map(|e| e.git_branch.clone());
             let is_subagent_by_entry = first.is_sidechain;
             let is_subagent_by_filename = file
                 .file_name()
@@ -382,11 +508,13 @@ impl StatsAggregator {
         file_stats.custom_title = entries
             .iter()
             .rfind(|e| e.entry_type == EntryType::CustomTitle)
-            .and_then(|e| e.custom_title.clone());
+            .and_then(|e| e.custom_title.clone())
+            // Cowork sessions don't emit a `customTitle` JSONL entry; pull the
+            // user-curated `title` from the sibling metadata json instead so
+            // the cached value matches what the grouper would resolve.
+            .or_else(|| crate::infrastructure::resolve_cowork_title(file));
 
-        file_stats.model = entries
-            .iter().find_map(|e| e.message.as_ref()?.model.as_ref())
-            .cloned();
+        file_stats.model = super::extract_session_model(entries);
 
         for entry in entries {
             if let Some(ts) = entry.timestamp {
@@ -407,7 +535,7 @@ impl StatsAggregator {
                                 .model
                                 .clone()
                                 .unwrap_or_else(|| "unknown".to_string());
-                            if model_key == "<synthetic>" {
+                            if !super::is_real_model(&model_key) {
                                 continue;
                             }
                             daily.input_tokens += usage.input_tokens;
@@ -493,6 +621,15 @@ impl StatsAggregator {
             project.work_tokens += session_work_tokens;
         }
 
+        // Per-session-day adoption counts (skip subagent sessions). Denominator is
+        // `total_session_days` (also incremented per-day here).
+        if !file_stats.is_subagent {
+            for ds in file_stats.daily_stats.values() {
+                Self::add_session_adoption(stats, ds.tool_usage.keys());
+                stats.total_session_days += 1;
+            }
+        }
+
         file_stats.session_date = Self::extract_session_date(entries);
         if let Some(date) = file_stats.session_date {
             *stats.daily_activity.entry(date).or_insert(0) += session_tokens;
@@ -515,12 +652,31 @@ impl StatsAggregator {
     ) {
         use crate::domain::{ContentBlock, MessageContent};
 
+        // Slash commands (`/clear`, `/model`, `/<custom>`) appear as XML
+        // metadata in user message text — they are NOT tool_use blocks. Scan
+        // user messages for `<command-name>/foo</command-name>` and bump the
+        // `command:foo` key so commands show up in tool_usage stats.
+        if matches!(message.role, crate::domain::Role::User) {
+            let text = message.content.extract_text();
+            for cmd in extract_command_names(&text) {
+                let key = format!("command:{cmd}");
+                *stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
+                *file_stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
+                if let Some(date) = daily_date
+                    && let Some(d) = file_stats.daily_stats.get_mut(&date)
+                {
+                    *d.tool_usage.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+
         if let MessageContent::Blocks(ref blocks) = message.content {
             for block in blocks {
                 match block {
                     ContentBlock::ToolUse { name, input, .. } => {
-                        *stats.tool_usage.entry(name.clone()).or_insert(0) += 1;
-                        *file_stats.tool_usage.entry(name.clone()).or_insert(0) += 1;
+                        let key = crate::aggregator::tool_usage_key(name, input);
+                        *stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
+                        *file_stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
 
                         let lang = Self::extract_language_from_tool_input(name, input);
                         if let Some(lang) = lang {
@@ -539,7 +695,7 @@ impl StatsAggregator {
 
                         if let Some(date) = daily_date
                             && let Some(d) = file_stats.daily_stats.get_mut(&date) {
-                                *d.tool_usage.entry(name.clone()).or_insert(0) += 1;
+                                *d.tool_usage.entry(key).or_insert(0) += 1;
                                 if let Some(lang) = lang {
                                     *d.language_usage.entry(lang.to_string()).or_insert(0) += 1;
                                 }
@@ -573,345 +729,28 @@ impl StatsAggregator {
                     .get("file_path")
                     .or_else(|| input.get("path"))
                     .and_then(|v| v.as_str())?;
-                Self::get_language_from_path(path)
+                super::language::from_path(path)
             }
             "NotebookEdit" => {
                 let path = input.get("notebook_path").and_then(|v| v.as_str())?;
-                Self::get_language_from_path(path)
+                super::language::from_path(path)
             }
             "Glob" => {
                 let pattern = input.get("pattern").and_then(|v| v.as_str())?;
-                Self::get_language_from_glob_pattern(pattern)
+                super::language::from_glob_pattern(pattern)
             }
             "Grep" => {
                 let glob = input.get("glob").and_then(|v| v.as_str());
                 if let Some(g) = glob {
-                    return Self::get_language_from_glob_pattern(g);
+                    return super::language::from_glob_pattern(g);
                 }
                 let type_filter = input.get("type").and_then(|v| v.as_str())?;
-                Self::get_language_from_type_filter(type_filter)
+                super::language::from_type_filter(type_filter)
             }
             _ => None,
         }
     }
 
-    fn get_language_from_type_filter(type_filter: &str) -> Option<&'static str> {
-        match type_filter {
-            "ada" => Some("Ada"),
-            "astro" => Some("Astro"),
-            "c" | "h" => Some("C"),
-            "clojure" | "clj" => Some("Clojure"),
-            "cpp" | "c++" => Some("C++"),
-            "cs" | "csharp" => Some("C#"),
-            "css" | "scss" | "sass" | "less" => Some("CSS"),
-            "d" => Some("D"),
-            "dart" => Some("Dart"),
-            "docker" | "dockerfile" => Some("Docker"),
-            "elixir" => Some("Elixir"),
-            "elm" => Some("Elm"),
-            "erlang" | "erl" => Some("Erlang"),
-            "fortran" => Some("Fortran"),
-            "fs" | "fsharp" => Some("F#"),
-            "gdscript" | "gd" => Some("GDScript"),
-            "glsl" => Some("GLSL"),
-            "go" => Some("Go"),
-            "graphql" | "gql" => Some("GraphQL"),
-            "haskell" | "hs" => Some("Haskell"),
-            "html" => Some("HTML"),
-            "java" => Some("Java"),
-            "js" | "jsx" | "javascript" => Some("JavaScript"),
-            "json" => Some("JSON"),
-            "julia" | "jl" => Some("Julia"),
-            "kotlin" | "kt" => Some("Kotlin"),
-            "latex" | "tex" => Some("LaTeX"),
-            "lua" => Some("Lua"),
-            "md" | "markdown" => Some("Markdown"),
-            "nim" => Some("Nim"),
-            "nix" => Some("Nix"),
-            "ocaml" | "ml" => Some("OCaml"),
-            "perl" | "pl" => Some("Perl"),
-            "php" => Some("PHP"),
-            "powershell" | "ps1" => Some("PowerShell"),
-            "proto" | "protobuf" => Some("Protobuf"),
-            "purescript" | "purs" => Some("PureScript"),
-            "py" | "python" => Some("Python"),
-            "r" => Some("R"),
-            "ruby" | "rb" => Some("Ruby"),
-            "rust" => Some("Rust"),
-            "scala" => Some("Scala"),
-            "sh" | "shell" | "bash" | "zsh" | "fish" => Some("Shell"),
-            "solidity" | "sol" => Some("Solidity"),
-            "sql" => Some("SQL"),
-            "svelte" => Some("Svelte"),
-            "swift" => Some("Swift"),
-            "terraform" | "tf" | "hcl" => Some("Terraform"),
-            "toml" => Some("TOML"),
-            "ts" | "tsx" | "typescript" => Some("TypeScript"),
-            "vue" => Some("Vue"),
-            "xml" => Some("XML"),
-            "yaml" => Some("YAML"),
-            "zig" => Some("Zig"),
-            _ => None,
-        }
-    }
-
-    pub fn language_for_extension(ext: &str) -> &'static str {
-        match ext {
-            // A
-            "abap" => "ABAP",
-            "ada" | "adb" | "ads" => "Ada",
-            "apex" => "Apex",
-            "applescript" | "scpt" => "AppleScript",
-            "asm" | "s" | "nasm" => "Assembly",
-            "astro" => "Astro",
-            "awk" => "AWK",
-
-            // B
-            "bat" | "cmd" => "Batch",
-
-            // C
-            "c" | "h" => "C",
-            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "ipp" | "inl" => "C++",
-            "cs" => "C#",
-            "cairo" => "Cairo",
-            "clj" | "cljs" | "cljc" | "edn" => "Clojure",
-            "cmake" => "CMake",
-            "cob" | "cbl" | "cpy" => "COBOL",
-            "coffee" | "litcoffee" => "CoffeeScript",
-            "cr" => "Crystal",
-            "css" | "scss" | "sass" | "less" | "styl" | "stylus" => "CSS",
-            "csv" | "tsv" => "CSV",
-            "cu" | "cuh" => "CUDA",
-
-            // D
-            "d" => "D",
-            "dart" => "Dart",
-            "dhall" => "Dhall",
-            "dockerfile" => "Docker",
-
-            // E
-            "ejs" => "EJS",
-            "elm" => "Elm",
-            "ex" | "exs" | "heex" | "leex" => "Elixir",
-            "erl" | "hrl" => "Erlang",
-
-            // F
-            "f" | "f90" | "f95" | "f03" | "f08" | "for" => "Fortran",
-            "fs" | "fsi" | "fsx" => "F#",
-
-            // G
-            "gd" | "gdscript" => "GDScript",
-            "gleam" => "Gleam",
-            "glsl" | "vert" | "frag" | "geom" | "comp" => "GLSL",
-            "go" => "Go",
-            "gradle" => "Gradle",
-            "graphql" | "gql" => "GraphQL",
-            "groovy" | "gvy" => "Groovy",
-
-            // H
-            "haml" => "HAML",
-            "hbs" | "handlebars" => "Handlebars",
-            "hs" | "lhs" => "Haskell",
-            "hcl" => "HCL",
-            "hlsl" => "HLSL",
-            "html" | "htm" | "xhtml" => "HTML",
-            "http" | "rest" => "HTTP",
-
-            // I-J
-            "idris" | "idr" => "Idris",
-            "ipynb" => "Jupyter",
-            "java" => "Java",
-            "jinja" | "jinja2" | "j2" => "Jinja",
-            "jl" => "Julia",
-            "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
-            "json" | "jsonc" | "jsonl" | "json5" | "geojson" => "JSON",
-
-            // K
-            "kdl" => "KDL",
-            "kt" | "kts" => "Kotlin",
-
-            // L
-            "latex" | "tex" | "ltx" | "sty" => "LaTeX",
-            "liquid" => "Liquid",
-            "lisp" | "cl" | "el" | "elisp" => "Lisp",
-            "lock" => "Lock",
-            "lua" => "Lua",
-
-            // M
-            "m" | "mm" => "Objective-C",
-            "makefile" | "mk" => "Makefile",
-            "mat" | "matlab" => "MATLAB",
-            "md" | "mdx" | "rst" | "adoc" | "asciidoc" => "Markdown",
-            "ml" | "mli" => "OCaml",
-            "mojo" => "Mojo",
-            "move" => "Move",
-            "mustache" => "Mustache",
-
-            // N
-            "nim" => "Nim",
-            "nix" => "Nix",
-            "njk" | "nunjucks" => "Nunjucks",
-            "nu" => "Nushell",
-
-            // O
-            "odin" => "Odin",
-
-            // P
-            "pas" | "pp" | "lpr" => "Pascal",
-            "pdf" => "PDF",
-            "perl" | "pl" | "pm" | "t" | "pod" => "Perl",
-            "php" | "phtml" | "phps" => "PHP",
-            "prisma" => "Prisma",
-            "proto" => "Protobuf",
-            "ps1" | "psm1" | "psd1" => "PowerShell",
-            "pug" | "jade" => "Pug",
-            "purs" => "PureScript",
-            "py" | "pyi" | "pyw" | "pyx" => "Python",
-
-            // R
-            "r" => "R",
-            "rkt" | "scrbl" => "Racket",
-            "re" | "rei" => "ReScript",
-            "rmd" => "R Markdown",
-            "robot" => "Robot Framework",
-            "rs" => "Rust",
-
-            // S
-            "scala" | "sc" => "Scala",
-            "scm" | "ss" => "Scheme",
-            "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh" => "Shell",
-            "slim" => "Slim",
-            "snap" => "Snapshot",
-            "sol" => "Solidity",
-            "sql" | "psql" | "mysql" | "pgsql" | "plsql" => "SQL",
-            "sv" | "svh" | "verilog" => "Verilog",
-            "svelte" => "Svelte",
-            "swift" => "Swift",
-
-            // T
-            "tcl" | "tk" => "Tcl",
-            "tf" | "tfvars" => "Terraform",
-            "toml" => "TOML",
-            "ts" | "tsx" | "mts" | "cts" => "TypeScript",
-            "twig" => "Twig",
-            "txt" | "text" | "log" => "Text",
-
-            // V
-            "v" => "V",
-            "vala" | "vapi" => "Vala",
-            "vb" => "Visual Basic",
-            "vhd" | "vhdl" => "VHDL",
-            "vue" => "Vue",
-
-            // W
-            "wasm" | "wat" => "WebAssembly",
-            "wgsl" => "WGSL",
-
-            // X-Y
-            "xaml" => "XAML",
-            "xml" | "xsl" | "xslt" | "xsd" | "plist" | "rss" | "atom" => "XML",
-            "yaml" | "yml" => "YAML",
-
-            // Z
-            "zig" => "Zig",
-
-            // Binary & media
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tiff" | "avif" | "svg" => "Image",
-            "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" => "Audio",
-            "mp4" | "webm" | "avi" | "mov" | "mkv" | "flv" => "Video",
-            "ttf" | "otf" | "woff" | "woff2" | "eot" => "Font",
-            "zip" | "gz" | "tar" | "bz2" | "xz" | "7z" | "rar" | "zst" => "Archive",
-
-            _ => "Other",
-        }
-    }
-
-    fn get_language_from_glob_pattern(pattern: &str) -> Option<&'static str> {
-        let filename = pattern.rsplit('/').next().unwrap_or(pattern);
-        if let Some(brace_start) = filename.find('{')
-            && let Some(brace_end) = filename.find('}') {
-                let inner = &filename[brace_start + 1..brace_end];
-                for part in inner.split(',') {
-                    let ext = part.trim().trim_start_matches('.');
-                    let lang = Self::language_for_extension(&ext.to_lowercase());
-                    if lang != "Other" {
-                        return Some(lang);
-                    }
-                }
-                return None;
-            }
-        Self::get_language_from_path(pattern)
-    }
-
-    fn get_language_from_path(path: &str) -> Option<&'static str> {
-        let filename = path.rsplit('/').next().unwrap_or(path);
-        let filename_lower = filename.to_lowercase();
-
-        match filename_lower.as_str() {
-            "makefile" | "gnumakefile" | "justfile" => return Some("Makefile"),
-            "dockerfile" | "containerfile" => return Some("Docker"),
-            "gemfile" | "rakefile" | "vagrantfile" => return Some("Ruby"),
-            "cmakelists.txt" => return Some("CMake"),
-            _ => {}
-        }
-
-        let ext = filename.rsplit('.').next()?.to_lowercase();
-        if ext == filename_lower {
-            return Some("Other");
-        }
-
-        Some(Self::language_for_extension(&ext))
-    }
-
-    fn get_extension_from_path(path: &str) -> Option<String> {
-        let filename = path.rsplit('/').next().unwrap_or(path);
-        let filename_lower = filename.to_lowercase();
-
-        match filename_lower.as_str() {
-            "makefile" | "gnumakefile" | "justfile" | "dockerfile" | "containerfile"
-            | "gemfile" | "rakefile" | "vagrantfile" | "cmakelists.txt" => return None,
-            _ => {}
-        }
-
-        let ext = filename.rsplit('.').next()?.to_lowercase();
-        if ext == filename_lower {
-            return None;
-        }
-        Some(ext)
-    }
-
-    fn parse_extensions_from_glob(pattern: &str) -> Vec<String> {
-        let filename = pattern.rsplit('/').next().unwrap_or(pattern);
-        let Some(dot_pos) = filename.rfind('.') else {
-            return vec![];
-        };
-        let after_dot = &filename[dot_pos + 1..];
-        if after_dot.is_empty() {
-            return vec![];
-        }
-
-        if after_dot.starts_with('{') && after_dot.ends_with('}') {
-            let inner = &after_dot[1..after_dot.len() - 1];
-            return inner
-                .split(',')
-                .filter_map(|s| {
-                    let s = s.trim().to_lowercase();
-                    let s = s.replace('*', "");
-                    if s.is_empty() || s.contains('{') || s.contains('}') {
-                        None
-                    } else {
-                        Some(s)
-                    }
-                })
-                .collect();
-        }
-
-        let ext = after_dot.to_lowercase().replace('*', "");
-        if ext.is_empty() || ext == filename.to_lowercase() {
-            return vec![];
-        }
-        vec![ext]
-    }
 
     pub(crate) fn extract_extensions_from_tool_input(
         tool_name: &str,
@@ -923,25 +762,25 @@ impl StatsAggregator {
                     .get("file_path")
                     .or_else(|| input.get("path"))
                     .and_then(|v| v.as_str());
-                path.and_then(Self::get_extension_from_path)
+                path.and_then(super::language::extension_from_path)
                     .into_iter()
                     .collect()
             }
             "NotebookEdit" => {
                 let path = input.get("notebook_path").and_then(|v| v.as_str());
-                path.and_then(Self::get_extension_from_path)
+                path.and_then(super::language::extension_from_path)
                     .into_iter()
                     .collect()
             }
             "Glob" => {
                 let pattern = input.get("pattern").and_then(|v| v.as_str());
                 pattern
-                    .map(Self::parse_extensions_from_glob)
+                    .map(super::language::parse_extensions_from_glob)
                     .unwrap_or_default()
             }
             "Grep" => {
                 let glob = input.get("glob").and_then(|v| v.as_str());
-                glob.map(Self::parse_extensions_from_glob)
+                glob.map(super::language::parse_extensions_from_glob)
                     .unwrap_or_default()
             }
             _ => vec![],
@@ -1042,31 +881,31 @@ mod tests {
     #[test]
     fn test_get_language_from_path_extensions() {
         assert_eq!(
-            StatsAggregator::get_language_from_path("/src/main.rs"),
+            crate::aggregator::language::from_path("/src/main.rs"),
             Some("Rust")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/app.tsx"),
+            crate::aggregator::language::from_path("/app.tsx"),
             Some("TypeScript")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/script.py"),
+            crate::aggregator::language::from_path("/script.py"),
             Some("Python")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/data.json"),
+            crate::aggregator::language::from_path("/data.json"),
             Some("JSON")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/data.jsonl"),
+            crate::aggregator::language::from_path("/data.jsonl"),
             Some("JSON")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/style.scss"),
+            crate::aggregator::language::from_path("/style.scss"),
             Some("CSS")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/page.vue"),
+            crate::aggregator::language::from_path("/page.vue"),
             Some("Vue")
         );
     }
@@ -1074,39 +913,39 @@ mod tests {
     #[test]
     fn test_get_language_from_path_new_extensions() {
         assert_eq!(
-            StatsAggregator::get_language_from_path("/readme.txt"),
+            crate::aggregator::language::from_path("/readme.txt"),
             Some("Text")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/data.csv"),
+            crate::aggregator::language::from_path("/data.csv"),
             Some("CSV")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/icon.png"),
+            crate::aggregator::language::from_path("/icon.png"),
             Some("Image")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/logo.svg"),
+            crate::aggregator::language::from_path("/logo.svg"),
             Some("Image")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/notebook.ipynb"),
+            crate::aggregator::language::from_path("/notebook.ipynb"),
             Some("Jupyter")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/Cargo.lock"),
+            crate::aggregator::language::from_path("/Cargo.lock"),
             Some("Lock")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/app.conf"),
+            crate::aggregator::language::from_path("/app.conf"),
             Some("Other")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/test.snap"),
+            crate::aggregator::language::from_path("/test.snap"),
             Some("Snapshot")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/template.hbs"),
+            crate::aggregator::language::from_path("/template.hbs"),
             Some("Handlebars")
         );
     }
@@ -1114,23 +953,23 @@ mod tests {
     #[test]
     fn test_get_language_from_path_dotfiles() {
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/.gitignore"),
+            crate::aggregator::language::from_path("/project/.gitignore"),
             Some("Other")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/.editorconfig"),
+            crate::aggregator::language::from_path("/project/.editorconfig"),
             Some("Other")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/.env"),
+            crate::aggregator::language::from_path("/project/.env"),
             Some("Other")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/.prettierrc"),
+            crate::aggregator::language::from_path("/project/.prettierrc"),
             Some("Other")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/.node-version"),
+            crate::aggregator::language::from_path("/project/.node-version"),
             Some("Other")
         );
     }
@@ -1138,19 +977,19 @@ mod tests {
     #[test]
     fn test_get_language_from_path_extensionless_files() {
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/Makefile"),
+            crate::aggregator::language::from_path("/project/Makefile"),
             Some("Makefile")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/Dockerfile"),
+            crate::aggregator::language::from_path("/project/Dockerfile"),
             Some("Docker")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/Gemfile"),
+            crate::aggregator::language::from_path("/project/Gemfile"),
             Some("Ruby")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/Justfile"),
+            crate::aggregator::language::from_path("/project/Justfile"),
             Some("Makefile")
         );
     }
@@ -1158,11 +997,11 @@ mod tests {
     #[test]
     fn test_get_language_from_path_unknown_extensionless() {
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/LICENSE"),
+            crate::aggregator::language::from_path("/project/LICENSE"),
             Some("Other")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/CHANGELOG"),
+            crate::aggregator::language::from_path("/project/CHANGELOG"),
             Some("Other")
         );
     }
@@ -1170,19 +1009,19 @@ mod tests {
     #[test]
     fn test_get_language_from_path_real_world_other() {
         assert_eq!(
-            StatsAggregator::get_language_from_path("/config.kdl"),
+            crate::aggregator::language::from_path("/config.kdl"),
             Some("KDL")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/.envrc"),
+            crate::aggregator::language::from_path("/.envrc"),
             Some("Other")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/.env.example"),
+            crate::aggregator::language::from_path("/.env.example"),
             Some("Other")
         );
         assert_eq!(
-            StatsAggregator::get_language_from_path("/project/.claude"),
+            crate::aggregator::language::from_path("/project/.claude"),
             Some("Other")
         );
     }
@@ -1252,6 +1091,137 @@ mod tests {
         assert_eq!(
             StatsAggregator::extract_language_from_tool_input("Read", &input),
             Some("Rust")
+        );
+    }
+
+    // ─── Adoption / tool_sessions counters ───────────────────────────────────
+
+    fn keys(slice: &[&str]) -> Vec<String> {
+        slice.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn test_add_session_adoption_counts_skill_subagent_mcp_once_per_call() {
+        let mut stats = Stats::default();
+        let day_keys = keys(&[
+            "Bash",
+            "skill:s1",
+            "skill:s2",
+            "agent:t1",
+            "mcp__server1__action",
+        ]);
+        StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
+
+        // Even though two `skill:*` keys are present, sessions_using_skills increments only once.
+        assert_eq!(stats.sessions_using_skills, 1);
+        assert_eq!(stats.sessions_using_subagents, 1);
+        assert_eq!(stats.sessions_using_mcp, 1);
+    }
+
+    #[test]
+    fn test_add_session_adoption_per_tool_session_count() {
+        let mut stats = Stats::default();
+        let day1 = keys(&["Bash", "skill:s1"]);
+        let day2 = keys(&["Bash", "skill:s1", "skill:s2"]);
+        StatsAggregator::add_session_adoption(&mut stats, day1.iter());
+        StatsAggregator::add_session_adoption(&mut stats, day2.iter());
+
+        // tool_sessions counts +1 per call where the key appears.
+        assert_eq!(stats.tool_sessions.get("Bash"), Some(&2));
+        assert_eq!(stats.tool_sessions.get("skill:s1"), Some(&2));
+        assert_eq!(stats.tool_sessions.get("skill:s2"), Some(&1));
+        // sessions_using_skills increments on every call that has at least one skill key.
+        assert_eq!(stats.sessions_using_skills, 2);
+    }
+
+    #[test]
+    fn test_add_session_adoption_no_meta_keys_no_increment() {
+        let mut stats = Stats::default();
+        let day_keys = keys(&["Bash", "Read", "Edit"]);
+        StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
+
+        assert_eq!(stats.sessions_using_skills, 0);
+        assert_eq!(stats.sessions_using_subagents, 0);
+        assert_eq!(stats.sessions_using_mcp, 0);
+        assert_eq!(stats.tool_sessions.len(), 3);
+    }
+
+    #[test]
+    fn test_add_session_adoption_empty_input() {
+        let mut stats = Stats::default();
+        let empty: Vec<String> = Vec::new();
+        StatsAggregator::add_session_adoption(&mut stats, empty.iter());
+
+        assert_eq!(stats.sessions_using_skills, 0);
+        assert_eq!(stats.tool_sessions.len(), 0);
+    }
+
+    #[test]
+    fn test_add_session_adoption_agent_and_task_both_increment_subagents() {
+        // Both `agent:*` (rewritten from Agent and Task tools) feed subagents counter.
+        let mut stats = Stats::default();
+        let day1 = keys(&["agent:type-a"]);
+        let day2 = keys(&["agent:type-b"]);
+        StatsAggregator::add_session_adoption(&mut stats, day1.iter());
+        StatsAggregator::add_session_adoption(&mut stats, day2.iter());
+
+        assert_eq!(stats.sessions_using_subagents, 2);
+        assert_eq!(stats.tool_sessions.get("agent:type-a"), Some(&1));
+        assert_eq!(stats.tool_sessions.get("agent:type-b"), Some(&1));
+    }
+
+    #[test]
+    fn test_add_session_adoption_mcp_server_sessions_deduped_per_session() {
+        // Regression: a session that hits two tools from the SAME MCP server must
+        // increment `mcp_server_sessions[<server>]` only once. Previously the only
+        // per-server metric was summed from per-tool `tool_sessions`, which double-
+        // counted sessions that used multiple tools from the same server.
+        let mut stats = Stats::default();
+        let day1 = keys(&[
+            "mcp__server1__action1",
+            "mcp__server1__action2",
+            "mcp__server2__other",
+        ]);
+        StatsAggregator::add_session_adoption(&mut stats, day1.iter());
+        let day2 = keys(&["mcp__server1__action1"]);
+        StatsAggregator::add_session_adoption(&mut stats, day2.iter());
+
+        // server1: used in day1 and day2 → 2 sessions (despite 3 tool invocations total)
+        assert_eq!(stats.mcp_server_sessions.get("server1"), Some(&2));
+        // server2: used only in day1 → 1 session
+        assert_eq!(stats.mcp_server_sessions.get("server2"), Some(&1));
+        // tool_sessions still records per-key session-day counts.
+        assert_eq!(stats.tool_sessions.get("mcp__server1__action1"), Some(&2));
+        assert_eq!(stats.tool_sessions.get("mcp__server1__action2"), Some(&1));
+    }
+
+    #[test]
+    fn test_add_session_adoption_mcp_prefix_match() {
+        // Both standard `mcp__server__tool` and plugin `mcp__plugin_*` are detected.
+        let mut stats = Stats::default();
+        let day_keys = keys(&[
+            "mcp__server1__action",
+            "mcp__plugin_orgA_serverB__action",
+        ]);
+        StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
+
+        assert_eq!(stats.sessions_using_mcp, 1);
+        assert_eq!(stats.tool_sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_add_session_adoption_plugin_only_session_counts_as_mcp() {
+        // Regression: a session that uses ONLY plugin-form MCP tools (no standard form)
+        // must still increment sessions_using_mcp. Guards against a future refactor that
+        // narrows the prefix check to e.g. `starts_with("mcp__server")`.
+        let mut stats = Stats::default();
+        let day_keys = keys(&["mcp__plugin_orgA_serverB__action"]);
+        StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
+
+        assert_eq!(stats.sessions_using_mcp, 1);
+        assert_eq!(
+            stats.tool_sessions.get("mcp__plugin_orgA_serverB__action"),
+            Some(&1)
         );
     }
 }

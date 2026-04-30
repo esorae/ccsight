@@ -199,11 +199,20 @@ impl CcsightServer {
         let mut tool_counts: HashMap<String, usize> = HashMap::new();
         let mut lang_counts: HashMap<String, usize> = HashMap::new();
 
+        // Track models encountered in the filtered window that lack a pricing entry,
+        // so the stats response can surface the silent-$0 risk to the caller.
+        let mut models_without_pricing: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for group in &filtered {
             for session in &group.sessions {
                 let mut session_cost = 0.0;
                 for (model, tokens) in &session.day_tokens_by_model {
                     let cost = calculator.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
+                    if !calculator.has_pricing(Some(model)) {
+                        models_without_pricing
+                            .insert(crate::aggregator::normalize_model_name(model));
+                    }
                     session_cost += cost;
                     total_cost += cost;
                     total_cache_creation += tokens.cache_creation_tokens;
@@ -228,12 +237,12 @@ impl CcsightServer {
                     let day = daily_agg.entry(group.date).or_default();
                     day.0 += session_cost;
                     day.1 += 1;
-                    day.2 += session.day_input_tokens + session.day_output_tokens;
+                    day.2 += session.work_tokens();
                 }
 
                 let proj = project_agg.entry(session.project_name.clone()).or_default();
                 proj.0 += 1;
-                proj.1 += session.day_input_tokens + session.day_output_tokens;
+                proj.1 += session.work_tokens();
                 proj.2 += session_cost;
 
                 for (hour, tokens) in &session.day_hourly_work_tokens {
@@ -336,10 +345,71 @@ impl CcsightServer {
                 .cmp(&a["count"].as_u64().unwrap_or(0))
         });
 
+        // Surface models that lack a pricing entry. Without this hint, consumers of the
+        // stats tool would see a `total_cost_usd` that silently excludes any spend on
+        // unknown models (e.g., a newly released model before `pricing.rs` is updated).
+        let pricing_gap_json = if models_without_pricing.is_empty() {
+            serde_json::Value::Null
+        } else {
+            let mut names: Vec<&String> = models_without_pricing.iter().collect();
+            names.sort();
+            serde_json::json!({
+                "count": names.len(),
+                "models": names,
+                "note": "total_cost_usd excludes spend on these models because pricing is not yet defined",
+            })
+        };
+
+        // Per-MCP-server adoption snapshot: configured, last_used, total_calls,
+        // status (active / stale-idle / stale-never / inactive). Mirrors what
+        // the Tools popup shows. Useful for users asking "which servers are
+        // I paying mental tax on but never invoking" via the MCP API.
+        let mcp_status_json = {
+            let now = chrono::Utc::now();
+            let owned: Vec<crate::aggregator::DailyGroup> =
+                filtered.iter().map(|g| (*g).clone()).collect();
+            let mut entries: Vec<serde_json::Value> =
+                crate::infrastructure::compute_mcp_status(&owned)
+                    .into_iter()
+                    .map(|s| {
+                        // `is_underutilized(now, 30)` is the canonical "stale"
+                        // predicate; reusing it here keeps the MCP API field
+                        // in lockstep with the TUI legend / popup ⚠ marker.
+                        let status = if !s.configured {
+                            "inactive"
+                        } else if s.last_used.is_none() {
+                            "stale-never"
+                        } else if s.is_underutilized(now, 30) {
+                            "stale-idle"
+                        } else {
+                            "active"
+                        };
+                        serde_json::json!({
+                            "name": s.name,
+                            "configured": s.configured,
+                            "last_used": s.last_used.map(|t| t.to_rfc3339()),
+                            "total_calls": s.total_calls,
+                            "status": status,
+                        })
+                    })
+                    .collect();
+            entries.sort_by(|a, b| {
+                a["status"].as_str().cmp(&b["status"].as_str())
+                    .then_with(|| {
+                        b["total_calls"].as_u64().unwrap_or(0)
+                            .cmp(&a["total_calls"].as_u64().unwrap_or(0))
+                    })
+                    .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
+            });
+            entries
+        };
+
         let mut result = serde_json::json!({
             "period": period_label,
             "date_range": date_range,
             "total_cost_usd": (total_cost * 100.0).round() / 100.0,
+            "pricing_gap": pricing_gap_json,
+            "mcp_servers": mcp_status_json,
             "total_sessions": session_count,
             "tokens": {
                 "input": total_input,
@@ -462,7 +532,7 @@ impl CcsightServer {
                 "summary": session.summary.as_deref().or(session.custom_title.as_deref()),
                 "snippet": result.snippet,
                 "match_type": match_type,
-                "tokens": session.day_input_tokens + session.day_output_tokens,
+                "tokens": session.work_tokens(),
                 "cost_usd": (cost * 100.0).round() / 100.0,
                 "session_id": session_id,
                 "git_branch": session.git_branch,
@@ -1233,6 +1303,66 @@ mod tests {
         assert_eq!(json["total_sessions"], 0);
         assert_eq!(json["total_cost_usd"], 0.0);
         assert_eq!(json["tokens"]["input"], 0);
+        // No sessions → no pricing gap to report.
+        assert!(json["pricing_gap"].is_null());
+    }
+
+    #[test]
+    fn test_stats_pricing_gap_flagged_for_unknown_model() {
+        // Regression: when a session uses a model not in `pricing.rs`, the stats tool
+        // must surface `pricing_gap` so callers know `total_cost_usd` is undercounted.
+        let today = Local::now().date_naive();
+        let groups = vec![make_daily_group(
+            today,
+            vec![make_session_with_tokens(
+                "~/projects/app",
+                100_000,
+                50_000,
+                "claude-future-experimental-x",
+            )],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_stats(&server, None);
+
+        assert!(
+            !json["pricing_gap"].is_null(),
+            "pricing_gap should be present when an unknown model is used. Got: {json}"
+        );
+        assert_eq!(json["pricing_gap"]["count"], 1);
+        let models = json["pricing_gap"]["models"]
+            .as_array()
+            .expect("models is array");
+        assert_eq!(models.len(), 1);
+        // The model name is normalized — future families preserve their raw name.
+        assert!(
+            models[0]
+                .as_str()
+                .is_some_and(|s| s.contains("future-experimental-x")),
+            "pricing_gap.models should include the raw/normalized unknown model name. Got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_stats_no_pricing_gap_when_all_models_priced() {
+        // Regression: when every model in the window has pricing, `pricing_gap` must be
+        // null so downstream consumers don't warn unnecessarily.
+        let today = Local::now().date_naive();
+        let groups = vec![make_daily_group(
+            today,
+            vec![make_session_with_tokens(
+                "~/projects/app",
+                100_000,
+                50_000,
+                "claude-opus-4-5-20251101",
+            )],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let json = call_stats(&server, None);
+
+        assert!(
+            json["pricing_gap"].is_null(),
+            "pricing_gap should be null when all models are priced. Got: {json}"
+        );
     }
 
     #[test]

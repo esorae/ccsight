@@ -1,7 +1,8 @@
 [package]
 name = "ccsight"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2024"
+rust-version = "1.87"
 description = "Claude Code log viewer with integrated statistics and daily summaries"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/esorae/ccsight"
@@ -31,9 +32,6 @@ clap = { version = "4", features = ["derive"] }
 
 # File discovery
 glob = "0.3"
-
-# Directories
-directories = "6"
 
 # Syntax highlighting
 syntect = "5"

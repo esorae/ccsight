@@ -9,6 +9,12 @@ use crate::aggregator::{CacheStats, CostCalculator, DailyGroup, Stats, TokenStat
 use crate::infrastructure::{RetentionWarning, SearchIndex};
 use crate::{pins, search, ConversationMessage};
 
+/// Canonical input-field type. Every text entry surface (search box, filter,
+/// custom date) MUST use this rather than a raw `String + usize` cursor pair.
+/// `cursor` is a CHAR index, not a byte offset, and the methods below all
+/// translate to byte offsets via `char_indices` so multi-byte input (Japanese,
+/// emoji) doesn't panic on non-char-boundary slicing. Lint #15 catches the
+/// most common mistake (raw `.remove(cursor)` / `.insert(cursor, …)` ops).
 #[derive(Default, Clone)]
 pub struct TextInput {
     pub text: String,
@@ -161,13 +167,22 @@ impl PeriodFilter {
     pub fn date_range_label(self) -> String {
         let (start, end) = self.date_range();
         let today = chrono::Local::now().date_naive();
+        // Preset filters (Today/7d/30d/...) are always anchored on today, so the
+        // year is implicit and we save header real-estate by showing only `%m-%d`.
+        // Custom ranges can span arbitrary years, so spell out the year there
+        // to avoid ambiguity (e.g. "04-01 - 04-30" of which year?).
+        let (fmt, sep) = match self {
+            PeriodFilter::Custom(_, _) => ("%Y-%m-%d", ".."),
+            _ => ("%m-%d", " - "),
+        };
         match (start, end) {
-            (Some(s), None) if s == today => format!("({})", s.format("%m-%d")),
+            (Some(s), None) if s == today => format!("({})", s.format(fmt)),
             (Some(s), None) => {
-                format!("({} - {})", s.format("%m-%d"), today.format("%m-%d"))
+                format!("({}{sep}{})", s.format(fmt), today.format(fmt))
             }
+            (Some(s), Some(e)) if s == e => format!("({})", s.format(fmt)),
             (Some(s), Some(e)) => {
-                format!("({} - {})", s.format("%m-%d"), e.format("%m-%d"))
+                format!("({}{sep}{})", s.format(fmt), e.format(fmt))
             }
             _ => String::new(),
         }
@@ -183,21 +198,63 @@ impl PeriodFilter {
             Some(PeriodFilter::Custom(date, Some(date)))
         } else {
             let parts: Vec<&str> = input.split('-').collect();
-            if parts.len() == 2 {
-                let year: i32 = parts[0].parse().ok()?;
-                let month: u32 = parts[1].parse().ok()?;
-                let first = NaiveDate::from_ymd_opt(year, month, 1)?;
-                let next = if month == 12 {
-                    NaiveDate::from_ymd_opt(year + 1, 1, 1)?
-                } else {
-                    NaiveDate::from_ymd_opt(year, month + 1, 1)?
-                };
-                let last = next - chrono::Duration::days(1);
-                Some(PeriodFilter::Custom(first, Some(last)))
-            } else {
-                None
+            match parts.as_slice() {
+                [y] => {
+                    // `YYYY` — whole calendar year (Jan 1 - Dec 31).
+                    let year: i32 = y.parse().ok()?;
+                    let first = NaiveDate::from_ymd_opt(year, 1, 1)?;
+                    let last = NaiveDate::from_ymd_opt(year, 12, 31)?;
+                    Some(PeriodFilter::Custom(first, Some(last)))
+                }
+                [y, m] => {
+                    // `YYYY-MM` — whole month.
+                    let year: i32 = y.parse().ok()?;
+                    let month: u32 = m.parse().ok()?;
+                    let first = NaiveDate::from_ymd_opt(year, month, 1)?;
+                    let next = if month == 12 {
+                        NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+                    } else {
+                        NaiveDate::from_ymd_opt(year, month + 1, 1)?
+                    };
+                    Some(PeriodFilter::Custom(first, Some(next - chrono::Duration::days(1))))
+                }
+                _ => None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod period_filter_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_custom_year_only() {
+        match PeriodFilter::parse_custom("2025") {
+            Some(PeriodFilter::Custom(s, Some(e))) => {
+                assert_eq!(s, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
+                assert_eq!(e, NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());
+            }
+            other => panic!("expected Custom(2025-01-01, 2025-12-31), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_custom_year_month() {
+        match PeriodFilter::parse_custom("2026-02") {
+            Some(PeriodFilter::Custom(s, Some(e))) => {
+                assert_eq!(s, NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+                assert_eq!(e, NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());
+            }
+            other => panic!("expected Custom for 2026-02, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_custom_invalid() {
+        assert!(PeriodFilter::parse_custom("abc").is_none());
+        assert!(PeriodFilter::parse_custom("2025-13").is_none());
+        assert!(PeriodFilter::parse_custom("2025-02-30").is_none());
     }
 }
 
@@ -234,6 +291,20 @@ pub struct ConversationPane {
 }
 
 impl ConversationPane {
+    /// Construct a fresh pane wired up to a background load task. Caller is
+    /// responsible for polling `load_task`.
+    pub(crate) fn load_from(file_path: &std::path::Path) -> Self {
+        let mut pane = Self::default();
+        pane.load_task = Some(crate::handlers::pane::spawn_load_conversation(file_path));
+        pane.loading = true;
+        pane.scroll = usize::MAX;
+        pane.file_path = Some(file_path.to_path_buf());
+        pane.last_modified = std::fs::metadata(file_path)
+            .and_then(|m| m.modified())
+            .ok();
+        pane
+    }
+
     pub fn clear(&mut self) {
         self.messages.clear();
         self.scroll = 0;
@@ -258,7 +329,6 @@ impl ConversationPane {
 pub struct LoadedData {
     pub(crate) stats: Stats,
     pub(crate) cost: f64,
-    pub(crate) cost_without_subagents: f64,
     pub(crate) model_costs: Vec<(String, f64)>,
     pub(crate) aggregated_model_tokens: std::collections::HashMap<String, TokenStats>,
     pub(crate) models_without_pricing: std::collections::HashSet<String>,
@@ -278,7 +348,6 @@ pub struct AppState {
     pub conv_list_mode: ConvListMode,
     pub stats: Stats,
     pub total_cost: f64,
-    pub cost_without_subagents: f64,
     pub model_costs: Vec<(String, f64)>,
     pub aggregated_model_tokens: std::collections::HashMap<String, TokenStats>,
     pub models_without_pricing: std::collections::HashSet<String>,
@@ -306,6 +375,23 @@ pub struct AppState {
     pub dashboard_panel: usize,
     pub dashboard_scroll: [usize; 7],
     pub show_dashboard_detail: bool,
+    /// Active section in Tools detail popup: 0=Tools (Built-in + MCP),
+    /// 1=Skills, 2=Commands, 3=Subagents. Tools merges Built-in and MCP since
+    /// both are tools the assistant calls; Subagents are dispatcher-tier meta-
+    /// tools and shown last. Only meaningful when
+    /// `dashboard_panel == 3 && show_dashboard_detail`.
+    pub tools_detail_section: usize,
+    /// MCP servers whose tool breakdown is currently expanded (shown inline below the
+    /// server row) in the Tools detail Tools tab (MCP subsection). Retained while
+    /// the app is running so re-opening the popup preserves the expand/collapse state.
+    pub mcp_expanded_servers: std::collections::HashSet<String>,
+    /// Cursor index into the sorted MCP server list in the Tools detail Tools tab.
+    /// `j`/`k` move this; `Enter`/`Space` toggles the selected server's expansion.
+    pub mcp_selected_server: usize,
+    /// Tool index within the currently selected server, when the cursor has descended
+    /// into an expanded server's tool rows. `None` = cursor is on the server header
+    /// row itself. `Enter`/`Space` toggle expansion only when this is `None`.
+    pub mcp_selected_tool: Option<usize>,
     pub search_mode: bool,
     pub search_input: TextInput,
     pub search_results: Vec<search::SearchResult>,
@@ -314,6 +400,22 @@ pub struct AppState {
     pub searching: bool,
     pub search_preview_mode: bool,
     pub search_saved_state: Option<(Tab, usize, usize, bool)>,
+    pub mcp_status: Vec<crate::infrastructure::McpServerStatus>,
+    /// Configured (installed) Skills / Commands / Subagents discovered from
+    /// `~/.claude/{skills,commands,agents}/` plus enabled plugin paths. Names
+    /// are bare (no `skill:`/`command:`/`agent:` prefix) and namespaced as
+    /// `<plugin>:<resource>` for plugin-provided entries — matching the
+    /// discriminator used in `tool_usage` keys (`skill:<name>` → strip prefix,
+    /// look up here). Populated at load time and on data reload.
+    /// The Tools detail popup uses these to render zero-call rows for entries
+    /// that are installed but never invoked, mirroring how MCP stale-never
+    /// servers are surfaced.
+    pub configured_resources: crate::infrastructure::ConfiguredResources,
+    /// Last-used timestamp per `tool_usage` key (Built-in / Skill / Subagent / MCP tool).
+    /// Computed by `compute_tool_last_used` from `daily_groups`. Mirrors the per-server
+    /// timestamps in `mcp_status` but at tool granularity, so non-MCP categories can also
+    /// surface "last used N days ago" in detail popups.
+    pub tool_last_used: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     pub search_index: Option<Arc<SearchIndex>>,
     pub index_build_task: Option<mpsc::Receiver<Arc<SearchIndex>>>,
     pub ctrl_c_pressed: bool,
@@ -340,20 +442,34 @@ pub struct AppState {
     pub retention_warning_dismissed: bool,
     pub show_insights_detail: bool,
     pub insights_detail_scroll: usize,
+    /// Vertical scroll offset for the Session/Conv detail popup (`show_detail`).
+    /// Reset to 0 each time the popup is (re)opened.
+    pub session_detail_scroll: usize,
     pub insights_panel: usize,
     pub toast_message: Option<String>,
     pub toast_time: Option<std::time::Instant>,
     pub panes: Vec<ConversationPane>,
     pub active_pane_index: Option<usize>,
     pub session_list_hidden: bool,
-    pub show_conversation_detail: bool,
     pub tab_areas: Vec<(Tab, ratatui::layout::Rect)>,
+    pub tools_detail_tab_areas: Vec<(usize, ratatui::layout::Rect)>,
+    /// Click areas for the per-category rows in the Dashboard Tools panel preview.
+    /// `(section_index, area)` where section_index matches `tools_detail_section`
+    /// (0=Tools (Built-in + MCP), 1=Skills, 2=Commands, 3=Subagents). Built-in and
+    /// MCP both route to section 0. Clicking opens the detail popup with that
+    /// section pre-selected.
+    pub tools_panel_category_areas: Vec<(usize, ratatui::layout::Rect)>,
+    /// Click areas for MCP server rows in the Tools detail MCP tab. Each entry is
+    /// `(server_index, area)` where the index matches the sorted server list position.
+    /// Clicking a recorded area toggles expansion and moves the cursor to that server.
+    pub mcp_server_row_areas: Vec<(usize, ratatui::layout::Rect)>,
     pub pane_areas: Vec<ratatui::layout::Rect>,
     pub dashboard_panel_areas: Vec<ratatui::layout::Rect>,
     pub insights_panel_areas: Vec<ratatui::layout::Rect>,
     pub session_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
     pub breakdown_panel_area: Option<ratatui::layout::Rect>,
     pub summary_popup_area: Option<ratatui::layout::Rect>,
+    pub active_popup_area: Option<ratatui::layout::Rect>,
     pub daily_header_area: Option<ratatui::layout::Rect>,
     pub filter_popup_area_trigger: Option<ratatui::layout::Rect>,
     pub project_popup_area_trigger: Option<ratatui::layout::Rect>,
@@ -377,12 +493,131 @@ pub struct AppState {
     pub original_daily_costs: Vec<(NaiveDate, f64)>,
     pub original_stats: Stats,
     pub original_total_cost: f64,
-    pub original_cost_without_subagents: f64,
     pub original_model_costs: Vec<(String, f64)>,
     pub original_aggregated_model_tokens: std::collections::HashMap<String, TokenStats>,
 }
 
 impl AppState {
+    /// Construct a fresh `AppState` with everything zero/empty/None except
+    /// `loading = true`, `tab = Dashboard`, the persisted pin list, and the
+    /// retention warning derived from the user config. `data_limit` is the
+    /// CLI `--limit` value carried into the data-load thread.
+    pub(crate) fn new_initial(data_limit: usize) -> Self {
+        Self {
+            needs_draw: true,
+            tab: Tab::Dashboard,
+            pins: crate::pins::Pins::load().unwrap_or_else(|_| crate::pins::Pins::empty()),
+            conv_list_mode: ConvListMode::Day,
+            stats: crate::aggregator::Stats::default(),
+            total_cost: 0.0,
+            model_costs: Vec::new(),
+            aggregated_model_tokens: std::collections::HashMap::new(),
+            models_without_pricing: std::collections::HashSet::new(),
+            daily_groups: Vec::new(),
+            daily_costs: Vec::new(),
+            selected_day: 0,
+            selected_session: 0,
+            show_detail: false,
+            show_help: false,
+            help_scroll: 0,
+            show_conversation: false,
+            show_summary: false,
+            summary_content: String::new(),
+            summary_scroll: 0,
+            summary_type: None,
+            daily_breakdown_focus: false,
+            daily_breakdown_scroll: 0,
+            daily_breakdown_max_scroll: 0,
+            generating_summary: false,
+            summary_task: None,
+            loading: true,
+            error: None,
+            file_count: 0,
+            cache_stats: None,
+            dashboard_panel: 0,
+            dashboard_scroll: [0; 7],
+            tools_detail_section: 0,
+            mcp_expanded_servers: std::collections::HashSet::new(),
+            mcp_selected_server: 0,
+            mcp_selected_tool: None,
+            show_dashboard_detail: false,
+            search_mode: false,
+            search_input: TextInput::default(),
+            search_results: Vec::new(),
+            search_selected: 0,
+            search_task: None,
+            searching: false,
+            search_preview_mode: false,
+            search_saved_state: None,
+            mcp_status: Vec::new(),
+            configured_resources: crate::infrastructure::ConfiguredResources::default(),
+            tool_last_used: std::collections::HashMap::new(),
+            search_index: None,
+            index_build_task: None,
+            ctrl_c_pressed: false,
+            last_click_time: None,
+            last_click_pos: (0, 0),
+            text_selection: None,
+            selecting: false,
+            mouse_down_pos: None,
+            screen_buffer: None,
+            conversation_content_area: None,
+            updating_session: None,
+            updating_task: None,
+            last_data_update: None,
+            data_reload_task: None,
+            data_limit,
+            animation_frame: 0,
+            retention_warning: crate::infrastructure::check_cleanup_period(),
+            retention_warning_dismissed: false,
+            show_insights_detail: false,
+            insights_detail_scroll: 0,
+            session_detail_scroll: 0,
+            insights_panel: 0,
+            toast_message: None,
+            toast_time: None,
+            panes: Vec::new(),
+            active_pane_index: None,
+            session_list_hidden: false,
+            tab_areas: Vec::new(),
+            tools_detail_tab_areas: Vec::new(),
+            tools_panel_category_areas: Vec::new(),
+            mcp_server_row_areas: Vec::new(),
+            pane_areas: Vec::new(),
+            dashboard_panel_areas: Vec::new(),
+            insights_panel_areas: Vec::new(),
+            session_list_area: None,
+            breakdown_panel_area: None,
+            summary_popup_area: None,
+            active_popup_area: None,
+            daily_header_area: None,
+            filter_popup_area_trigger: None,
+            project_popup_area_trigger: None,
+            pin_view_trigger: None,
+            help_trigger: None,
+            filter_popup_area: None,
+            project_popup_area: None,
+            search_results_area: None,
+            period_filter: PeriodFilter::All,
+            show_filter_popup: false,
+            filter_popup_selected: 0,
+            filter_input_mode: false,
+            filter_input: TextInput::default(),
+            filter_input_error: false,
+            project_filter: None,
+            show_project_popup: false,
+            project_popup_selected: 0,
+            project_popup_scroll: 0,
+            project_list: Vec::new(),
+            original_daily_groups: Vec::new(),
+            original_daily_costs: Vec::new(),
+            original_stats: crate::aggregator::Stats::default(),
+            original_total_cost: 0.0,
+            original_model_costs: Vec::new(),
+            original_aggregated_model_tokens: std::collections::HashMap::new(),
+        }
+    }
+
     pub(crate) fn clear_summary(&mut self) {
         self.show_summary = false;
         self.generating_summary = false;
@@ -395,7 +630,6 @@ impl AppState {
     pub(crate) fn apply_loaded_data(&mut self, data: LoadedData) {
         self.original_stats = data.stats.clone();
         self.original_total_cost = data.cost;
-        self.original_cost_without_subagents = data.cost_without_subagents;
         self.original_model_costs = data.model_costs.clone();
         self.original_aggregated_model_tokens = data.aggregated_model_tokens.clone();
         self.original_daily_groups = data.daily_groups.clone();
@@ -403,7 +637,6 @@ impl AppState {
 
         self.stats = data.stats;
         self.total_cost = data.cost;
-        self.cost_without_subagents = data.cost_without_subagents;
         self.model_costs = data.model_costs;
         self.aggregated_model_tokens = data.aggregated_model_tokens;
         self.models_without_pricing = data.models_without_pricing;
@@ -412,6 +645,9 @@ impl AppState {
         self.file_count = data.file_count;
         self.cache_stats = Some(data.cache_stats);
         self.last_data_update = Some(std::time::Instant::now());
+        self.mcp_status = crate::infrastructure::compute_mcp_status(&self.daily_groups);
+        self.configured_resources = crate::infrastructure::discover_configured_resources();
+        self.tool_last_used = crate::aggregator::compute_tool_last_used(&self.daily_groups);
         self.rebuild_project_list();
 
         if !matches!(self.period_filter, PeriodFilter::All) || self.project_filter.is_some() {
@@ -429,7 +665,6 @@ impl AppState {
             self.daily_groups = self.original_daily_groups.clone();
             self.daily_costs = self.original_daily_costs.clone();
             self.total_cost = self.original_total_cost;
-            self.cost_without_subagents = self.original_cost_without_subagents;
             self.model_costs = self.original_model_costs.clone();
             self.aggregated_model_tokens = self.original_aggregated_model_tokens.clone();
             self.models_without_pricing =
@@ -487,11 +722,11 @@ impl AppState {
                 let calculator = CostCalculator::global();
                 let mut date_cost: std::collections::HashMap<NaiveDate, f64> =
                     std::collections::HashMap::new();
+                // Costs include subagent contributions so the project-filtered
+                // daily total matches Overview semantics (subagent cost is real
+                // Anthropic spend tied to that day).
                 for group in &self.daily_groups {
                     for session in &group.sessions {
-                        if session.is_subagent {
-                            continue;
-                        }
                         for (model, tokens) in &session.day_tokens_by_model {
                             *date_cost.entry(group.date).or_insert(0.0) += calculator
                                 .calculate_cost(tokens, Some(model))
@@ -512,16 +747,17 @@ impl AppState {
             }
 
             self.total_cost = self.daily_costs.iter().map(|(_, c)| c).sum();
-            self.cost_without_subagents = self.total_cost;
 
             let calculator = CostCalculator::global();
             let mut all_model_tokens: std::collections::HashMap<String, TokenStats> =
                 std::collections::HashMap::new();
+            // Include subagent tokens — same scope as `daily_costs` (cost
+            // accounting is subagent-inclusive after 1.1.0). Without this
+            // a model used only inside subagents would silently drop out of
+            // `aggregated_model_tokens` / `models_without_pricing` whenever
+            // a project filter is applied, contradicting the unfiltered view.
             for group in &self.daily_groups {
                 for session in &group.sessions {
-                    if session.is_subagent {
-                        continue;
-                    }
                     for (model, tokens) in &session.day_tokens_by_model {
                         let entry = all_model_tokens.entry(model.clone()).or_default();
                         entry.input_tokens += tokens.input_tokens;
@@ -539,11 +775,18 @@ impl AppState {
             self.rebuild_filtered_stats();
         }
 
+        // Recompute MCP per-server status against the CURRENT day set on
+        // BOTH paths (reset and filtered). Putting this inside the `else`
+        // branch alone caused 7d → All to leave `mcp_status` pinned to the
+        // previous filter's window — the legend showed "19 stale" against
+        // unfiltered totals.
+        self.mcp_status = crate::infrastructure::compute_mcp_status(&self.daily_groups);
+
         if self.selected_day >= self.daily_groups.len() {
             self.selected_day = self.daily_groups.len().saturating_sub(1);
         }
         if let Some(group) = self.daily_groups.get(self.selected_day) {
-            let session_count = group.sessions.iter().filter(|s| !s.is_subagent).count();
+            let session_count = group.user_sessions().count();
             if self.selected_session >= session_count {
                 self.selected_session = session_count.saturating_sub(1);
             }
@@ -560,11 +803,12 @@ impl AppState {
                     continue;
                 }
                 stats.total_sessions_count += 1;
+                stats.total_session_days += 1;
                 if session.summary.is_some() {
                     stats.sessions_with_summary += 1;
                 }
 
-                let work_tokens = session.day_input_tokens + session.day_output_tokens;
+                let work_tokens = session.work_tokens();
                 stats.total_tokens.input_tokens += session.day_input_tokens;
                 stats.total_tokens.output_tokens += session.day_output_tokens;
 
@@ -612,6 +856,10 @@ impl AppState {
                 for (tool, count) in &session.day_tool_usage {
                     *stats.tool_usage.entry(tool.clone()).or_insert(0) += count;
                 }
+                crate::aggregator::StatsAggregator::add_session_adoption(
+                    &mut stats,
+                    session.day_tool_usage.keys(),
+                );
                 for (lang, count) in &session.day_language_usage {
                     *stats.language_usage.entry(lang.clone()).or_insert(0) += count;
                 }
@@ -641,7 +889,7 @@ impl AppState {
                 let entry = map
                     .entry(session.project_name.clone())
                     .or_insert((0, group.date));
-                entry.0 += session.day_input_tokens + session.day_output_tokens;
+                entry.0 += session.work_tokens();
                 if group.date > entry.1 {
                     entry.1 = group.date;
                 }

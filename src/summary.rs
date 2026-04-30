@@ -1,5 +1,15 @@
 use crate::aggregator::DailyGroup;
 
+/// Eagerly trigger language detection on a background thread so the first call from
+/// the UI thread (when the user hits `s` to summarize) doesn't pay the
+/// `defaults read NSGlobalDomain AppleLanguages` cost. Idempotent: subsequent calls
+/// are no-ops thanks to the underlying `OnceLock`.
+pub fn prefetch_user_language() {
+    std::thread::spawn(|| {
+        let _ = detect_user_language();
+    });
+}
+
 fn detect_user_language() -> String {
     use std::sync::OnceLock;
     static CACHED: OnceLock<String> = OnceLock::new();
@@ -59,7 +69,7 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
                 return format!("(cached)\n\n{cached}");
             }
 
-    let sessions: Vec<_> = group.sessions.iter().filter(|s| !s.is_subagent).collect();
+    let sessions: Vec<_> = group.user_sessions().collect();
     if sessions.is_empty() {
         return "No sessions to summarize.".to_string();
     }
@@ -202,44 +212,40 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
             branch
         ));
 
-        if let Some(ref summary) = session.summary {
-            context.push_str(&format!("- Summary: {summary}\n"));
-        } else {
-            let (requests, files, tools) = extract_session_details_for_date(&session.file_path, Some(group.date));
+        let (requests, files, tools) = extract_session_details_for_date(&session.file_path, Some(group.date));
 
-            if !requests.is_empty() {
-                context.push_str("- User requests:\n");
-                for req in requests.iter().take(5) {
-                    let short: String = req.chars().take(150).collect();
-                    context.push_str(&format!("  - {short}\n"));
-                }
+        if !requests.is_empty() {
+            context.push_str("- User requests:\n");
+            for req in requests.iter().take(5) {
+                let short: String = req.chars().take(150).collect();
+                context.push_str(&format!("  - {short}\n"));
             }
+        }
 
-            if !files.is_empty() {
-                context.push_str(&format!("- Modified files ({}): ", files.len()));
-                let file_list: Vec<_> = files
-                    .iter()
-                    .take(5)
-                    .map(|f| {
-                        std::path::Path::new(f)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(f)
-                    })
-                    .collect();
-                context.push_str(&format!("{}\n", file_list.join(", ")));
-            }
+        if !files.is_empty() {
+            context.push_str(&format!("- Modified files ({}): ", files.len()));
+            let file_list: Vec<_> = files
+                .iter()
+                .take(5)
+                .map(|f| {
+                    std::path::Path::new(f)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(f)
+                })
+                .collect();
+            context.push_str(&format!("{}\n", file_list.join(", ")));
+        }
 
-            if !tools.is_empty() {
-                let mut sorted_tools: Vec<_> = tools.iter().collect();
-                sorted_tools.sort_by(|a, b| b.1.cmp(a.1));
-                let top_tools: Vec<_> = sorted_tools
-                    .iter()
-                    .take(5)
-                    .map(|(t, c)| format!("{t}({c})"))
-                    .collect();
-                context.push_str(&format!("- Tools: {}\n", top_tools.join(", ")));
-            }
+        if !tools.is_empty() {
+            let mut sorted_tools: Vec<_> = tools.iter().collect();
+            sorted_tools.sort_by(|a, b| b.1.cmp(a.1));
+            let top_tools: Vec<_> = sorted_tools
+                .iter()
+                .take(5)
+                .map(|(t, c)| format!("{t}({c})"))
+                .collect();
+            context.push_str(&format!("- Tools: {}\n", top_tools.join(", ")));
         }
     }
 
@@ -607,28 +613,57 @@ mod tests {
     }
 }
 
-pub fn generate_session_summary(session: &crate::aggregator::SessionInfo) -> String {
-    generate_session_summary_internal(session, true)
+pub fn generate_session_summary(
+    session: &crate::aggregator::SessionInfo,
+    filter_date: Option<chrono::NaiveDate>,
+) -> String {
+    generate_session_summary_internal(session, true, filter_date)
 }
 
-pub fn regenerate_session_summary(session: &crate::aggregator::SessionInfo) -> String {
-    generate_session_summary_internal(session, false)
+pub fn regenerate_session_summary(
+    session: &crate::aggregator::SessionInfo,
+    filter_date: Option<chrono::NaiveDate>,
+) -> String {
+    generate_session_summary_internal(session, false, filter_date)
+}
+
+fn summary_cache_key(
+    session: &crate::aggregator::SessionInfo,
+    filter_date: Option<chrono::NaiveDate>,
+) -> std::path::PathBuf {
+    match filter_date {
+        Some(date) => {
+            let mut key = session.file_path.clone();
+            let name = key
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            key.set_file_name(format!("{name}_{date}"));
+            key
+        }
+        None => session.file_path.clone(),
+    }
 }
 
 fn generate_session_summary_internal(
     session: &crate::aggregator::SessionInfo,
     use_cache: bool,
+    filter_date: Option<chrono::NaiveDate>,
 ) -> String {
     use crate::infrastructure::Cache;
     use std::process::Command;
 
+    let cache_key = summary_cache_key(session, filter_date);
+
     if use_cache
         && let Ok(cache) = Cache::load()
-            && let Some(cached) = cache.get_session_summary(&session.file_path) {
+            && let Some(cached) = cache.get_session_summary(&cache_key) {
                 return format!("(cached)\n\n{cached}");
             }
 
-    let (user_requests, files_modified, tool_counts) = extract_session_details(&session.file_path);
+    let (user_requests, files_modified, tool_counts) =
+        extract_session_details_for_date(&session.file_path, filter_date);
 
     if user_requests.is_empty() {
         return "No conversation to summarize.".to_string();
@@ -639,6 +674,9 @@ fn generate_session_summary_internal(
     context.push_str(&format!("## Project: {}\n", session.project_name));
     if let Some(ref branch) = session.git_branch {
         context.push_str(&format!("## Branch: {branch}\n"));
+    }
+    if let Some(date) = filter_date {
+        context.push_str(&format!("## Date: {date} (this day's activity only)\n"));
     }
     context.push('\n');
 
@@ -717,9 +755,141 @@ fn generate_session_summary_internal(
 
     if !result.starts_with("Error") && !result.starts_with("Failed")
         && let Ok(mut cache) = Cache::load() {
-            cache.set_session_summary(&session.file_path, result.clone());
+            cache.set_session_summary(&cache_key, result.clone());
             let _ = cache.save();
         }
 
     result
+}
+
+// JSONL summary regeneration / append.
+// Writes the result back into the session's JSONL as a `type: "summary"` row,
+// so external tools (and ccsight on next reload) see the updated label.
+
+pub(crate) fn regenerate_jsonl_summary(
+    session: &crate::aggregator::SessionInfo,
+) -> Result<String, String> {
+    use std::process::Command;
+
+    let (user_requests, files_modified, _) = extract_session_details(&session.file_path);
+
+    if user_requests.is_empty() {
+        return Err("No conversation to summarize".to_string());
+    }
+
+    let mut context = String::new();
+    context.push_str(&format!("Project: {}\n", session.project_name));
+    context.push_str("\nUser requests:\n");
+    for req in user_requests.iter().take(5) {
+        let truncated: String = req.chars().take(100).collect();
+        context.push_str(&format!("- {truncated}\n"));
+    }
+    if !files_modified.is_empty() {
+        context.push_str("\nFiles modified:\n");
+        for file in files_modified.iter().take(10) {
+            context.push_str(&format!("- {file}\n"));
+        }
+    }
+
+    let prompt = format!(
+        "Based on this Claude Code session, generate a VERY SHORT summary (max 60 chars).\n\
+        Format: Brief description of what was done (e.g. \"Fix login bug and add tests\")\n\
+        Use emoji if appropriate. Reply with ONLY the summary, nothing else.\n\n\
+        ---\n{context}\n---"
+    );
+
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new("claude")
+        .args(["-p", &prompt, "--model", crate::SUMMARY_MODEL])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn claude: {e}"))?;
+
+    let timeout = Duration::from_secs(60);
+    let start = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("Timeout: claude command took too long".to_string());
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("Error waiting for claude: {e}")),
+        }
+    }
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+
+    let summary = stdout.trim().to_string();
+    if summary.is_empty() && !stderr.is_empty() {
+        return Err(format!("claude error: {}", stderr.trim()));
+    }
+
+    let summary = if unicode_width::UnicodeWidthStr::width(summary.as_str()) > 80 {
+        let truncated = crate::ui::truncate_to_display_width(&summary, 77);
+        format!("{truncated}...")
+    } else {
+        summary
+    };
+    Ok(summary)
+}
+
+pub(crate) fn update_jsonl_summary(
+    file_path: &std::path::Path,
+    new_summary: &str,
+) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader, Write};
+
+    let file = std::fs::File::open(file_path).map_err(|e| format!("Failed to open file: {e}"))?;
+    let reader = BufReader::new(file);
+
+    let mut last_leaf_uuid: Option<String> = None;
+
+    for line_result in reader.lines() {
+        let line = line_result.map_err(|e| format!("Read error: {e}"))?;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+            && value.get("uuid").is_some()
+        {
+            last_leaf_uuid = value
+                .get("uuid")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string);
+        }
+    }
+
+    let leaf_uuid = last_leaf_uuid.unwrap_or_default();
+    let new_entry = serde_json::json!({
+        "type": "summary",
+        "summary": new_summary,
+        "leafUuid": leaf_uuid
+    });
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(file_path)
+        .map_err(|e| format!("Failed to open file for append: {e}"))?;
+
+    let json_str = serde_json::to_string(&new_entry)
+        .map_err(|e| format!("JSON serialization error: {e}"))?;
+    writeln!(file, "{json_str}").map_err(|e| format!("Write error: {e}"))?;
+
+    Ok(())
 }

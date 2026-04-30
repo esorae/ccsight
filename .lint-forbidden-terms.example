@@ -1,0 +1,12 @@
+# Lint denylist (template). Copy to `.lint-forbidden-terms` (git-ignored).
+#
+# Format: one term per line. `#` comments and blank lines ignored.
+# Match: case-sensitive substring against src/, scripts/, CLAUDE.md, README.md,
+# bounded by non-alphanumeric. Hits → ERROR (blocks commit).
+#
+# Add: real org/product/MCP/skill/plugin names tied to your environment.
+# Skip: generic placeholders (server1, orgA, my-skill, type-a) and `ccsight`.
+#
+# Example (replace with real terms after copying):
+# my-real-org
+# internal-product-x

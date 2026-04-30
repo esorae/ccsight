@@ -84,17 +84,31 @@ impl JsonlParser {
                 continue;
             }
 
-            if let Ok(entry) = serde_json::from_str::<LogEntry>(&line) {
-                if let Some(hash) = Self::create_dedup_hash(&entry) {
-                    if let Some(&existing_idx) = hash_to_index.get(&hash) {
-                        entries[existing_idx] = entry;
-                    } else {
-                        hash_to_index.insert(hash, entries.len());
-                        entries.push(entry);
-                    }
+            let Ok(mut entry) = serde_json::from_str::<LogEntry>(&line) else {
+                continue;
+            };
+
+            // Cowork `audit.jsonl` puts the wall-clock time in `_audit_timestamp`
+            // and leaves the standard `timestamp` field null. Fill the gap so
+            // downstream date-grouping / hourly aggregation works without
+            // every consumer needing to know about the alternate field.
+            if entry.timestamp.is_none()
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                && let Some(ts_str) = value.get("_audit_timestamp").and_then(|v| v.as_str())
+                && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str)
+            {
+                entry.timestamp = Some(ts.with_timezone(&chrono::Utc));
+            }
+
+            if let Some(hash) = Self::create_dedup_hash(&entry) {
+                if let Some(&existing_idx) = hash_to_index.get(&hash) {
+                    entries[existing_idx] = entry;
                 } else {
+                    hash_to_index.insert(hash, entries.len());
                     entries.push(entry);
                 }
+            } else {
+                entries.push(entry);
             }
         }
 
@@ -138,16 +152,39 @@ mod tests {
     }
 
     #[test]
+    fn test_audit_timestamp_fallback() {
+        // Cowork audit.jsonl emits `timestamp: null` and carries the wall-clock
+        // time in `_audit_timestamp` — the parser should backfill so date
+        // bucketing works on these files just like Claude Code JSONL.
+        let dir = std::env::temp_dir().join(format!("ccsight-parser-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let line = r#"{"type":"assistant","uuid":"u1","session_id":"s1","timestamp":null,"_audit_timestamp":"2026-04-27T01:23:45.000Z","message":{"role":"assistant","content":"hi"}}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let entries = JsonlParser::parse_file(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        let ts = entries[0].timestamp.expect("timestamp filled from _audit_timestamp");
+        assert_eq!(ts.to_rfc3339(), "2026-04-27T01:23:45+00:00");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_parse_unknown_type() {
         let json = r#"{"type":"some-unknown-type","data":"test"}"#;
         let entry: LogEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.entry_type, crate::domain::EntryType::Unknown);
     }
 
+    /// Integration test against the developer's local `~/.claude/projects` directory.
+    /// Marked `#[ignore]` because results depend on the runner's environment (CI may have
+    /// no logs at all). Run explicitly with `cargo test -- --ignored test_parse_actual_files`.
     #[test]
+    #[ignore]
     fn test_parse_actual_files() {
         let Some(home) = std::env::var_os("HOME") else {
-            return; // Skip test if HOME is not set
+            return;
         };
         let projects_dir = format!("{}/.claude/projects", home.to_string_lossy());
 
@@ -167,7 +204,7 @@ mod tests {
                     Ok(entries) => {
                         total_entries += entries.len();
                     }
-                    Err(e) => {
+                    Err(_) => {
                         total_errors += 1;
                         // JSONL parse failure is non-fatal
                     }

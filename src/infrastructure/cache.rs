@@ -8,7 +8,11 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 22;
+// Bump on changes to: parser output, aggregator field semantics
+// (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
+// 23: revert `extract_project_name` to FIRST cwd (was briefly rev() in 1.1.0
+// dev) — needed to invalidate buckets cached with the wrong semantics.
+const CACHE_VERSION: u32 = 23;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {
@@ -133,6 +137,14 @@ impl Cache {
     }
 
     pub fn save(&self) -> Result<()> {
+        // Reject the `/dev/null` placeholder used by `Cache::new_empty()` when HOME is
+        // unset. Saving to /dev/null on Linux silently succeeds but never persists, which
+        // would mask the failure mode. Surface it as an error.
+        if self.cache_path.as_os_str() == "/dev/null" {
+            return Err(anyhow::anyhow!(
+                "Cannot save cache: HOME is not set (cache_path is /dev/null fallback)"
+            ));
+        }
         if let Some(parent) = self.cache_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -220,8 +232,7 @@ impl Cache {
     }
 
     fn cache_file_path() -> Result<PathBuf> {
-        let home = std::env::var("HOME")?;
-        Ok(PathBuf::from(home).join(".cache/ccsight/cache.json"))
+        super::cache_path()
     }
 }
 
@@ -265,5 +276,98 @@ mod tests {
         assert_eq!(ts.output_tokens, 0);
         assert_eq!(ts.cache_creation_tokens, 0);
         assert_eq!(ts.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn test_new_empty_cache_save_returns_error() {
+        // Regression: Cache::new_empty() uses /dev/null as a placeholder when no HOME.
+        // save() must surface an error rather than silently writing to /dev/null.
+        let cache = Cache::new_empty();
+        let err = cache.save().expect_err("save() should fail on /dev/null fallback");
+        assert!(
+            err.to_string().contains("HOME is not set"),
+            "error message should mention HOME, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cache_save_load_roundtrip() {
+        // Regression: serialize a Cache to disk, reload it, verify CACHE_VERSION matches
+        // and the per-file entries survive (including new tool_usage / daily_stats keys).
+        // Guards against silent data loss when the schema gains new fields.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ccsight-cache-roundtrip-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        let key = "/tmp/some-session.jsonl".to_string();
+        let mut tool_usage = HashMap::new();
+        tool_usage.insert("Bash".to_string(), 5);
+        tool_usage.insert("skill:my-skill".to_string(), 2);
+
+        let original = Cache {
+            cache_path: path.clone(),
+            data: CacheData {
+                version: CACHE_VERSION,
+                files: {
+                    let mut map = HashMap::new();
+                    map.insert(
+                        key.clone(),
+                        CachedFileStats {
+                            modified_secs: 1234,
+                            file_size: 100,
+                            entry_count: 10,
+                            input_tokens: 1000,
+                            output_tokens: 500,
+                            cache_creation_tokens: 200,
+                            cache_read_tokens: 100,
+                            tool_usage: tool_usage.clone(),
+                            model_usage: HashMap::new(),
+                            model_tokens: HashMap::new(),
+                            session_date: None,
+                            project_name: Some("proj".to_string()),
+                            session_id: Some("sid".to_string()),
+                            git_branch: None,
+                            first_timestamp: None,
+                            last_timestamp: None,
+                            summary: None,
+                            custom_title: None,
+                            model: None,
+                            is_subagent: false,
+                            daily_stats: HashMap::new(),
+                            hourly_activity: HashMap::new(),
+                            hourly_work_activity: HashMap::new(),
+                            weekday_activity: HashMap::new(),
+                            weekday_work_activity: HashMap::new(),
+                            tool_error_count: 0,
+                            tool_success_count: 0,
+                            session_duration_mins: None,
+                            language_usage: HashMap::new(),
+                            extension_usage: HashMap::new(),
+                        },
+                    );
+                    map
+                },
+                day_summaries: HashMap::new(),
+                session_summaries: HashMap::new(),
+            },
+        };
+
+        original.save().expect("save cache");
+
+        // Reload by reading the file directly (Cache::load uses fixed XDG path).
+        let file = File::open(&path).expect("open saved cache");
+        let reader = BufReader::new(file);
+        let reloaded: CacheData = serde_json::from_reader(reader).expect("parse cache");
+
+        assert_eq!(reloaded.version, CACHE_VERSION);
+        let entry = reloaded.files.get(&key).expect("file entry survived");
+        assert_eq!(entry.entry_count, 10);
+        assert_eq!(entry.tool_usage.get("Bash"), Some(&5));
+        assert_eq!(entry.tool_usage.get("skill:my-skill"), Some(&2));
+
+        let _ = fs::remove_file(&path);
     }
 }

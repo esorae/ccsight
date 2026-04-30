@@ -33,10 +33,28 @@ pub struct SessionInfo {
     pub is_continued: bool,
 }
 
+impl SessionInfo {
+    /// Sum of `day_input_tokens + day_output_tokens` — the "work" (non-cache)
+    /// token total used everywhere we display a per-session token count.
+    /// Centralised so callers don't keep re-typing the addition.
+    pub fn work_tokens(&self) -> u64 {
+        self.day_input_tokens + self.day_output_tokens
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DailyGroup {
     pub date: NaiveDate,
     pub sessions: Vec<SessionInfo>,
+}
+
+impl DailyGroup {
+    /// Iterator over sessions excluding subagents — the canonical "user-facing"
+    /// session list. Most aggregations skip subagents to avoid double-counting
+    /// nested activity that's already attributed to the parent session.
+    pub fn user_sessions(&self) -> impl Iterator<Item = &SessionInfo> + '_ {
+        self.sessions.iter().filter(|s| !s.is_subagent)
+    }
 }
 
 pub struct DailyGrouper;
@@ -159,12 +177,25 @@ impl DailyGrouper {
             .expect("entry has timestamp (filtered above)");
         let session_start_date = session_first.with_timezone(&Local).date_naive();
 
-        let project_name = Self::extract_project_name_from_entries(&entries)
-            .unwrap_or_else(|| "unknown".to_string());
+        // Project name resolution shares one helper with the cache writer in
+        // `stats.rs`. For Cowork audit.jsonl this swaps the sandbox /
+        // outputs-dir cwd for the metadata `processName`; non-cowork files
+        // are returned unchanged.
+        let project_name = crate::infrastructure::resolve_project_name(
+            file,
+            Self::extract_project_name_from_entries(&entries),
+        )
+        .unwrap_or_else(|| "unknown".to_string());
 
+        // Branch can change mid-session (`git checkout`, worktree switch),
+        // so use the LATEST entry's value to match the user's mental model
+        // of "what branch was this session on". Other session-representative
+        // fields (model, custom title) follow the same `rev().find_map(...)`
+        // pattern.
         let git_branch = entries_with_timestamp
-            .first()
-            .and_then(|e| e.git_branch.clone());
+            .iter()
+            .rev()
+            .find_map(|e| e.git_branch.clone());
         let is_subagent_by_entry = entries_with_timestamp
             .first()
             .is_some_and(|e| e.is_sidechain);
@@ -205,10 +236,12 @@ impl DailyGrouper {
                 .rfind(|e| e.entry_type == EntryType::CustomTitle)
                 .and_then(|e| e.custom_title.clone())
         };
+        // Cowork sessions don't emit a `customTitle` entry; pull the curated
+        // `title` from sibling metadata json. Non-cowork files: returns None.
+        let custom_title =
+            custom_title.or_else(|| crate::infrastructure::resolve_cowork_title(file));
 
-        let model = entries
-            .iter().find_map(|e| e.message.as_ref()?.model.as_ref())
-            .cloned();
+        let model = super::extract_session_model(&entries);
 
         let mut daily_stats: HashMap<NaiveDate, DailyStats> = HashMap::new();
 
@@ -237,11 +270,21 @@ impl DailyGrouper {
 
                 if let Some(ref message) = entry.message {
                     use crate::domain::MessageContent;
+                    // Slash commands appear as `<command-name>/foo</command-name>`
+                    // XML metadata in user message text — count them under `command:foo`
+                    // so the per-day tool_usage reflects command invocations.
+                    if matches!(message.role, crate::domain::Role::User) {
+                        let text = message.content.extract_text();
+                        for cmd in crate::aggregator::stats::extract_command_names(&text) {
+                            *stats.tool_usage.entry(format!("command:{cmd}")).or_insert(0) += 1;
+                        }
+                    }
                     if let MessageContent::Blocks(ref blocks) = message.content {
                         for block in blocks {
                             if let crate::domain::ContentBlock::ToolUse { name, input, .. } = block
                             {
-                                *stats.tool_usage.entry(name.clone()).or_insert(0) += 1;
+                                let key = crate::aggregator::tool_usage_key(name, input);
+                                *stats.tool_usage.entry(key).or_insert(0) += 1;
                                 if let Some(lang) =
                                     StatsAggregator::extract_language_from_tool_input(name, input)
                                 {
@@ -261,7 +304,7 @@ impl DailyGrouper {
                             .model
                             .clone()
                             .unwrap_or_else(|| "unknown".to_string());
-                        if model_key == "<synthetic>" {
+                        if !super::is_real_model(&model_key) {
                             continue;
                         }
                         stats.input_tokens += usage.input_tokens;
