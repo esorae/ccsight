@@ -111,18 +111,17 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
             KeyCode::End => {
                 state.filter_input.move_end();
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
                 // Restrict input to characters that can legally appear
                 // in `YYYY-MM-DD[..YYYY-MM-DD]` / `YYYY-MM`. Without
                 // this filter, accidental presses of `f`/`j`/`k` (the
                 // popup-trigger and list-nav keys) silently appended
                 // garbage to the field, leaving the user no way to
                 // recover except Backspace-to-empty.
-                if c.is_ascii_digit() || c == '-' || c == '.' {
+                if (c.is_ascii_digit() || c == '-' || c == '.') => {
                     state.filter_input.insert_char(c);
                     state.filter_input_error = false;
                 }
-            }
             _ => {}
         }
     } else {
@@ -132,16 +131,14 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => {
                 state.show_filter_popup = false;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if state.filter_popup_selected > 0 {
+            KeyCode::Up | KeyCode::Char('k')
+                if state.filter_popup_selected > 0 => {
                     state.filter_popup_selected -= 1;
                 }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if state.filter_popup_selected < total_items - 1 {
+            KeyCode::Down | KeyCode::Char('j')
+                if state.filter_popup_selected < total_items - 1 => {
                     state.filter_popup_selected += 1;
                 }
-            }
             KeyCode::Enter => {
                 if state.filter_popup_selected < PeriodFilter::ALL_VARIANTS.len() {
                     state.period_filter =
@@ -295,8 +292,8 @@ pub(crate) fn handle_conversation_key(
                         pane.search_saved_scroll = None;
                     }
                 }
-                KeyCode::Enter => {
-                    if !pane.search_matches.is_empty() {
+                KeyCode::Enter
+                    if !pane.search_matches.is_empty() => {
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
                             pane.search_current = pane
                                 .search_current
@@ -315,7 +312,6 @@ pub(crate) fn handle_conversation_key(
                             pane.selected_message = msg_idx;
                         }
                     }
-                }
                 KeyCode::Backspace => {
                     pane.search_input.delete_back();
                     ui::update_pane_search_matches(pane);
@@ -479,26 +475,24 @@ pub(crate) fn handle_conversation_key(
         // implementation (and the help popup's
         // `j/k: Select message` actually works once a
         // pane is focused).
-        KeyCode::Char('H') => {
+        KeyCode::Char('H')
             if state.conv_list_mode == ConvListMode::Day
                 && state.selected_day < state.daily_groups.len().saturating_sub(1)
-            {
+            => {
                 state.selected_day += 1;
                 state.selected_session = 0;
                 if state.panes.len() == 1 {
                     preview_conversation_in_pane(state);
                 }
             }
-        }
-        KeyCode::Char('L') => {
-            if state.conv_list_mode == ConvListMode::Day && state.selected_day > 0 {
+        KeyCode::Char('L')
+            if state.conv_list_mode == ConvListMode::Day && state.selected_day > 0 => {
                 state.selected_day -= 1;
                 state.selected_session = 0;
                 if state.panes.len() == 1 {
                     preview_conversation_in_pane(state);
                 }
             }
-        }
         KeyCode::Char(' ') => {
             if state.show_detail {
                 let fp = state
@@ -541,8 +535,8 @@ pub(crate) fn handle_conversation_key(
                 preview_conversation_in_pane(state);
             }
         }
-        KeyCode::BackTab => {
-            if state.active_pane_index.is_none() {
+        KeyCode::BackTab
+            if state.active_pane_index.is_none() => {
                 state.conv_list_mode = match state.conv_list_mode {
                     ConvListMode::Day => {
                         if state.pins.entries().is_empty() {
@@ -559,7 +553,6 @@ pub(crate) fn handle_conversation_key(
                     preview_conversation_in_pane(state);
                 }
             }
-        }
         KeyCode::Down | KeyCode::Char('j') => {
             if state.active_pane_index.is_none() {
                 let max = get_conv_session_count(state).saturating_sub(1);
@@ -770,11 +763,10 @@ pub(crate) fn handle_conversation_key(
                 state.session_detail_scroll = 0;
             }
         }
-        KeyCode::Enter => {
-            if state.active_pane_index.is_none() {
+        KeyCode::Enter
+            if state.active_pane_index.is_none() => {
                 open_conversation_in_pane(state);
             }
-        }
         _ => {}
     }
 }
@@ -799,17 +791,15 @@ pub(crate) fn handle_default_key(
             state.toast_time = Some(std::time::Instant::now());
             state.needs_draw = true;
         }
-        KeyCode::Esc => {
-            if state.daily_breakdown_focus {
+        KeyCode::Esc
+            if state.daily_breakdown_focus => {
                 state.daily_breakdown_focus = false;
                 state.daily_breakdown_scroll = 0;
             }
-        }
-        KeyCode::Char('x') => {
-            if state.retention_warning.is_some() && !state.retention_warning_dismissed {
+        KeyCode::Char('x')
+            if state.retention_warning.is_some() && !state.retention_warning_dismissed => {
                 state.retention_warning_dismissed = true;
             }
-        }
         KeyCode::Char('?') => {
             state.show_help = true;
         }
@@ -853,8 +843,8 @@ pub(crate) fn handle_default_key(
                 }
             }
         }
-        KeyCode::Char('m') => {
-            if !state.pins.entries().is_empty() {
+        KeyCode::Char('m')
+            if !state.pins.entries().is_empty() => {
                 state.conv_list_mode = ConvListMode::Pinned;
                 state.selected_session = 0;
                 state.tab = Tab::Daily;
@@ -868,7 +858,6 @@ pub(crate) fn handle_default_key(
                     preview_conversation_in_pane(state);
                 }
             }
-        }
         KeyCode::Char('/') => {
             state.search_mode = true;
             state.search_input.move_end();
@@ -1060,8 +1049,8 @@ pub(crate) fn handle_default_key(
                 handlers::tasks::start_session_summary(state, session, true);
             }
         }
-        KeyCode::Char('R') => {
-            if state.tab == Tab::Daily {
+        KeyCode::Char('R')
+            if state.tab == Tab::Daily => {
                 let selected_day = state.selected_day;
                 let selected_session = state.selected_session;
                 if let Some((actual_idx, session)) =
@@ -1077,21 +1066,18 @@ pub(crate) fn handle_default_key(
                     );
                 }
             }
-        }
-        KeyCode::Char('b') => {
-            if state.tab == Tab::Daily {
+        KeyCode::Char('b')
+            if state.tab == Tab::Daily => {
                 state.daily_breakdown_focus = !state.daily_breakdown_focus;
                 if state.daily_breakdown_focus {
                     state.daily_breakdown_scroll = 0;
                 }
             }
-        }
-        KeyCode::Char('t') => {
-            if state.tab == Tab::Daily && !state.daily_groups.is_empty() {
+        KeyCode::Char('t')
+            if state.tab == Tab::Daily && !state.daily_groups.is_empty() => {
                 state.selected_day = 0;
                 state.selected_session = 0;
             }
-        }
         KeyCode::Char('i') => {
             if state.tab == Tab::Daily {
                 state.show_detail = true;
@@ -1187,11 +1173,10 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
             state.show_dashboard_detail = false;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if state.dashboard_scroll[state.dashboard_panel] > 0 {
+        KeyCode::Up | KeyCode::Char('k')
+            if state.dashboard_scroll[state.dashboard_panel] > 0 => {
                 state.dashboard_scroll[state.dashboard_panel] -= 1;
             }
-        }
         KeyCode::Down | KeyCode::Char('j') => {
             let max_items = crate::dashboard_max_items(state);
             let scroll = &mut state.dashboard_scroll[state.dashboard_panel];
@@ -1308,8 +1293,8 @@ pub(crate) fn handle_search_mode_key(
             }
             state.search_preview_mode = false;
         }
-        KeyCode::Enter => {
-            if !state.search_results.is_empty() {
+        KeyCode::Enter
+            if !state.search_results.is_empty() => {
                 let result = state.search_results[state.search_selected].clone();
                 let query = state.search_input.text.clone();
                 let is_content =
@@ -1338,21 +1323,18 @@ pub(crate) fn handle_search_mode_key(
                     pane.search_mode = true;
                 }
             }
-        }
-        KeyCode::Down => {
-            if !state.search_results.is_empty() {
+        KeyCode::Down
+            if !state.search_results.is_empty() => {
                 state.search_selected =
                     (state.search_selected + 1) % state.search_results.len();
             }
-        }
-        KeyCode::Up => {
-            if !state.search_results.is_empty() {
+        KeyCode::Up
+            if !state.search_results.is_empty() => {
                 state.search_selected = state
                     .search_selected
                     .checked_sub(1)
                     .unwrap_or(state.search_results.len() - 1);
             }
-        }
         KeyCode::Backspace => {
             state.search_input.delete_back();
             state.search_results =
@@ -1391,16 +1373,14 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
             state.show_project_popup = false;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if state.project_popup_selected > 0 {
+        KeyCode::Up | KeyCode::Char('k')
+            if state.project_popup_selected > 0 => {
                 state.project_popup_selected -= 1;
             }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if state.project_popup_selected < total - 1 {
+        KeyCode::Down | KeyCode::Char('j')
+            if state.project_popup_selected < total - 1 => {
                 state.project_popup_selected += 1;
             }
-        }
         KeyCode::Enter => {
             if state.project_popup_selected == 0 {
                 state.project_filter = None;

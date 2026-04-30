@@ -539,11 +539,11 @@ fn draw_hourly_pattern(
         Style::default().fg(theme::DIM),
     )));
 
-    let peak_hour = hourly_avg.iter().max_by_key(|(_, t)| *t).map(|(h, _)| *h);
-    let peak_title = if let Some(h) = peak_hour {
-        format!(" Peak: {}-{}h ({}) ", h, h + 1, crate::format_number(total_avg))
+    let peak_entry = hourly_avg.iter().max_by_key(|(_, t)| *t);
+    let peak_title = if let Some((h, t)) = peak_entry {
+        format!(" Peak: {}-{}h ({}) ", h, h + 1, crate::format_number(*t))
     } else {
-        format!(" Peak: - ({}) ", crate::format_number(total_avg))
+        format!(" Peak: - ({}/day) ", crate::format_number(total_avg))
     };
 
     let border_style = if selected {
@@ -579,7 +579,7 @@ fn draw_top_projects(
     scroll: usize,
 ) {
     let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-    projects.sort_by(|a, b| b.1.work_tokens.cmp(&a.1.work_tokens));
+    projects.sort_by_key(|p| std::cmp::Reverse(p.1.work_tokens));
 
     let total_tokens: u64 = projects.iter().map(|(_, s)| s.work_tokens).sum();
     let (visible_height, _, scroll) = calc_scroll(area.height, projects.len(), scroll, 2);
@@ -669,7 +669,7 @@ fn draw_model_tokens(
             (name.clone(), work_tokens, cost)
         })
         .collect();
-    models.sort_by(|a, b| b.1.cmp(&a.1));
+    models.sort_by_key(|m| std::cmp::Reverse(m.1));
 
     let total_tokens: u64 = models.iter().map(|(_, t, _)| *t).sum();
 
@@ -1459,7 +1459,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         }
         1 => {
             let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-            projects.sort_by(|a, b| b.1.work_tokens.cmp(&a.1.work_tokens));
+            projects.sort_by_key(|p| std::cmp::Reverse(p.1.work_tokens));
             let selected_path = projects
                 .get(scroll)
                 .map_or("", |(name, _)| name.as_str());
@@ -1653,7 +1653,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     (name.clone(), ts.clone(), work_tokens, cost)
                 })
                 .collect();
-            models.sort_by(|a, b| b.2.cmp(&a.2));
+            models.sort_by_key(|m| std::cmp::Reverse(m.2));
 
             let total_tokens: u64 = models.iter().map(|(_, _, t, _)| *t).sum();
             let max_tokens = models.first().map_or(1, |(_, _, t, _)| *t);
@@ -1882,8 +1882,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             // Subagents are dispatcher-tier meta-tools shown last.
             // `mcp` is rendered specially inside the Tools body and is not
             // represented here as its own Section.
-            let sections = vec![
-                Section {
+            let sections = [Section {
                     items: builtin,
                     total: builtin_total,
                     color: theme::CAT_TOOLS,
@@ -1910,8 +1909,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     color: theme::CAT_SUBAGENTS,
                     bar_rgb_table: AGENT_RGB,
                     format_name: short_name,
-                },
-            ];
+                }];
             // The Tools tab is "active for nav" if either built-in OR mcp has rows.
             let tools_tab_has_rows = !sections[0].items.is_empty() || !mcp.is_empty();
 

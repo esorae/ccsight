@@ -561,8 +561,8 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         ui::update_pane_search_matches(pane);
                     }
                 }
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Press {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press => {
                         use crossterm::event::KeyModifiers;
                         if key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -619,7 +619,6 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             break;
                         }
                     }
-                }
                 _ => {}
             }
             state.needs_draw = true;

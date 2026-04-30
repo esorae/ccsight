@@ -197,8 +197,7 @@ impl Cache {
                 if let Ok(modified) = metadata.modified() {
                     let modified_secs = modified
                         .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_secs());
                     return cached.modified_secs == modified_secs
                         && cached.file_size == current_size;
                 }
@@ -245,7 +244,7 @@ pub fn get_file_modified_secs(path: &Path) -> u64 {
 }
 
 pub fn get_file_size(path: &Path) -> u64 {
-    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    fs::metadata(path).map_or(0, |m| m.len())
 }
 
 #[cfg(test)]

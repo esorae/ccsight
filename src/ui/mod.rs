@@ -3362,7 +3362,7 @@ fn draw_session_detail(
             Style::default().fg(theme::PRIMARY).bold(),
         )));
         let mut models: Vec<_> = session.day_tokens_by_model.iter().collect();
-        models.sort_by(|a, b| b.1.work_tokens().cmp(&a.1.work_tokens()));
+        models.sort_by_key(|m| std::cmp::Reverse(m.1.work_tokens()));
         for (model, tokens) in &models {
             let normalized = crate::aggregator::normalize_model_name(model);
             let clr = model_color(model);
@@ -4947,8 +4947,8 @@ mod tests {
 
         let text = render_to_text(&mut state, 140, 35);
         assert!(
-            text.contains("Used"),
-            "should contain 'Used' label. Got:\n{text}"
+            text.contains("Sessions using"),
+            "should contain 'Sessions using' label. Got:\n{text}"
         );
         assert!(
             text.contains("MCP"),
@@ -4981,7 +4981,7 @@ mod tests {
         state.stats.sessions_using_skills = 0;
 
         let text = render_to_text(&mut state, 140, 35);
-        assert!(text.contains("Used"));
+        assert!(text.contains("Sessions using"));
     }
 
     #[test]

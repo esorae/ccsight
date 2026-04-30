@@ -75,7 +75,7 @@ impl DailyGrouper {
         }
 
         for sessions in date_map.values_mut() {
-            sessions.sort_by(|a, b| b.day_last_timestamp.cmp(&a.day_last_timestamp));
+            sessions.sort_by_key(|s| std::cmp::Reverse(s.day_last_timestamp));
         }
 
         let mut groups: Vec<DailyGroup> = date_map
@@ -83,7 +83,7 @@ impl DailyGrouper {
             .map(|(date, sessions)| DailyGroup { date, sessions })
             .collect();
 
-        groups.sort_by(|a, b| b.date.cmp(&a.date));
+        groups.sort_by_key(|g| std::cmp::Reverse(g.date));
         groups
     }
 

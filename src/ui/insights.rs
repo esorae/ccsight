@@ -226,7 +226,10 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
             Style::default().fg(theme::WARNING),
         ));
     }
-    let used_prefix = if row_width >= 80 { "    Used: " } else { "  · " };
+    // Numbers here are session counts (`sessions_using_*`). The Dashboard
+    // Ecosystem panel shows call counts under similar labels, so spell the
+    // unit out to keep the two views distinguishable.
+    let used_prefix = if row_width >= 80 { "    Sessions using:  " } else { "  ses: " };
     let mcp_label = if row_width >= 80 { "MCP " } else { "M" };
     let skill_label = if row_width >= 80 { "Skills " } else { "Sk" };
     let command_label = if row_width >= 80 { "Commands " } else { "Cm" };
@@ -531,6 +534,14 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
 
     // Monthly trend (compact)
     let monthly_costs = super::aggregate_monthly_costs(&state.daily_costs);
+    // Avg is over ALL months so this panel and the detail popup show the same
+    // delta for the same row regardless of how many months the visible window
+    // holds.
+    let avg_monthly_all: f64 = if monthly_costs.is_empty() {
+        0.0
+    } else {
+        monthly_costs.values().sum::<f64>() / monthly_costs.len() as f64
+    };
     let col_width = 7usize;
     let max_months = ((bottom_chunks[1].width.saturating_sub(3)) as usize / col_width).max(1);
     let months: Vec<_> = monthly_costs
@@ -585,11 +596,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
         monthly_lines.push(Line::from(row_spans));
     }
 
-    let avg_monthly = if months.is_empty() {
-        0.0
-    } else {
-        months.iter().map(|(_, c)| **c).sum::<f64>() / months.len() as f64
-    };
+    let avg_monthly = avg_monthly_all;
 
     let mut label_spans: Vec<Span> = vec![Span::raw(" ")];
     let mut cost_spans: Vec<Span> = vec![Span::raw(" ")];
@@ -979,7 +986,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 let name_w = w.saturating_sub(22).min(24);
                 let bar_max = 12;
                 let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-                projects.sort_by(|a, b| b.1.work_tokens.cmp(&a.1.work_tokens));
+                projects.sort_by_key(|p| std::cmp::Reverse(p.1.work_tokens));
                 let max_tokens = projects.first().map_or(1, |(_, s)| s.work_tokens);
                 for (name, ps) in projects.iter().take(5) {
                     let short = super::shorten_project(name);
@@ -1592,10 +1599,12 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 .skip(skip)
                 .take(visible_months)
                 .collect();
-            let avg_monthly = if months.is_empty() {
+            // Avg uses ALL months (not just the visible window) so the inline
+            // panel and this popup show the same delta for the same row.
+            let avg_monthly = if monthly_costs.is_empty() {
                 0.0
             } else {
-                months.iter().map(|(_, c)| **c).sum::<f64>() / months.len() as f64
+                monthly_costs.values().sum::<f64>() / monthly_costs.len() as f64
             };
             let max_monthly = months
                 .iter()

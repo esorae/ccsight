@@ -735,7 +735,7 @@ impl AppState {
                     }
                 }
                 let mut costs: Vec<_> = date_cost.into_iter().collect();
-                costs.sort_by(|a, b| b.0.cmp(&a.0));
+                costs.sort_by_key(|c| std::cmp::Reverse(c.0));
                 self.daily_costs = costs;
             } else {
                 self.daily_costs = self
@@ -879,13 +879,15 @@ impl AppState {
     }
 
     pub(crate) fn rebuild_project_list(&mut self) {
+        // Include subagent sessions — `state.stats.project_stats` (the dashboard
+        // Projects panel) already aggregates over all sessions, and `apply_filter`
+        // keeps subagents when the project filter matches. Excluding them here
+        // produced a misleading lower preview total in the project popup vs the
+        // panel.
         let mut map: std::collections::HashMap<String, (u64, NaiveDate)> =
             std::collections::HashMap::new();
         for group in &self.original_daily_groups {
             for session in &group.sessions {
-                if session.is_subagent {
-                    continue;
-                }
                 let entry = map
                     .entry(session.project_name.clone())
                     .or_insert((0, group.date));
@@ -899,7 +901,7 @@ impl AppState {
             .into_iter()
             .map(|(name, (tokens, date))| (name, tokens, date))
             .collect();
-        list.sort_by(|a, b| b.1.cmp(&a.1));
+        list.sort_by_key(|x| std::cmp::Reverse(x.1));
         self.project_list = list;
     }
 }

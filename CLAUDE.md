@@ -95,6 +95,25 @@ govern, so they're seen at the moment of violation:
 - AppState init parity — every `AppState { ... }` literal lists every field.
 - Real-world identifier shapes — fully covered by lint #16 / #17 / #21.
 
+## Comments
+
+Comments explain invariants, not history. Don't write incidents, prior bug
+numbers, captured numbers, or "earlier this was X" into comments — the file
+will outlive the incident and the comment will lie. The same applies to test
+docstrings, commit-message-flavored doc comments, and `// Why:` blocks.
+
+- ❌ `// Earlier bug: foo screen showed Xx and bar screen Yx for the same row.`
+- ❌ `// (regression in vA.B.C where two surfaces disagreed on the count.)`
+- ❌ `// User reported data loss on YYYY-MM-DD around HH:MM.`
+- ✅ `// Avg is over all months so this panel and the detail popup show the
+       same delta for the same row regardless of the visible window size.`
+- ✅ `// Number is a session count, not a call count — different from the
+       sibling panel that shares the same labels.`
+
+State the rule and why it matters in terms a future reader can verify against
+the code in front of them. If the "why" is a past incident, that belongs in
+the commit message or PR description.
+
 ## Tests — three layers
 
 | Layer | When | How |

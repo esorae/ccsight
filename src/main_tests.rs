@@ -662,7 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_project_list_skips_subagents() {
+    fn test_rebuild_project_list_includes_subagents() {
+        // Subagent sessions in their own bucket must appear: project_stats (dashboard
+        // panel) and apply_filter both include subagents, and excluding them here
+        // would make the project popup understate the total relative to the panel.
         use crate::test_helpers::helpers::*;
         let today = chrono::Local::now().date_naive();
         let mut subagent = make_session("~/projects/agent-task", None, None);
@@ -674,8 +677,10 @@ mod tests {
         let mut state = make_test_app_state(groups);
         state.rebuild_project_list();
 
-        assert_eq!(state.project_list.len(), 1);
-        assert_eq!(state.project_list[0].0, "~/projects/main");
+        assert_eq!(state.project_list.len(), 2);
+        let names: Vec<&String> = state.project_list.iter().map(|(n, _, _)| n).collect();
+        assert!(names.iter().any(|n| n.as_str() == "~/projects/main"));
+        assert!(names.iter().any(|n| n.as_str() == "~/projects/agent-task"));
     }
 
     fn make_buffer(width: u16, height: u16, lines: &[&str]) -> ratatui::buffer::Buffer {

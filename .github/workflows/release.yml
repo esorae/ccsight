@@ -8,7 +8,11 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+
   build:
+    needs: verify
     strategy:
       matrix:
         include:
