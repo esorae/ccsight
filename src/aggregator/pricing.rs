@@ -109,7 +109,25 @@ impl CostCalculator {
         let mut pricing = HashMap::new();
 
         // Per-model rates from platform.claude.com/docs/en/about-claude/pricing.
-        // 5m cache write = base × 1.25; 1h cache write = base × 2.0; cache read = base × 0.10.
+        // 5m cache write = base × 1.25; 1h cache write = base × 2.0; cache read
+        // = base × 0.10, except the 5.1 pair below (× 0.025).
+
+        // Claude Fable 5.1 / Mythos 5.1: base $10 / $50 like the .0 pair, but
+        // cache reads bill at 0.025x base instead of the usual 0.1x — the only
+        // models with that multiplier, so cloning a sibling entry would
+        // overcharge reads 4x (they dominate volume here).
+        for id in ["claude-fable-5-1", "claude-mythos-5-1"] {
+            pricing.insert(
+                id.to_string(),
+                ModelPricing {
+                    input_cost_per_mtok: 10.0,
+                    output_cost_per_mtok: 50.0,
+                    cache_write_5m_cost_per_mtok: 12.5,
+                    cache_write_1h_cost_per_mtok: 20.0,
+                    cache_read_cost_per_mtok: 0.25,
+                },
+            );
+        }
 
         // Claude Fable 5: base $10 / $50 (verified against platform.claude.com/docs
         // pricing page); cache rates use the standard multipliers (1.25x / 2x / 0.1x).
@@ -138,6 +156,18 @@ impl CostCalculator {
             },
         );
 
+        // Claude Opus 5 (verified against platform.claude.com/docs pricing page)
+        pricing.insert(
+            "claude-opus-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 5.0,
+                output_cost_per_mtok: 25.0,
+                cache_write_5m_cost_per_mtok: 6.25,
+                cache_write_1h_cost_per_mtok: 10.0,
+                cache_read_cost_per_mtok: 0.50,
+            },
+        );
+
         // Claude Opus 4.8: base $5 / $25 (verified against platform.claude.com/docs pricing page)
         pricing.insert(
             "claude-opus-4-8".to_string(),
@@ -150,7 +180,7 @@ impl CostCalculator {
             },
         );
 
-        // Claude Opus 4.7: base $5 input / $25 output (placeholder == 4.6 until official rates ship)
+        // Claude Opus 4.7: base $5 / $25 (verified against platform.claude.com/docs pricing page)
         pricing.insert(
             "claude-opus-4-7".to_string(),
             ModelPricing {
@@ -207,6 +237,20 @@ impl CostCalculator {
                 cache_write_5m_cost_per_mtok: 18.75,
                 cache_write_1h_cost_per_mtok: 30.0,
                 cache_read_cost_per_mtok: 1.50,
+            },
+        );
+
+        // Claude Sonnet 5 is on an introductory rate; a flat rate is exact
+        // while all data falls within that window — a date-aware rate is
+        // needed only once sessions span the changeover to the standard rate.
+        pricing.insert(
+            "claude-sonnet-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 2.0,
+                output_cost_per_mtok: 10.0,
+                cache_write_5m_cost_per_mtok: 2.50,
+                cache_write_1h_cost_per_mtok: 4.0,
+                cache_read_cost_per_mtok: 0.20,
             },
         );
 
@@ -328,6 +372,9 @@ impl CostCalculator {
     }
 
     pub fn calculate_cost(&self, tokens: &TokenStats, model: Option<&str>) -> Option<f64> {
+        if tokens.non_standard_speed {
+            return None;
+        }
         let pricing = self.get_pricing(model)?;
         let million = 1_000_000.0;
 
@@ -492,6 +539,140 @@ mod tests {
     }
 
     #[test]
+    fn opus_5_prices_both_the_base_and_1m_context_ids() {
+        // The 1M-context variant is the id Claude Code emits for the extended
+        // window; it bills at the base rate, so both must resolve to one entry
+        // rather than one of them silently costing $0.
+        let calculator = CostCalculator::new();
+        let base = calculator.get_pricing(Some("claude-opus-5")).unwrap();
+        let long_ctx = calculator.get_pricing(Some("claude-opus-5[1m]")).unwrap();
+        assert_eq!(base.input_cost_per_mtok, long_ctx.input_cost_per_mtok);
+        assert_eq!(base.output_cost_per_mtok, long_ctx.output_cost_per_mtok);
+        // Both ids collapse to one badge — a split would double the model row.
+        assert_eq!(normalize_model_name("claude-opus-5"), "Opus 5");
+        assert_eq!(normalize_model_name("claude-opus-5[1m]"), "Opus 5");
+    }
+
+    #[test]
+    fn an_unknown_speed_tier_costs_unknown_rather_than_the_standard_rate() {
+        let calculator = CostCalculator::new();
+        let mut tokens = TokenStats {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            calculator.calculate_cost(&tokens, Some("claude-opus-5")),
+            Some(30.0),
+            "the standard tier prices normally"
+        );
+        tokens.non_standard_speed = true;
+        assert_eq!(
+            calculator.calculate_cost(&tokens, Some("claude-opus-5")),
+            None,
+            "an unrated speed tier must reach the $? path, not bill at standard"
+        );
+    }
+
+    #[test]
+    fn speed_flag_is_sticky_across_folds() {
+        // One flagged message in a day makes the day's cost unknown; folding
+        // a clean aggregate afterwards must not clear it.
+        let mut day = TokenStats::default();
+        day.add(&crate::domain::Usage {
+            speed: Some("turbo".to_string()),
+            ..Default::default()
+        });
+        assert!(day.non_standard_speed);
+        day.add(&crate::domain::Usage {
+            speed: Some("standard".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            day.non_standard_speed,
+            "a later standard message cleared it"
+        );
+
+        let mut total = TokenStats::default();
+        total.merge(&day);
+        assert!(total.non_standard_speed, "merge dropped the flag");
+    }
+
+    #[test]
+    fn fable_5_1_reads_bill_at_the_reduced_cache_multiplier() {
+        // Same base as Fable 5 but a quarter of its cache-read rate. Cache
+        // reads dominate real volume, so cloning the sibling entry would
+        // silently overcharge every session on this model.
+        let calculator = CostCalculator::new();
+        let f51 = calculator.get_pricing(Some("claude-fable-5-1")).unwrap();
+        let f5 = calculator.get_pricing(Some("claude-fable-5")).unwrap();
+        assert_eq!(f51.input_cost_per_mtok, 10.0);
+        assert_eq!(f51.output_cost_per_mtok, 50.0);
+        assert_eq!(f51.cache_write_5m_cost_per_mtok, 12.5);
+        assert_eq!(f51.cache_write_1h_cost_per_mtok, 20.0);
+        assert_eq!(f51.cache_read_cost_per_mtok, 0.25);
+        assert_eq!(
+            f5.cache_read_cost_per_mtok, 1.0,
+            "the .0 rate must not move"
+        );
+        // The longer key has to win, or `-1` falls through to the .0 entry.
+        assert_eq!(normalize_model_name("claude-fable-5-1"), "Fable 5.1");
+        assert_eq!(normalize_model_name("claude-mythos-5-1"), "Mythos 5.1");
+        assert_eq!(
+            calculator
+                .get_pricing(Some("claude-mythos-5-1"))
+                .unwrap()
+                .cache_read_cost_per_mtok,
+            0.25
+        );
+    }
+
+    #[test]
+    fn opus_5_rates_match_the_published_table() {
+        // Comparing the two ids to each other passes for any rate, so pin the
+        // absolute numbers: a mistyped digit reaches every cost surface with
+        // no `$?` marker to hint at it.
+        let calculator = CostCalculator::new();
+        let pricing = calculator.get_pricing(Some("claude-opus-5")).unwrap();
+        assert_eq!(pricing.input_cost_per_mtok, 5.0);
+        assert_eq!(pricing.output_cost_per_mtok, 25.0);
+        assert_eq!(pricing.cache_write_5m_cost_per_mtok, 6.25);
+        assert_eq!(pricing.cache_write_1h_cost_per_mtok, 10.0);
+        assert_eq!(pricing.cache_read_cost_per_mtok, 0.50);
+    }
+
+    #[test]
+    fn models_without_pricing_flags_only_unpriced_entries() {
+        let calculator = CostCalculator::new();
+        let zero = TokenStats {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
+        };
+        let mut model_tokens = std::collections::HashMap::new();
+        model_tokens.insert("claude-sonnet-4".to_string(), zero.clone());
+        model_tokens.insert("unknown-model-xyz".to_string(), zero.clone());
+        model_tokens.insert("claude-mythos-preview".to_string(), zero);
+
+        let unpriced = calculator.models_without_pricing(&model_tokens);
+        assert!(!unpriced.contains(&normalize_model_name("claude-sonnet-4")));
+        assert!(unpriced.contains(&normalize_model_name("unknown-model-xyz")));
+        assert!(unpriced.contains(&normalize_model_name("claude-mythos-preview")));
+        assert_eq!(unpriced.len(), 2);
+    }
+
+    #[test]
+    fn models_without_pricing_empty_input_is_empty() {
+        let calculator = CostCalculator::new();
+        let model_tokens = std::collections::HashMap::new();
+        assert!(calculator.models_without_pricing(&model_tokens).is_empty());
+    }
+
+    #[test]
     fn test_get_pricing_unknown_model() {
         let calculator = CostCalculator::new();
         assert!(calculator.get_pricing(Some("unknown-model-xyz")).is_none());
@@ -521,13 +702,20 @@ mod tests {
     #[test]
     fn test_get_pricing_no_version_fallback() {
         let calculator = CostCalculator::new();
-        // "claude-sonnet-5" is not defined; must NOT fall back to "claude-sonnet-4"
+        // An undefined future version must NOT fall back to an older one.
         assert!(
             calculator
-                .get_pricing(Some("claude-sonnet-5-20270101"))
+                .get_pricing(Some("claude-sonnet-6-20270101"))
                 .is_none(),
-            "should not fall back to claude-sonnet-4"
+            "undefined claude-sonnet-6 must not fall back to sonnet-5/4"
         );
+        // claude-sonnet-5 IS defined at the introductory rate ($2 / $10), and
+        // must resolve to that — not sonnet-4's $3.
+        let s5 = calculator
+            .get_pricing(Some("claude-sonnet-5-20260701"))
+            .expect("sonnet-5 is priced");
+        assert_eq!(s5.input_cost_per_mtok, 2.0);
+        assert_eq!(s5.output_cost_per_mtok, 10.0);
         // "claude-sonnet-4-6" with date suffix should match
         assert!(
             calculator
@@ -568,6 +756,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         let cost = calculator.calculate_cost(&tokens, Some("unknown-model"));
         assert_eq!(cost, None);
@@ -583,6 +772,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         let cost = calculator.calculate_cost(&tokens, None);
         assert_eq!(cost, None);
@@ -598,6 +788,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-sonnet-4"))
@@ -633,6 +824,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-sonnet-4"))
@@ -655,6 +847,7 @@ mod tests {
             // 50K all 5m TTL — matches Anthropic's API key default.
             cache_creation_5m_tokens: 50_000,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-sonnet-4"))
@@ -682,6 +875,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 1_000_000,
+            non_standard_speed: false,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-sonnet-4-6"))
@@ -705,6 +899,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_5m_tokens: 100_000,
             cache_creation_1h_tokens: 1_000_000,
+            non_standard_speed: false,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-sonnet-4-6"))
@@ -733,6 +928,7 @@ mod tests {
                 ephemeral_1h_input_tokens: 20_000,
             }),
             service_tier: None,
+            speed: None,
         };
         let mut stats = TokenStats::default();
         stats.add(&usage);
@@ -754,6 +950,7 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_creation: None,
             service_tier: None,
+            speed: None,
         };
         let mut stats = TokenStats::default();
         stats.add(&usage);
@@ -772,6 +969,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-opus-4-5"))
@@ -828,14 +1026,18 @@ mod tests {
     fn test_all_defined_models_have_pricing() {
         let calculator = CostCalculator::new();
         let expected_models = [
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
             "claude-fable-5",
             "claude-mythos-5",
+            "claude-opus-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-opus-4-6",
             "claude-opus-4-5",
             "claude-opus-4-1",
             "claude-opus-4",
+            "claude-sonnet-5",
             "claude-sonnet-4-6",
             "claude-sonnet-4-5",
             "claude-sonnet-4",

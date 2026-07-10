@@ -99,34 +99,63 @@ pub(crate) fn step_live_view_snapshot(state: &mut AppState, delta: i32) {
     state.needs_draw = true;
 }
 
+/// Scroll intent shared by every `j/k`-scrollable popup. Centralizing the
+/// key→intent mapping in `scroll_action_for_key` means a new popup can't
+/// silently end up with a narrower key set than its siblings.
+pub(crate) enum ScrollAction {
+    Up(usize),
+    Down(usize),
+    Home,
+    End,
+}
+
+const SCROLL_PAGE: usize = 10;
+
+pub(crate) fn scroll_action_for_key(key: &KeyEvent) -> Option<ScrollAction> {
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => Some(ScrollAction::Down(1)),
+        KeyCode::Up | KeyCode::Char('k') => Some(ScrollAction::Up(1)),
+        KeyCode::PageDown | KeyCode::Char('d') => Some(ScrollAction::Down(SCROLL_PAGE)),
+        KeyCode::PageUp | KeyCode::Char('u') => Some(ScrollAction::Up(SCROLL_PAGE)),
+        KeyCode::Home | KeyCode::Char('g') => Some(ScrollAction::Home),
+        KeyCode::End | KeyCode::Char('G') => Some(ScrollAction::End),
+        _ => None,
+    }
+}
+
+/// Apply to a `usize` scroll field. `End` saturates to `usize::MAX` — the
+/// draw fn clamps against actual content height every frame, so landing
+/// past the end is safe and renders the last page.
+pub(crate) fn apply_scroll_usize(current: usize, action: ScrollAction) -> usize {
+    match action {
+        ScrollAction::Up(n) => current.saturating_sub(n),
+        ScrollAction::Down(n) => current.saturating_add(n),
+        ScrollAction::Home => 0,
+        ScrollAction::End => usize::MAX,
+    }
+}
+
+/// `u16` counterpart for scroll fields whose backing type is `u16`.
+pub(crate) fn apply_scroll_u16(current: u16, action: ScrollAction) -> u16 {
+    match action {
+        ScrollAction::Up(n) => current.saturating_sub(n as u16),
+        ScrollAction::Down(n) => current.saturating_add(n as u16),
+        ScrollAction::Home => 0,
+        ScrollAction::End => u16::MAX,
+    }
+}
+
 /// `ActivePopup::Help` branch — Esc/q/? close, j/k/↑↓ scroll the body.
 pub(crate) fn handle_help_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
             state.active_popup = crate::ActivePopup::None;
-            state.help_scroll = 0;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.help_scroll = state.help_scroll.saturating_add(1);
+        _ => {
+            if let Some(action) = scroll_action_for_key(&key) {
+                state.set_help_scroll(apply_scroll_u16(state.help_scroll(), action));
+            }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.help_scroll = state.help_scroll.saturating_sub(1);
-        }
-        KeyCode::PageDown | KeyCode::Char('d') => {
-            state.help_scroll = state.help_scroll.saturating_add(10);
-        }
-        KeyCode::PageUp | KeyCode::Char('u') => {
-            state.help_scroll = state.help_scroll.saturating_sub(10);
-        }
-        KeyCode::Home | KeyCode::Char('g') => {
-            state.help_scroll = 0;
-        }
-        KeyCode::End | KeyCode::Char('G') => {
-            // Draw clamps `help_scroll` against the actual content height,
-            // so a saturating-large value here lands on the last page.
-            state.help_scroll = u16::MAX;
-        }
-        _ => {}
     }
 }
 
@@ -140,22 +169,15 @@ pub(crate) fn handle_project_detail_key(state: &mut AppState, key: KeyEvent) {
             // DashboardDetail popup, so closing returns there (the two-level
             // drill-back), not straight to the bare dashboard.
             state.active_popup = crate::ActivePopup::DashboardDetail;
-            state.project_detail_scroll = 0;
-            state.project_detail_path.clear();
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.project_detail_scroll = state.project_detail_scroll.saturating_add(1);
+        _ => {
+            if let Some(action) = scroll_action_for_key(&key) {
+                state.set_project_detail_scroll(apply_scroll_usize(
+                    state.project_detail_scroll(),
+                    action,
+                ));
+            }
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.project_detail_scroll = state.project_detail_scroll.saturating_sub(1);
-        }
-        KeyCode::PageDown | KeyCode::Char('d') => {
-            state.project_detail_scroll = state.project_detail_scroll.saturating_add(10);
-        }
-        KeyCode::PageUp | KeyCode::Char('u') => {
-            state.project_detail_scroll = state.project_detail_scroll.saturating_sub(10);
-        }
-        _ => {}
     }
 }
 
@@ -172,7 +194,7 @@ pub(crate) fn handle_insights_detail_key(state: &mut AppState, key: KeyEvent) {
             } else {
                 state.insights_panel - 1
             };
-            state.insights_detail_scroll = 0;
+            state.set_insights_detail_scroll(0);
         }
         KeyCode::Right | KeyCode::Char('l') => {
             state.insights_panel = if state.insights_panel >= 3 {
@@ -180,15 +202,16 @@ pub(crate) fn handle_insights_detail_key(state: &mut AppState, key: KeyEvent) {
             } else {
                 state.insights_panel + 1
             };
-            state.insights_detail_scroll = 0;
+            state.set_insights_detail_scroll(0);
         }
-        KeyCode::Char('j') | KeyCode::Down => {
-            state.insights_detail_scroll = state.insights_detail_scroll.saturating_add(1);
+        _ => {
+            if let Some(action) = scroll_action_for_key(&key) {
+                state.set_insights_detail_scroll(apply_scroll_usize(
+                    state.insights_detail_scroll(),
+                    action,
+                ));
+            }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            state.insights_detail_scroll = state.insights_detail_scroll.saturating_sub(1);
-        }
-        _ => {}
     }
 }
 
@@ -196,7 +219,7 @@ pub(crate) fn handle_insights_detail_key(state: &mut AppState, key: KeyEvent) {
 /// sub-modes (preset list nav vs Custom date input).
 pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
     let total_items = PeriodFilter::ALL_VARIANTS.len() + 1;
-    if state.filter_input_mode {
+    if state.filter_input_mode() {
         match key.code {
             // Esc backs out of the input field to the list of preset
             // ranges (still inside the filter popup); a second Esc
@@ -204,67 +227,85 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
             // who fat-fingered the Custom row had no way to escape
             // back to the preset list without losing the popup.
             KeyCode::Esc => {
-                state.filter_input_mode = false;
-                state.filter_input.clear();
-                state.filter_input_error = false;
+                state.set_filter_input_mode(false);
+                if let Some(input) = state.filter_input_mut() {
+                    input.clear();
+                }
+                state.set_filter_input_error(false);
             }
             KeyCode::Enter => {
-                if let Some(filter) = PeriodFilter::parse_custom(&state.filter_input.text) {
+                let text = state
+                    .filter_input()
+                    .map(|i| i.text.clone())
+                    .unwrap_or_default();
+                if let Some(filter) = PeriodFilter::parse_custom(&text) {
                     state.period_filter = filter;
                     state.apply_filter();
                     state.active_popup = crate::ActivePopup::None;
-                    state.filter_input_mode = false;
-                    state.filter_input.clear();
-                    state.filter_input_error = false;
                 } else {
-                    state.filter_input_error = true;
+                    state.set_filter_input_error(true);
                 }
             }
             KeyCode::Backspace => {
-                state.filter_input.delete_back();
-                state.filter_input_error = false;
+                if let Some(input) = state.filter_input_mut() {
+                    input.delete_back();
+                }
+                state.set_filter_input_error(false);
             }
             KeyCode::Left => {
-                state.filter_input.move_left();
+                if let Some(input) = state.filter_input_mut() {
+                    input.move_left();
+                }
             }
             KeyCode::Right => {
-                state.filter_input.move_right();
+                if let Some(input) = state.filter_input_mut() {
+                    input.move_right();
+                }
             }
             KeyCode::Home => {
-                state.filter_input.move_home();
+                if let Some(input) = state.filter_input_mut() {
+                    input.move_home();
+                }
             }
             KeyCode::End => {
-                state.filter_input.move_end();
-            }
-            KeyCode::Char(c)
-                // Only date-shape chars (digits / - / .). Without this,
-                // `f`/`j`/`k` (popup / nav keys) silently appended garbage.
-                if (c.is_ascii_digit() || c == '-' || c == '.') => {
-                    state.filter_input.insert_char(c);
-                    state.filter_input_error = false;
+                if let Some(input) = state.filter_input_mut() {
+                    input.move_end();
                 }
+            }
+            // Date-shape chars only (see `InputKind::Filter::sanitize_input_char`,
+            // shared with the paste path); otherwise `f`/`j`/`k` (popup / nav
+            // keys) would silently append garbage.
+            KeyCode::Char(c) => {
+                if let Some(c) = crate::InputKind::Filter.sanitize_input_char(c) {
+                    if let Some(input) = state.filter_input_mut() {
+                        input.insert_char(c);
+                    }
+                    state.set_filter_input_error(false);
+                }
+            }
             _ => {}
         }
     } else {
         let custom_idx = PeriodFilter::ALL_VARIANTS.len();
-        let on_custom_row = state.filter_popup_selected == custom_idx;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => {
                 state.active_popup = crate::ActivePopup::None;
             }
-            KeyCode::Up | KeyCode::Char('k') if state.filter_popup_selected > 0 => {
-                state.filter_popup_selected -= 1;
+            KeyCode::Up | KeyCode::Char('k') if state.filter_popup_selected() > 0 => {
+                state.set_filter_popup_selected(state.filter_popup_selected() - 1);
             }
-            KeyCode::Down | KeyCode::Char('j') if state.filter_popup_selected < total_items - 1 => {
-                state.filter_popup_selected += 1;
+            KeyCode::Down | KeyCode::Char('j')
+                if state.filter_popup_selected() < total_items - 1 =>
+            {
+                state.set_filter_popup_selected(state.filter_popup_selected() + 1);
             }
             KeyCode::Enter => {
-                if state.filter_popup_selected < PeriodFilter::ALL_VARIANTS.len() {
-                    state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected];
+                if state.filter_popup_selected() < PeriodFilter::ALL_VARIANTS.len() {
+                    state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected()];
                     state.apply_filter();
                     state.active_popup = crate::ActivePopup::None;
                 } else {
-                    state.filter_input_mode = true;
+                    state.set_filter_input_mode(true);
                     let text = match state.period_filter {
                         PeriodFilter::Custom(s, Some(e)) if s == e => {
                             s.format("%Y-%m-%d").to_string()
@@ -275,19 +316,26 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
                         PeriodFilter::Custom(s, None) => s.format("%Y-%m-%d").to_string(),
                         _ => String::new(),
                     };
-                    state.filter_input.set(text);
-                    state.filter_input_error = false;
+                    if let Some(input) = state.filter_input_mut() {
+                        input.set(text);
+                    }
+                    state.set_filter_input_error(false);
                 }
             }
-            // When the cursor is on the Custom row, typing a digit
-            // (or `-`/`.` separators) jumps straight into input mode
-            // with that character as the first keystroke. Saves the
-            // user from having to press Enter first.
-            KeyCode::Char(c) if on_custom_row && (c.is_ascii_digit() || c == '-' || c == '.') => {
-                state.filter_input_mode = true;
-                state.filter_input.set(String::new());
-                state.filter_input.insert_char(c);
-                state.filter_input_error = false;
+            // Typing a digit (or `-`/`.`) from ANY row jumps to the
+            // Custom row and starts date input with that keystroke —
+            // starting to type a date is an unambiguous intent, and
+            // silently ignoring it on preset rows reads as a dead key.
+            KeyCode::Char(c) => {
+                if let Some(c) = crate::InputKind::Filter.sanitize_input_char(c) {
+                    state.set_filter_popup_selected(custom_idx);
+                    state.set_filter_input_mode(true);
+                    if let Some(input) = state.filter_input_mut() {
+                        input.set(String::new());
+                        input.insert_char(c);
+                    }
+                    state.set_filter_input_error(false);
+                }
             }
             _ => {}
         }
@@ -304,12 +352,6 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
             state.session_detail_override = None;
             state.session_detail_live_extra = None;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.session_detail_scroll = state.session_detail_scroll.saturating_add(1);
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.session_detail_scroll = state.session_detail_scroll.saturating_sub(1);
-        }
         KeyCode::Char(' ') => {
             if let Some(group) = state.daily_groups.get(state.selected_day) {
                 let sessions: Vec<_> = group.user_sessions().collect();
@@ -322,24 +364,15 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Char('y') => {
             // Mirror the Live tab `y` binding: copy `cd ... && claude -r UUID`
             // for the session whose detail popup is open. Use override (set
-            // by Live tab opens) so cwd reversal targets the right JSONL
-            // even when the Daily selection cursor has moved.
+            // by Live tab opens) so the copy targets the right JSONL even
+            // when the Daily selection cursor has moved.
             let file_path = state
                 .session_detail_override
                 .as_ref()
                 .map(|s| s.file_path.clone())
                 .or_else(|| crate::current_selected_session(state).map(|s| s.file_path));
             if let Some(path) = file_path {
-                match crate::shell::resume_command_from_jsonl(&path) {
-                    Some(cmd) => {
-                        state.clipboard_task =
-                            Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
-                        state.toast(format!("Copied: {cmd}"));
-                    }
-                    None => {
-                        state.toast("Cowork — re-open from Claude Desktop");
-                    }
-                }
+                copy_resume_command(state, &path);
                 state.needs_draw = true;
             }
         }
@@ -363,34 +396,166 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
                 }
             }
         }
-        KeyCode::Char('S') | KeyCode::Char('r') => {
-            // Both `S` (force) and `r` (regen-from-popup) reuse the
-            // same `generate_session_summary` path here — the popup
-            // already shows a stale summary, so even `r` is treated
-            // as a fresh generate (the dedicated regen variant is
-            // wired through `show_summary`'s own `r` handler).
+        // `s` opens the AI summary popup (where `r` regenerates); `t` writes a
+        // custom title directly here too (Enter saves, ^R AI-generates), so
+        // writing a title doesn't require the summary-generation detour first.
+        KeyCode::Char('s') => {
             if state.summary_task.is_none()
                 && let Some(session) = crate::current_selected_session(state)
             {
                 handlers::tasks::start_session_summary(state, session, false);
             }
         }
-        KeyCode::Char('R') => {
-            let selected_day = state.selected_day;
-            let selected_session = state.selected_session;
-            if let Some((actual_idx, session)) = crate::current_selected_session_with_index(state)
-                && state.updating_task.is_none()
+        // `t` opens the title editor prefilled with the current title. Enter
+        // saves the typed text; clearing it and pressing Enter AI-generates.
+        KeyCode::Char('t') => {
+            if let Some(session) = state
+                .session_detail_override
+                .clone()
+                .or_else(|| crate::current_selected_session(state))
             {
-                handlers::tasks::start_jsonl_regen(
-                    state,
-                    session,
-                    selected_day,
-                    selected_session,
-                    actual_idx,
-                );
+                open_title_editor(state, &session, crate::TitleEditReturn::Detail);
             }
         }
-        _ => {}
+        _ => {
+            if let Some(action) = scroll_action_for_key(&key) {
+                state.session_detail_scroll =
+                    apply_scroll_usize(state.session_detail_scroll, action);
+            }
+        }
+    }
+}
+
+/// Copy the verified resume command for `jsonl_path` to the clipboard, or
+/// say why there is none: Cowork sessions re-open from the desktop app, and
+/// an unverifiable dir is stated honestly (`claude --resume` + Ctrl+A still
+/// reaches the session) — never guessed, since a wrong `cd` makes
+/// `claude -r` silently fail to find the session.
+fn copy_resume_command(state: &mut AppState, jsonl_path: &std::path::Path) {
+    if crate::infrastructure::is_cowork_audit_path(jsonl_path) {
+        state.toast("Cowork — re-open from Claude Desktop");
+        return;
+    }
+    let Some(session_id) = jsonl_path.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    match state.resume_dir(jsonl_path) {
+        Some(dir) => {
+            let cmd = crate::shell::resume_command(&dir.to_string_lossy(), session_id);
+            state.clipboard_task = Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
+            state.toast(format!("Copied: {cmd}"));
+        }
+        None => state.toast("Resume dir unknown — use the `claude --resume` picker"),
+    }
+}
+
+/// Open the `TitleEdit` popup for `session`, prefilled with its current title
+/// (cursor at end) so `t` starts an edit rather than a blank field.
+/// `return_to` is where save / cancel land afterwards.
+pub(crate) fn open_title_editor(
+    state: &mut AppState,
+    session: &crate::aggregator::SessionInfo,
+    return_to: crate::TitleEditReturn,
+) {
+    // `session` is a clone from `daily_groups`, which a just-saved title does
+    // NOT mutate — only the `session_titles` cache is updated until the next
+    // data reload. Prefill from the cache first (same precedence as
+    // `resolved_title`) so an immediate re-edit shows what was just saved
+    // instead of silently reverting it on Enter.
+    let current = state
+        .session_titles
+        .get(&session.file_path)
+        .map(String::as_str)
+        .or_else(|| session.display_title())
+        .unwrap_or("");
+    let mut input = crate::TextInput::default();
+    input.set(current.to_string());
+    input.move_end();
+    state.active_popup = crate::ActivePopup::TitleEdit {
+        input,
+        path: session.file_path.clone(),
+        return_to,
+    };
+}
+
+/// `ActivePopup::TitleEdit` branch — free-text session-title editor. Enter
+/// writes the typed text as a `custom-title` row; `Ctrl+R` AI-generates one
+/// (regardless of field contents). Empty Enter is rejected, not a silent
+/// AI-generate, so clearing the prefill then Enter can't destroy the title.
+pub(crate) fn handle_title_edit_key(state: &mut AppState, key: KeyEvent) {
+    // Ctrl+R AI-generates. Matched before `KeyCode::Char` so the modifier isn't
+    // swallowed as a literal `r` insert.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+        let crate::ActivePopup::TitleEdit {
+            path, return_to, ..
+        } = std::mem::take(&mut state.active_popup)
+        else {
+            return;
+        };
+        state.active_popup = return_to.restore();
+        match handlers::pane::find_session_indices_by_path(state, &path).and_then(
+            |(day, sess, idx)| {
+                let s = state.daily_groups.get(day)?.sessions.get(idx)?.clone();
+                Some((s, day, sess, idx))
+            },
+        ) {
+            Some((session, day, sess, idx)) => {
+                handlers::tasks::start_jsonl_regen(state, session, day, sess, idx);
+                state.toast("Generating title…");
+            }
+            None => state.toast("Session no longer loaded — cannot write title"),
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            if let crate::ActivePopup::TitleEdit { return_to, .. } = &state.active_popup {
+                state.active_popup = return_to.restore();
+            }
+        }
+        KeyCode::Enter => {
+            let title = state
+                .title_input()
+                .map(|i| i.text.trim().to_string())
+                .unwrap_or_default();
+            if title.is_empty() {
+                // Keep the popup open; empty Enter is not a save nor an AI trigger.
+                state.toast("Type a title, or ^R to AI-generate");
+                return;
+            }
+            let crate::ActivePopup::TitleEdit {
+                path, return_to, ..
+            } = std::mem::take(&mut state.active_popup)
+            else {
+                return;
+            };
+            state.active_popup = return_to.restore();
+            // Manual title → write the custom-title row (sessionId = file stem).
+            let sid = path.file_stem().and_then(|s| s.to_str()).map(String::from);
+            match sid {
+                Some(sid) if crate::update_jsonl_custom_title(&path, &sid, &title).is_ok() => {
+                    // Update the single title cache so every surface reflects it.
+                    state.set_session_title(&path, &title);
+                    state.toast("Title saved");
+                }
+                Some(_) => state.toast("❌ Failed to write title"),
+                None => state.toast("❌ No session id — cannot write title"),
+            }
+        }
+        code => {
+            let crate::ActivePopup::TitleEdit { input, .. } = &mut state.active_popup else {
+                return;
+            };
+            match code {
+                KeyCode::Backspace => input.delete_back(),
+                KeyCode::Left => input.move_left(),
+                KeyCode::Right => input.move_right(),
+                KeyCode::Home => input.move_home(),
+                KeyCode::End => input.move_end(),
+                KeyCode::Char(c) => input.insert_char(c),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -416,18 +581,25 @@ pub(crate) fn handle_conversation_key(
         {
             match key.code {
                 KeyCode::Esc => {
+                    // VS Code semantics: Esc ends the search outright —
+                    // matches (and thus highlights) clear, the query stays
+                    // for `/`-reopen. The last peeked message stays expanded
+                    // so the found text survives the bar closing.
                     pane.search_mode = false;
-                    if pane.search_matches.is_empty() {
-                        pane.search_input.clear();
-                        if let Some((saved_scroll, saved_msg)) = pane.search_saved_scroll.take() {
-                            pane.scroll = saved_scroll;
-                            pane.selected_message = saved_msg;
-                        }
-                    } else {
-                        pane.search_saved_scroll = None;
+                    pane.search_select_all = false;
+                    pane.peek_expanded = None;
+                    pane.pending_search_scroll = false;
+                    if pane.search_matches.is_empty()
+                        && let Some((saved_scroll, saved_msg)) = pane.search_saved_scroll.take()
+                    {
+                        pane.scroll = saved_scroll;
+                        pane.selected_message = saved_msg;
                     }
+                    pane.search_saved_scroll = None;
+                    pane.search_matches.clear();
                 }
                 KeyCode::Enter if !pane.search_matches.is_empty() => {
+                    pane.search_select_all = false;
                     if key.modifiers.contains(KeyModifiers::SHIFT) {
                         pane.search_current = pane
                             .search_current
@@ -436,56 +608,40 @@ pub(crate) fn handle_conversation_key(
                     } else {
                         pane.search_current = (pane.search_current + 1) % pane.search_matches.len();
                     }
-                    pane.scroll = pane.search_matches[pane.search_current];
-                    if let Some(msg_idx) = pane
-                        .message_lines
-                        .iter()
-                        .rposition(|&(start, _)| start <= pane.scroll)
-                    {
-                        pane.selected_message = msg_idx;
-                    }
+                    pane.pending_search_scroll = true;
                 }
                 KeyCode::Backspace => {
-                    pane.search_input.delete_back();
-                    ui::update_pane_search_matches(pane);
-                    pane.search_current = 0;
-                    if let Some(&first) = pane.search_matches.first() {
-                        pane.scroll = first;
-                        if let Some(msg_idx) = pane
-                            .message_lines
-                            .iter()
-                            .rposition(|&(start, _)| start <= first)
-                        {
-                            pane.selected_message = msg_idx;
-                        }
+                    if pane.search_select_all {
+                        // Restored query is "selected": Backspace wipes it.
+                        pane.search_input.set(String::new());
+                    } else {
+                        pane.search_input.delete_back();
                     }
+                    ui::on_pane_search_edit(pane);
                 }
                 KeyCode::Left => {
+                    pane.search_select_all = false;
                     pane.search_input.move_left();
                 }
                 KeyCode::Right => {
+                    pane.search_select_all = false;
                     pane.search_input.move_right();
                 }
                 KeyCode::Home => {
+                    pane.search_select_all = false;
                     pane.search_input.move_home();
                 }
                 KeyCode::End => {
+                    pane.search_select_all = false;
                     pane.search_input.move_end();
                 }
                 KeyCode::Char(c) => {
-                    pane.search_input.insert_char(c);
-                    ui::update_pane_search_matches(pane);
-                    pane.search_current = 0;
-                    if let Some(&first) = pane.search_matches.first() {
-                        pane.scroll = first;
-                        if let Some(msg_idx) = pane
-                            .message_lines
-                            .iter()
-                            .rposition(|&(start, _)| start <= first)
-                        {
-                            pane.selected_message = msg_idx;
-                        }
+                    if pane.search_select_all {
+                        // First char replaces the restored query wholesale.
+                        pane.search_input.set(String::new());
                     }
+                    pane.search_input.insert_char(c);
+                    ui::on_pane_search_edit(pane);
                 }
                 _ => {}
             }
@@ -535,28 +691,41 @@ pub(crate) fn handle_conversation_key(
         KeyCode::Char('T') => {
             state.session_list_hidden = !state.session_list_hidden;
         }
-        KeyCode::Esc | KeyCode::Char('q') => {
-            // `show_detail` is now handled before this branch by the
-            // dispatcher in `main`, so the Session Detail popup is closed
-            // there via `handle_session_detail_key`.
-            let has_search = state
-                .active_pane_index
-                .and_then(|i| state.panes.get(i))
-                .is_some_and(|p| !p.search_input.text.is_empty());
-            if has_search {
-                if let Some(idx) = state.active_pane_index
-                    && let Some(pane) = state.panes.get_mut(idx)
+        // Pane focused: accordion-toggle the cursor message in compact mode.
+        // No pane focused (Daily session list): open the selected conversation.
+        KeyCode::Enter => {
+            if let Some(idx) = state.active_pane_index {
+                if let Some(pane) = state.panes.get_mut(idx)
+                    && pane.compact
+                    && let Some(&(line, msg_idx)) = pane.message_lines.get(pane.selected_message)
+                    && !pane.expanded.remove(&msg_idx)
                 {
-                    pane.search_input.text.clear();
-                    pane.search_input.cursor = 0;
-                    pane.search_matches.clear();
-                    pane.search_current = 0;
-                    if let Some((saved_scroll, saved_msg)) = pane.search_saved_scroll.take() {
-                        pane.scroll = saved_scroll;
-                        pane.selected_message = saved_msg;
-                    }
+                    pane.expanded.insert(msg_idx);
+                    // Align the just-expanded message to the viewport top so its
+                    // body reads from the start — the message's first line is
+                    // unchanged by expansion (preceding lines are untouched), and
+                    // the draw clamps this down if it overshoots max_scroll.
+                    pane.scroll = line;
                 }
-            } else if state.search_preview_mode {
+            } else {
+                open_conversation_in_pane(state);
+            }
+        }
+        // Toggle the whole pane between compact (one line per message) and the
+        // classic full-transcript reading view.
+        KeyCode::Char('c') => {
+            if let Some(idx) = state.active_pane_index
+                && let Some(pane) = state.panes.get_mut(idx)
+            {
+                pane.compact = !pane.compact;
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Session Detail closing lives in `handle_session_detail_key`
+            // (dispatched before this). No residual-search cleanup either:
+            // bar-Esc already cleared matches, and the query text survives
+            // intentionally so `/` can restore it.
+            if state.search_preview_mode {
                 state.show_conversation = false;
                 if state.conv_list_mode == ConvListMode::Live {
                     state.selected_session = 0;
@@ -627,15 +796,23 @@ pub(crate) fn handle_conversation_key(
                 };
             }
         }
+        // `?` is advertised as Global — it must work here too, not just on
+        // the tab views.
+        KeyCode::Char('?') => {
+            state.active_popup = crate::ActivePopup::Help { scroll: 0 };
+        }
         KeyCode::Char('/') => {
             if let Some(idx) = state.active_pane_index
                 && let Some(pane) = state.panes.get_mut(idx)
             {
                 pane.search_saved_scroll = Some((pane.scroll, pane.selected_message));
                 pane.search_mode = true;
-                pane.search_input.clear();
-                pane.search_matches.clear();
+                // Reopen restores the previous query "selected" (VS Code):
+                // highlights come back immediately, the first typed char
+                // replaces the text, Enter continues from the top.
+                pane.search_select_all = !pane.search_input.text.is_empty();
                 pane.search_current = 0;
+                ui::update_pane_search_matches(pane);
             }
         }
         // j/k bindings live with the Down/Up arms below
@@ -750,19 +927,31 @@ pub(crate) fn handle_conversation_key(
                     if pane.selected_message == usize::MAX || pane.selected_message >= msg_count {
                         pane.selected_message = msg_count - 1;
                     }
-                    if pane.selected_message + 1 < msg_count {
-                        pane.selected_message += 1;
-                    } else if let (Some(visible_height), Some(cached)) =
+                    let cur = pane.selected_message;
+                    // A message taller than the viewport must be read in chunks:
+                    // reveal its hidden bottom first, advancing to the next message
+                    // only once its end is on screen (this also covers the tail of
+                    // the last message).
+                    let scrolled_within = if let (Some(vh), Some(cached)) =
                         (pane.last_visible_height, pane.rendered.as_ref())
                     {
-                        // On the last message: if its bottom is below the viewport,
-                        // fall back to scrolling one line so j keeps making downward
-                        // progress instead of becoming a silent no-op.
                         let total_lines = cached.0.len();
-                        let max_scroll = total_lines.saturating_sub(visible_height);
-                        if pane.scroll < max_scroll {
-                            pane.scroll += 1;
+                        let sel_end = pane
+                            .message_lines
+                            .get(cur + 1)
+                            .map_or(total_lines, |&(l, _)| l);
+                        if sel_end > pane.scroll + vh {
+                            let step = vh.saturating_sub(2).max(1);
+                            pane.scroll = (pane.scroll + step).min(sel_end.saturating_sub(vh));
+                            true
+                        } else {
+                            false
                         }
+                    } else {
+                        false
+                    };
+                    if !scrolled_within && cur + 1 < msg_count {
+                        pane.selected_message = cur + 1;
                     }
                 }
             }
@@ -787,12 +976,25 @@ pub(crate) fn handle_conversation_key(
                 {
                     pane.selected_message = msg_count - 1;
                 }
-                if pane.selected_message > 0 {
+                let cur = pane.selected_message;
+                // Symmetric to j: if the selected message's top is scrolled above
+                // the viewport, reveal its hidden head first, moving to the
+                // previous message only once its start is on screen (this also
+                // covers the head of the first message).
+                let sel_start = pane.message_lines.get(cur).map_or(0, |&(l, _)| l);
+                let scrolled_within = if let Some(vh) = pane.last_visible_height {
+                    if sel_start < pane.scroll {
+                        let step = vh.saturating_sub(2).max(1);
+                        pane.scroll = pane.scroll.saturating_sub(step).max(sel_start);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !scrolled_within && cur > 0 {
                     pane.selected_message -= 1;
-                } else if pane.scroll > 0 {
-                    // Symmetric to j on last message: on the first message with its
-                    // top scrolled out of view, k scrolls up by one line.
-                    pane.scroll -= 1;
                 }
             }
         }
@@ -859,17 +1061,7 @@ pub(crate) fn handle_conversation_key(
             if let Some(idx) = state.active_pane_index
                 && let Some(pane) = state.panes.get_mut(idx)
             {
-                if !pane.search_matches.is_empty() {
-                    pane.search_current = (pane.search_current + 1) % pane.search_matches.len();
-                    pane.scroll = pane.search_matches[pane.search_current];
-                    if let Some(msg_idx) = pane
-                        .message_lines
-                        .iter()
-                        .rposition(|&(start, _)| start <= pane.scroll)
-                    {
-                        pane.selected_message = msg_idx;
-                    }
-                } else if let Some(&(next_pos, _)) = pane
+                if let Some(&(next_pos, _)) = pane
                     .message_lines
                     .iter()
                     .find(|&&(pos, _)| pos > pane.scroll + 2)
@@ -882,20 +1074,7 @@ pub(crate) fn handle_conversation_key(
             if let Some(idx) = state.active_pane_index
                 && let Some(pane) = state.panes.get_mut(idx)
             {
-                if !pane.search_matches.is_empty() {
-                    pane.search_current = pane
-                        .search_current
-                        .checked_sub(1)
-                        .unwrap_or(pane.search_matches.len() - 1);
-                    pane.scroll = pane.search_matches[pane.search_current];
-                    if let Some(msg_idx) = pane
-                        .message_lines
-                        .iter()
-                        .rposition(|&(start, _)| start <= pane.scroll)
-                    {
-                        pane.selected_message = msg_idx;
-                    }
-                } else if let Some(&(prev_pos, _)) = pane
+                if let Some(&(prev_pos, _)) = pane
                     .message_lines
                     .iter()
                     .rev()
@@ -964,12 +1143,29 @@ pub(crate) fn handle_conversation_key(
             }
         }
         KeyCode::Char('y') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-                && let Some(&(_, msg_idx)) = pane.message_lines.get(pane.selected_message)
-                && let Some(msg) = pane.messages.get(msg_idx)
-            {
-                let content = ui::extract_message_text(msg);
+            // A compact row can fold several consecutive messages (a tool group)
+            // into one `message_lines` entry, so copy every message from this
+            // row's start up to the next row's start — not just the first. In
+            // full mode each row is one message, so the range is a single entry.
+            let content = state
+                .active_pane_index
+                .and_then(|idx| state.panes.get(idx))
+                .and_then(|pane| {
+                    let &(_, start_msg) = pane.message_lines.get(pane.selected_message)?;
+                    let end_msg = pane
+                        .message_lines
+                        .get(pane.selected_message + 1)
+                        .map_or(pane.messages.len(), |&(_, m)| m);
+                    let text = pane
+                        .messages
+                        .get(start_msg..end_msg.min(pane.messages.len()))?
+                        .iter()
+                        .map(ui::extract_message_text)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.is_empty()).then_some(text)
+                });
+            if let Some(content) = content {
                 let len = content.chars().count();
                 state.toast(format!("Copied ({len} chars)"));
                 state.clipboard_task = Some(crate::handlers::tasks::spawn_clipboard_write(content));
@@ -981,8 +1177,29 @@ pub(crate) fn handle_conversation_key(
             state.active_popup = crate::ActivePopup::Detail;
             state.session_detail_scroll = 0;
         }
-        KeyCode::Enter if state.active_pane_index.is_none() => {
-            open_conversation_in_pane(state);
+        // Open the AI summary popup for the focused pane's session, falling back
+        // to the list-selected session when no pane has focus. Regenerate / write
+        // resume title (`r` / `t`) then live inside that popup.
+        KeyCode::Char('s') if state.summary_task.is_none() => {
+            let session = state
+                .active_pane_index
+                .and_then(|i| state.panes.get(i))
+                .and_then(|p| p.file_path.as_ref())
+                .and_then(|fp| {
+                    // Skip subagents: their .jsonl has no resume-title slot, so a
+                    // summary opened here would have a dead `t` action. Fall through
+                    // to the list selection instead (a real user session).
+                    state
+                        .daily_groups
+                        .iter()
+                        .flat_map(|g| g.sessions.iter())
+                        .find(|s| &s.file_path == fp && !s.is_subagent)
+                        .cloned()
+                })
+                .or_else(|| crate::handlers::pane::current_selected_session(state));
+            if let Some(session) = session {
+                handlers::tasks::start_session_summary(state, session, false);
+            }
         }
         _ => {}
     }
@@ -1017,7 +1234,7 @@ pub(crate) fn handle_default_key(
             state.retention_warning_dismissed = true;
         }
         KeyCode::Char('?') => {
-            state.active_popup = crate::ActivePopup::Help;
+            state.active_popup = crate::ActivePopup::Help { scroll: 0 };
         }
         KeyCode::Char(' ') if state.tab == Tab::Live => {
             // Pin / unpin the currently-selected Live row — same semantics as
@@ -1028,30 +1245,37 @@ pub(crate) fn handle_default_key(
                 crate::handlers::pane::toggle_pin(state, &path);
             }
         }
+        KeyCode::Char('v') if state.tab == Tab::Live && state.live_view_snapshot_offset == 0 => {
+            // Cycle Split → Active-only → Paused-only. Land the cursor in the
+            // newly visible pane and reset both scrolls so the full-screen list
+            // starts at the top.
+            state.live_pane_mode = match state.live_pane_mode {
+                crate::LivePaneMode::Split => crate::LivePaneMode::ActiveOnly,
+                crate::LivePaneMode::ActiveOnly => crate::LivePaneMode::PausedOnly,
+                crate::LivePaneMode::PausedOnly => crate::LivePaneMode::Split,
+            };
+            let (lo, _) = crate::live_selectable_range(state);
+            state.live_selected = lo;
+            state.live_scroll = 0;
+            state.live_paused_scroll = 0;
+        }
         KeyCode::Char('y') if state.tab == Tab::Live => {
             // Snapshot the fields before mutating `state` (toast) so the
             // `live_selected_session` borrow is released.
             let sel = crate::live_selected_session(state)
                 .map(|s| (s.jsonl_path.clone(), s.cwd.clone(), s.session_id.clone()));
-            if let Some((jsonl_path, fallback_cwd, session_id)) = sel {
-                // Authoritative cwd = the JSONL's `cwd` field; it preserves a
-                // literal `-` in the path that the slug reversal mangles into
-                // `/`. Fall back to the discovered cwd (pid.json for active
-                // sessions) only when no JSONL exists yet.
-                let cwd = jsonl_path
-                    .as_deref()
-                    .and_then(crate::infrastructure::live_sessions::read_cwd_from_jsonl)
-                    .unwrap_or_else(|| fallback_cwd.to_string_lossy().into_owned());
-                // Both cwd and session_id are POSIX-quoted — the underlying
-                // JSON is on disk and could be tampered with.
-                let cmd = format!(
-                    "cd {} && claude -r {}",
-                    crate::shell::shell_quote_cwd(&cwd),
-                    crate::shell::posix_shell_quote(&session_id),
-                );
-                state.clipboard_task =
-                    Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
-                state.toast(format!("Copied: {cmd}"));
+            if let Some((jsonl_path, pid_cwd, session_id)) = sel {
+                if let Some(path) = jsonl_path {
+                    copy_resume_command(state, &path);
+                } else {
+                    // No transcript on disk yet: its storage slug will derive
+                    // from this very pid cwd when the first entry lands, so
+                    // the pid cwd is correct by construction.
+                    let cmd = crate::shell::resume_command(&pid_cwd.to_string_lossy(), &session_id);
+                    state.clipboard_task =
+                        Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
+                    state.toast(format!("Copied: {cmd}"));
+                }
             }
         }
         KeyCode::Char('i') if state.tab == Tab::Live => {
@@ -1083,24 +1307,27 @@ pub(crate) fn handle_default_key(
             }
         }
         KeyCode::Char('f') => {
-            state.active_popup = crate::ActivePopup::FilterPopup;
-            state.filter_popup_selected =
-                if matches!(state.period_filter, PeriodFilter::Custom(_, _)) {
-                    PeriodFilter::ALL_VARIANTS.len()
-                } else {
-                    PeriodFilter::ALL_VARIANTS
-                        .iter()
-                        .position(|&v| v == state.period_filter)
-                        .unwrap_or(0)
-                };
+            let selected = if matches!(state.period_filter, PeriodFilter::Custom(_, _)) {
+                PeriodFilter::ALL_VARIANTS.len()
+            } else {
+                PeriodFilter::ALL_VARIANTS
+                    .iter()
+                    .position(|&v| v == state.period_filter)
+                    .unwrap_or(0)
+            };
+            state.active_popup = crate::ActivePopup::FilterPopup {
+                selected,
+                input_mode: false,
+                input: crate::TextInput::default(),
+                input_error: false,
+            };
         }
         KeyCode::Char('p') => {
-            state.active_popup = crate::ActivePopup::ProjectPopup;
             // Preselect against the SAME sorted view the popup renders and the
             // Enter handler indexes (`project_list_sorted`, recency by
             // default) — using the raw `project_list` order here would land
             // the cursor on an unrelated project and silently switch filters.
-            state.project_popup_selected = match &state.project_filter {
+            let selected = match &state.project_filter {
                 Some(name) => state
                     .project_list_sorted()
                     .iter()
@@ -1108,7 +1335,10 @@ pub(crate) fn handle_default_key(
                     .map_or(0, |i| i + 1),
                 None => 0,
             };
-            state.project_popup_scroll = 0;
+            state.active_popup = crate::ActivePopup::ProjectPopup {
+                selected,
+                scroll: 0,
+            };
         }
         KeyCode::Char(' ') => {
             if state.tab == Tab::Daily
@@ -1158,6 +1388,12 @@ pub(crate) fn handle_default_key(
             }
             state.search_mode = true;
             state.search_input.move_end();
+            // Restored query opens "selected" (VS Code find widget), same as
+            // the pane search: the first typed char replaces it wholesale.
+            // The just-seeded Live-tab `filter:live ` prefix stays appendable.
+            let fresh_live_seed =
+                state.tab == Tab::Live && state.search_input.text == "filter:live ";
+            state.search_select_all = !state.search_input.text.is_empty() && !fresh_live_seed;
         }
         KeyCode::Tab
         | KeyCode::Char('1')
@@ -1215,7 +1451,6 @@ pub(crate) fn handle_default_key(
                 } else {
                     state.insights_panel - 1
                 };
-                state.insights_detail_scroll = 0;
             }
         }
         KeyCode::Right | KeyCode::Char('l') => {
@@ -1237,7 +1472,6 @@ pub(crate) fn handle_default_key(
                 } else {
                     state.insights_panel + 1
                 };
-                state.insights_detail_scroll = 0;
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -1261,7 +1495,8 @@ pub(crate) fn handle_default_key(
                     state.selected_session -= 1;
                 }
             } else if state.tab == Tab::Live {
-                state.live_selected = state.live_selected.saturating_sub(1);
+                let (lo, _) = crate::live_selectable_range(state);
+                state.live_selected = state.live_selected.saturating_sub(1).max(lo);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1291,8 +1526,8 @@ pub(crate) fn handle_default_key(
                     }
                 }
             } else if state.tab == Tab::Live {
-                let n = crate::live_visible_count(state);
-                if state.live_selected + 1 < n {
+                let (_, hi) = crate::live_selectable_range(state);
+                if state.live_selected + 1 < hi {
                     state.live_selected += 1;
                 }
             }
@@ -1325,8 +1560,7 @@ pub(crate) fn handle_default_key(
             } else if state.tab == Tab::Dashboard {
                 state.active_popup = crate::ActivePopup::DashboardDetail;
             } else if state.tab == Tab::Insights {
-                state.active_popup = crate::ActivePopup::InsightsDetail;
-                state.insights_detail_scroll = 0;
+                state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
             }
         }
         KeyCode::Char('C') => {
@@ -1386,55 +1620,64 @@ pub(crate) fn handle_default_key(
                 }
             }
         }
-        KeyCode::Char('r') => {
-            if state.tab == Tab::Daily
-                && state.summary_task.is_none()
-                && let Some(session) = crate::current_selected_session(state)
-            {
-                handlers::tasks::start_session_summary(state, session, true);
-            }
-        }
-        KeyCode::Char('R') if state.tab == Tab::Daily => {
-            let selected_day = state.selected_day;
-            let selected_session = state.selected_session;
-            if let Some((actual_idx, session)) = crate::current_selected_session_with_index(state)
-                && state.updating_task.is_none()
-            {
-                handlers::tasks::start_jsonl_regen(
-                    state,
-                    session,
-                    selected_day,
-                    selected_session,
-                    actual_idx,
-                );
-            }
-        }
+        // Regenerate (`r`) and resume-title write (`t`) moved into the Summary
+        // popup (`handle_summary_popup_key`) so they sit next to the summary
+        // they act on, with consistent meaning across every view.
         KeyCode::Char('b') if state.tab == Tab::Daily => {
             state.daily_breakdown_focus = !state.daily_breakdown_focus;
             if state.daily_breakdown_focus {
                 state.daily_breakdown_scroll = 0;
             }
         }
-        KeyCode::Char('t') if state.tab == Tab::Daily && !state.daily_groups.is_empty() => {
+        KeyCode::Char('T') if state.tab == Tab::Daily && !state.daily_groups.is_empty() => {
             state.selected_day = 0;
             state.selected_session = 0;
         }
-        KeyCode::Char('t') if state.tab == Tab::Live && state.live_view_snapshot_offset != 0 => {
-            // Mirror Daily's `t` — jump to today. No-op when already on today.
+        KeyCode::Char('T') if state.tab == Tab::Live && state.live_view_snapshot_offset != 0 => {
+            // Mirror Daily's `T` — jump to today. No-op when already on today.
             state.live_view_snapshot_offset = 0;
             state.live_past_sessions.clear();
             state.live_selected = 0;
             state.live_scroll = 0;
             state.needs_draw = true;
         }
+        // `t` edits the selected session's title right from the list — same
+        // key the Detail / Summary popups advertise, so it works everywhere
+        // a session is selected.
+        KeyCode::Char('t') if state.tab == Tab::Daily => {
+            if let Some(session) = crate::current_selected_session(state) {
+                open_title_editor(state, &session, crate::TitleEditReturn::Root);
+            }
+        }
+        KeyCode::Char('t') if state.tab == Tab::Live => {
+            let jsonl = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone());
+            if let Some(jsonl) = jsonl {
+                match crate::handlers::pane::find_indexed_session_by_path(state, &jsonl) {
+                    Some(session) => {
+                        open_title_editor(state, &session, crate::TitleEditReturn::Root);
+                    }
+                    None => state.toast("Session not yet indexed; ccsight reloads every 30s"),
+                }
+            }
+        }
         KeyCode::Char('i') => {
             if state.tab == Tab::Daily {
                 state.active_popup = crate::ActivePopup::Detail;
                 state.session_detail_scroll = 0;
             } else if state.tab == Tab::Insights {
-                state.active_popup = crate::ActivePopup::InsightsDetail;
-                state.insights_detail_scroll = 0;
+                state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
             }
+        }
+        // Unbound printable key: name it instead of silently ignoring, so a
+        // slip (wrong tab, key from another view) is distinguishable from a
+        // dead keyboard. Modified chords stay silent — terminals send many.
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            state.toast(format!("'{c}': no action here — ? shows key bindings"));
+            state.needs_draw = true;
         }
         _ => {}
     }
@@ -1558,9 +1801,10 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
             state.sort_projects(&mut projects);
             if let Some((name, _)) = projects.get(state.dashboard_scroll[1]) {
-                state.project_detail_path = (*name).clone();
-                state.project_detail_scroll = 0;
-                state.active_popup = crate::ActivePopup::ProjectDetail;
+                state.active_popup = crate::ActivePopup::ProjectDetail {
+                    path: (*name).clone(),
+                    scroll: 0,
+                };
             }
         }
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
@@ -1572,6 +1816,15 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             // of the new dataset; otherwise an out-of-range index from the
             // longer (daily) list would silently saturate at the end.
             state.dashboard_scroll[5] = 0;
+        }
+        // Costs (0) and Daily-Activity (5) share the active-day date set; toggle
+        // filling idle calendar days. Reset scroll for the same reason as `w`.
+        KeyCode::Char('z')
+            if state.dashboard_panel == 0
+                || (state.dashboard_panel == 5 && !state.activity_view_weekly) =>
+        {
+            state.show_empty_days = !state.show_empty_days;
+            state.dashboard_scroll[state.dashboard_panel] = 0;
         }
         KeyCode::Up | KeyCode::Char('k') if state.dashboard_scroll[state.dashboard_panel] > 0 => {
             state.dashboard_scroll[state.dashboard_panel] -= 1;
@@ -1644,18 +1897,15 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `ActivePopup::Summary` branch — Esc/q close the popup, ↑↓/j/k scroll
-/// the body, `r` re-runs the summary generation.
+/// `ActivePopup::Summary` branch — Esc/q close the popup, ↑↓/j/k scroll the
+/// body, `r` re-runs the summary generation, `t` opens the session title
+/// editor (closing it returns to this popup).
 pub(crate) fn handle_summary_popup_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        // Enter closes too — parity with the other detail popups, where a
+        // no-op Enter reads as an unresponsive UI.
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
             state.clear_summary();
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.summary_scroll = state.summary_scroll.saturating_add(1);
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.summary_scroll = state.summary_scroll.saturating_sub(1);
         }
         KeyCode::Char('r') => {
             if state.summary_task.is_none()
@@ -1671,7 +1921,18 @@ pub(crate) fn handle_summary_popup_key(state: &mut AppState, key: KeyEvent) {
                 }
             }
         }
-        _ => {}
+        // `t` opens the title editor for the session (prefilled). Enter saves
+        // the typed text; ^R AI-generates. Session summaries only.
+        KeyCode::Char('t') => {
+            if let Some(SummaryType::Session(session)) = state.summary_type.clone() {
+                open_title_editor(state, &session, crate::TitleEditReturn::Summary);
+            }
+        }
+        _ => {
+            if let Some(action) = scroll_action_for_key(&key) {
+                state.set_summary_scroll(apply_scroll_usize(state.summary_scroll(), action));
+            }
+        }
     }
 }
 
@@ -1691,6 +1952,7 @@ pub(crate) fn handle_search_mode_key(
             // the previous query. Drop the result list to release memory;
             // it gets rebuilt on the next open.
             state.search_mode = false;
+            state.search_select_all = false;
             state.search_results.clear();
             state.search_selected = 0;
             state.search_task = None;
@@ -1705,6 +1967,7 @@ pub(crate) fn handle_search_mode_key(
             state.search_preview_mode = false;
         }
         KeyCode::Enter if !state.search_results.is_empty() => {
+            state.search_select_all = false;
             let result = state.search_results[state.search_selected].clone();
             let query = state.search_input.text.clone();
             // Persist the query so ↑ on the next `/` open recalls it.
@@ -1726,18 +1989,33 @@ pub(crate) fn handle_search_mode_key(
             state.search_task = None;
             state.searching = false;
             open_conversation_in_pane(state);
+            // Seed the in-pane search with the free text only: filter
+            // tokens (`filter:` / `project:` / ...) are popup syntax, and
+            // carried over verbatim they'd search for the literal token.
+            let (_, free_text) = crate::search::parse_search_query(&query);
             if is_content
+                && !free_text.is_empty()
                 && let Some(idx) = state.active_pane_index
                 && let Some(pane) = state.panes.get_mut(idx)
             {
-                pane.search_input.set(query);
+                pane.search_input.set(free_text);
                 pane.search_mode = true;
+                // Seeded query opens "selected", like a `/` reopen: the user
+                // didn't type it here, so their first keypress replaces it
+                // instead of appending to it. Enter still walks matches
+                // (navigation keys don't consume the selection's text).
+                pane.search_select_all = true;
+                pane.search_current = 0;
+                // Messages load async; the draw recomputes matches once they
+                // land and this flag then peeks + centers the first hit.
+                pane.pending_search_scroll = true;
             }
         }
         // ↑↓ walk history only on blank input or while already recalling;
         // typing reverts ↑↓ to list nav so users aren't yanked into
         // history. j/k always navigate results (vim consistency).
         KeyCode::Up => {
+            state.search_select_all = false;
             let in_history_mode =
                 state.search_input.text.is_empty() || state.search_history.is_browsing();
             if state.search_selected > 0 {
@@ -1760,6 +2038,7 @@ pub(crate) fn handle_search_mode_key(
             }
         }
         KeyCode::Down => {
+            state.search_select_all = false;
             if state.search_history.is_browsing() && state.search_selected == 0 {
                 if let Some(next) = state.search_history.step_forward() {
                     state.search_input.set(next);
@@ -1786,7 +2065,13 @@ pub(crate) fn handle_search_mode_key(
         // typed something.
         KeyCode::Backspace => {
             state.search_history.reset_cursor();
-            state.search_input.delete_back();
+            if state.search_select_all {
+                // Restored query is "selected": Backspace wipes it.
+                state.search_select_all = false;
+                state.search_input.set(String::new());
+            } else {
+                state.search_input.delete_back();
+            }
             let ctx_owned = crate::build_search_filter_ctx(state);
             state.search_results = search::perform_search(
                 &state.daily_groups,
@@ -1797,19 +2082,28 @@ pub(crate) fn handle_search_mode_key(
             start_content_search(state);
         }
         KeyCode::Left => {
+            state.search_select_all = false;
             state.search_input.move_left();
         }
         KeyCode::Right => {
+            state.search_select_all = false;
             state.search_input.move_right();
         }
         KeyCode::Home => {
+            state.search_select_all = false;
             state.search_input.move_home();
         }
         KeyCode::End => {
+            state.search_select_all = false;
             state.search_input.move_end();
         }
         KeyCode::Char(c) => {
             state.search_history.reset_cursor();
+            if state.search_select_all {
+                // First char replaces the restored query wholesale.
+                state.search_select_all = false;
+                state.search_input.set(String::new());
+            }
             state.search_input.insert_char(c);
             let ctx_owned = crate::build_search_filter_ctx(state);
             state.search_results = search::perform_search(
@@ -1832,20 +2126,21 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
             state.active_popup = crate::ActivePopup::None;
         }
-        KeyCode::Up | KeyCode::Char('k') if state.project_popup_selected > 0 => {
-            state.project_popup_selected -= 1;
+        KeyCode::Up | KeyCode::Char('k') if state.project_popup_selected() > 0 => {
+            state.set_project_popup_selected(state.project_popup_selected() - 1);
         }
-        KeyCode::Down | KeyCode::Char('j') if state.project_popup_selected < total - 1 => {
-            state.project_popup_selected += 1;
+        KeyCode::Down | KeyCode::Char('j') if state.project_popup_selected() < total - 1 => {
+            state.set_project_popup_selected(state.project_popup_selected() + 1);
         }
         KeyCode::Enter => {
-            if state.project_popup_selected == 0 {
+            if state.project_popup_selected() == 0 {
                 state.project_filter = None;
             } else {
                 // Selection indexes into the display-sorted view so the
                 // chosen row matches whatever the user is looking at.
                 let sorted = state.project_list_sorted();
-                if let Some((name, _, _)) = sorted.get(state.project_popup_selected - 1).copied() {
+                if let Some((name, _, _)) = sorted.get(state.project_popup_selected() - 1).copied()
+                {
                     state.project_filter = Some(name.clone());
                 }
             }
@@ -1859,6 +2154,30 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_editor_prefills_from_the_cache_over_the_stale_session_clone() {
+        // Saving a title updates `session_titles` only; the SessionInfo in
+        // `daily_groups` keeps the old value until the next data reload. A
+        // re-edit inside that window must show the just-saved title, or Enter
+        // would silently revert it.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        let mut session = crate::test_helpers::helpers::make_session_with_tokens(
+            "~/proj",
+            10,
+            10,
+            "claude-sonnet-4-20250514",
+        );
+        session.custom_title = Some("old title".to_string());
+        state
+            .session_titles
+            .insert(session.file_path.clone(), "new title".to_string());
+        open_title_editor(&mut state, &session, crate::TitleEditReturn::Root);
+        let crate::ActivePopup::TitleEdit { input, .. } = &state.active_popup else {
+            panic!("editor did not open");
+        };
+        assert_eq!(input.text, "new title");
+    }
 
     #[test]
     fn step_live_view_snapshot_at_today_warns_when_walking_forward() {
@@ -1878,11 +2197,13 @@ mod tests {
     #[test]
     fn project_detail_esc_returns_to_dashboard_detail() {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
-        state.active_popup = crate::ActivePopup::ProjectDetail;
-        state.project_detail_path = "~/proj".to_string();
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "~/proj".to_string(),
+            scroll: 0,
+        };
         handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Esc));
         assert_eq!(state.active_popup, crate::ActivePopup::DashboardDetail);
-        assert!(state.project_detail_path.is_empty());
+        assert!(state.project_detail_path().is_empty());
     }
 
     fn noop(_: &mut AppState) {}
@@ -1906,6 +2227,71 @@ mod tests {
     }
 
     #[test]
+    fn title_edit_empty_enter_is_rejected_not_a_save() {
+        // Clearing the prefill then Enter must not close the popup nor drop the
+        // target path — otherwise an accidental empty Enter would lose the edit.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::TitleEdit {
+            input: crate::TextInput::default(),
+            path: std::path::PathBuf::from("/tmp/x.jsonl"),
+            return_to: crate::TitleEditReturn::Root,
+        };
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(
+                state.active_popup,
+                crate::ActivePopup::TitleEdit { ref path, .. } if path.ends_with("x.jsonl")
+            ),
+            "stays open with the target path preserved"
+        );
+        assert!(state.toast_message.is_some(), "guidance toast shown");
+    }
+
+    #[test]
+    fn title_edit_returns_to_its_opener_on_esc_and_save() {
+        // Esc from a Detail-opened editor lands back on Detail, not root.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::TitleEdit {
+            input: crate::TextInput::default(),
+            path: std::path::PathBuf::from("/tmp/x.jsonl"),
+            return_to: crate::TitleEditReturn::Detail,
+        };
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.active_popup, crate::ActivePopup::Detail);
+
+        // A successful save restores the Summary popup for a Summary opener.
+        let dir = std::env::temp_dir().join(format!("ccsight-titleret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("abc123.jsonl");
+        std::fs::write(&jsonl, "{}\n").unwrap();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        let mut input = crate::TextInput::default();
+        input.set("renamed".to_string());
+        state.active_popup = crate::ActivePopup::TitleEdit {
+            input,
+            path: jsonl,
+            return_to: crate::TitleEditReturn::Summary,
+        };
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(state.show_summary(), "save lands back on the Summary popup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn title_edit_plain_r_inserts_not_ai_trigger() {
+        // Only Ctrl+R triggers AI-generate; a bare 'r' is a literal insert.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::TitleEdit {
+            input: crate::TextInput::default(),
+            path: std::path::PathBuf::from("/tmp/x.jsonl"),
+            return_to: crate::TitleEditReturn::Root,
+        };
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Char('r')));
+        assert_eq!(state.title_input().unwrap().text, "r");
+        assert!(state.show_title_edit());
+    }
+
+    #[test]
     fn tab_switch_works_once_loaded() {
         // After loading clears, the same keys switch tabs normally.
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
@@ -1915,5 +2301,677 @@ mod tests {
         assert!(state.tab == Tab::Live);
         handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('3')), noop, noop);
         assert!(state.tab == Tab::Daily);
+    }
+
+    fn conv_test_pane(texts: &[&str]) -> crate::ConversationPane {
+        let msgs: Vec<crate::ConversationMessage> = texts
+            .iter()
+            .map(|t| crate::ConversationMessage {
+                role: "user".to_string(),
+                blocks: vec![crate::ConversationBlock::Text((*t).to_string())],
+                timestamp: Some("10:00".to_string()),
+                timestamp_utc: None,
+                model: None,
+                tokens: None,
+                usage: None,
+            })
+            .collect();
+        crate::ConversationPane {
+            messages: std::sync::Arc::new(msgs),
+            ..Default::default()
+        }
+    }
+
+    fn conv_key(state: &mut AppState, code: KeyCode) {
+        fn no_file(_: &AppState, _: usize) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn no_count(_: &AppState) -> usize {
+            0
+        }
+        handle_conversation_key(state, KeyEvent::from(code), noop, noop, no_file, no_count);
+    }
+
+    #[test]
+    fn question_mark_opens_help_from_conversation_view() {
+        // `?` is documented as Global; the conversation view consumes all
+        // keys, so it needs its own arm or the claim is false there.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.show_conversation = true;
+        state.active_pane_index = Some(0);
+        state.panes = vec![conv_test_pane(&["hello"])];
+        conv_key(&mut state, KeyCode::Char('?'));
+        assert!(matches!(
+            state.active_popup,
+            crate::ActivePopup::Help { .. }
+        ));
+    }
+
+    #[test]
+    fn pane_search_esc_ends_search_and_reopen_restores_query_selected() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.show_conversation = true;
+        state.active_pane_index = Some(0);
+        state.panes = vec![conv_test_pane(&["alpha beta", "beta gamma beta"])];
+
+        conv_key(&mut state, KeyCode::Char('/'));
+        for c in "beta".chars() {
+            conv_key(&mut state, KeyCode::Char(c));
+        }
+        assert_eq!(
+            state.panes[0].search_matches.len(),
+            3,
+            "occurrence-level matches across messages"
+        );
+
+        // Esc = VS Code pure: matches (highlights) die, the query survives.
+        conv_key(&mut state, KeyCode::Esc);
+        {
+            let pane = &state.panes[0];
+            assert!(!pane.search_mode);
+            assert!(pane.search_matches.is_empty(), "highlights die with Esc");
+            assert_eq!(pane.search_input.text, "beta", "query kept for reopen");
+        }
+
+        // Reopen: query restored selected; highlights return; first char
+        // replaces the text wholesale.
+        conv_key(&mut state, KeyCode::Char('/'));
+        assert!(state.panes[0].search_select_all);
+        assert_eq!(state.panes[0].search_matches.len(), 3);
+        conv_key(&mut state, KeyCode::Char('g'));
+        assert_eq!(state.panes[0].search_input.text, "g");
+        assert!(!state.panes[0].search_select_all);
+    }
+
+    #[test]
+    fn search_enter_seeds_pane_search_with_free_text_only() {
+        // Filter tokens are popup-only syntax; carried into the in-pane
+        // search bar verbatim they'd search for the literal token text.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.search_mode = true;
+        state
+            .search_input
+            .set("filter:month project:kernel scheduler race".to_string());
+        state.search_results = vec![crate::search::SearchResult {
+            day_idx: 0,
+            session_idx: 0,
+            snippet: Some("…".to_string()),
+            match_type: crate::search::SearchMatchType::Content,
+            session_path: None,
+        }];
+        fn opener(state: &mut AppState) {
+            state.panes.push(crate::ConversationPane::default());
+            state.active_pane_index = Some(0);
+        }
+        handle_search_mode_key(&mut state, KeyEvent::from(KeyCode::Enter), noop, opener);
+        let pane = &state.panes[0];
+        assert_eq!(pane.search_input.text, "scheduler race");
+        assert!(pane.search_mode);
+        // Seeded text was not typed by the user: it opens "selected" so the
+        // first keypress replaces it instead of appending.
+        assert!(pane.search_select_all);
+    }
+
+    #[test]
+    fn search_popup_reopen_restores_query_selected_and_first_char_replaces() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.search_input.set("resume".to_string());
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('/')), noop, noop);
+        assert!(state.search_mode);
+        assert!(state.search_select_all, "restored query opens selected");
+        handle_search_mode_key(&mut state, KeyEvent::from(KeyCode::Char('x')), noop, noop);
+        assert_eq!(
+            state.search_input.text, "x",
+            "first char must replace, not append"
+        );
+        assert!(!state.search_select_all);
+    }
+
+    #[test]
+    fn search_popup_live_tab_seed_stays_appendable() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = crate::Tab::Live;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('/')), noop, noop);
+        assert_eq!(state.search_input.text, "filter:live ");
+        assert!(
+            !state.search_select_all,
+            "the fresh seed is a prefix to type after, not a query to replace"
+        );
+    }
+
+    #[test]
+    fn paste_replaces_a_selected_restored_query() {
+        // Search popup input.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.search_mode = true;
+        state.search_input.set("old".to_string());
+        state.search_select_all = true;
+        let kind = crate::paste_into_active_input(&mut state, "new");
+        assert_eq!(kind, Some(crate::InputKind::Search));
+        assert_eq!(state.search_input.text, "new");
+
+        // Pane search input.
+        state.search_mode = false;
+        state.show_conversation = true;
+        let mut pane = crate::ConversationPane::default();
+        pane.search_mode = true;
+        pane.search_input.set("old".to_string());
+        pane.search_select_all = true;
+        state.panes = vec![pane];
+        state.active_pane_index = Some(0);
+        let kind = crate::paste_into_active_input(&mut state, "xy");
+        assert_eq!(kind, Some(crate::InputKind::PaneSearch));
+        assert_eq!(state.panes[0].search_input.text, "xy");
+    }
+
+    #[test]
+    fn daily_t_opens_title_editor_and_shift_t_jumps_to_today() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let older = chrono::NaiveDate::from_ymd_opt(2026, 3, 14).unwrap(); // lint-ok: date-literal
+        let groups = vec![
+            make_daily_group(today, vec![make_session_with_tokens("~/proj", 10, 5, "m")]),
+            make_daily_group(older, vec![make_session_with_tokens("~/proj", 10, 5, "m")]),
+        ];
+        let mut state = make_test_app_state(groups);
+        state.tab = Tab::Daily;
+        state.selected_day = 1;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('t')), noop, noop);
+        assert!(
+            matches!(
+                state.active_popup,
+                crate::ActivePopup::TitleEdit {
+                    return_to: crate::TitleEditReturn::Root,
+                    ..
+                }
+            ),
+            "t on the list edits the selected session's title"
+        );
+
+        state.active_popup = crate::ActivePopup::None;
+        state.selected_day = 1;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('T')), noop, noop);
+        assert_eq!(state.selected_day, 0, "T keeps the jump-to-today binding");
+        assert!(!state.show_title_edit());
+    }
+
+    #[test]
+    fn live_past_view_shift_t_returns_to_now() {
+        // `T` = jump to today/now on every list; past view must not leave
+        // `t` doing double duty.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = Tab::Live;
+        state.live_view_snapshot_offset = 3;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('T')), noop, noop);
+        assert_eq!(
+            state.live_view_snapshot_offset, 0,
+            "T returns to the now view"
+        );
+        assert!(!state.show_title_edit());
+    }
+
+    #[test]
+    fn live_t_on_unindexed_session_toasts_instead_of_opening_editor() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = Tab::Live;
+        state
+            .live_active
+            .push(crate::infrastructure::live_sessions::LiveSession {
+                session_id: "sess-1".to_string(),
+                jsonl_path: Some(std::path::PathBuf::from("/tmp/not-indexed.jsonl")),
+                cwd: std::path::PathBuf::from("/tmp"),
+                name: None,
+                status: None,
+                pid: 1,
+                started_at: None,
+                updated_at: None,
+                jsonl_mtime: None,
+                is_live: true,
+                was_recently_live: false,
+            });
+        state.live_selected = 0;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('t')), noop, noop);
+        assert!(
+            !state.show_title_edit(),
+            "no editor without an indexed session"
+        );
+        assert!(
+            state
+                .toast_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("not yet indexed"),
+            "toast explains why nothing opened: {:?}",
+            state.toast_message
+        );
+    }
+
+    #[test]
+    fn unbound_printable_key_names_itself_in_a_toast() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = Tab::Dashboard;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('Z')), noop, noop);
+        assert!(
+            state.toast_message.as_deref().unwrap_or("").contains("'Z'"),
+            "unbound key is named: {:?}",
+            state.toast_message
+        );
+
+        // Modified chords stay silent — terminals emit many of them.
+        state.toast_message = None;
+        let mut ev = KeyEvent::from(KeyCode::Char('z'));
+        ev.modifiers = KeyModifiers::CONTROL;
+        handle_default_key(&mut state, ev, noop, noop);
+        assert!(state.toast_message.is_none(), "ctrl chord must not toast");
+    }
+
+    #[test]
+    fn help_scroll_saturates_at_zero() {
+        // k (line up) and u (page up) at scroll 0 must stay at 0, never wrap.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::Help { scroll: 0 };
+        handle_help_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(state.help_scroll(), 0);
+        handle_help_key(&mut state, KeyEvent::from(KeyCode::Char('u')));
+        assert_eq!(state.help_scroll(), 0);
+        handle_help_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(state.help_scroll(), 1);
+        handle_help_key(&mut state, KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(state.help_scroll(), 11);
+    }
+
+    #[test]
+    fn help_end_and_home_jump_to_edges() {
+        // G saturates to u16::MAX (draw clamps against content height); g → 0.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::Help { scroll: 5 };
+        handle_help_key(&mut state, KeyEvent::from(KeyCode::Char('G')));
+        assert_eq!(state.help_scroll(), u16::MAX);
+        handle_help_key(&mut state, KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(state.help_scroll(), 0);
+    }
+
+    #[test]
+    fn project_detail_scroll_saturates_at_zero() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "~/proj".to_string(),
+            scroll: 0,
+        };
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(state.project_detail_scroll(), 0);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('u')));
+        assert_eq!(state.project_detail_scroll(), 0);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(state.project_detail_scroll(), 1);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(state.project_detail_scroll(), 11);
+    }
+
+    #[test]
+    fn insights_detail_scroll_saturates_at_zero() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
+        handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(state.insights_detail_scroll(), 0);
+        handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(state.insights_detail_scroll(), 1);
+    }
+
+    #[test]
+    fn summary_scroll_saturates_at_zero() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::Summary { scroll: 0 };
+        handle_summary_popup_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(state.summary_scroll(), 0);
+        handle_summary_popup_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(state.summary_scroll(), 1);
+    }
+
+    // Every j/k-scrollable popup shares one key set via `scroll_action_for_key`
+    // (PageUp/PageDown/Home/End alongside line-step) — pin it here so a
+    // future popup can't end up with a narrower set than its siblings.
+    #[test]
+    fn project_detail_supports_page_and_edge_keys() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "~/proj".to_string(),
+            scroll: 5,
+        };
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::End));
+        assert_eq!(state.project_detail_scroll(), usize::MAX);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Home));
+        assert_eq!(state.project_detail_scroll(), 0);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(state.project_detail_scroll(), 10);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(state.project_detail_scroll(), 0);
+    }
+
+    #[test]
+    fn insights_detail_supports_page_and_edge_keys() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 5 };
+        handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(state.insights_detail_scroll(), 15);
+        handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(state.insights_detail_scroll(), 0);
+        handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('G')));
+        assert_eq!(state.insights_detail_scroll(), usize::MAX);
+    }
+
+    #[test]
+    fn session_detail_supports_page_and_edge_keys() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::Detail;
+        state.session_detail_scroll = 5;
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(state.session_detail_scroll, 15);
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Home));
+        assert_eq!(state.session_detail_scroll, 0);
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::End));
+        assert_eq!(state.session_detail_scroll, usize::MAX);
+    }
+
+    #[test]
+    fn summary_popup_supports_page_and_edge_keys() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::Summary { scroll: 5 };
+        handle_summary_popup_key(&mut state, KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(state.summary_scroll(), 0);
+        handle_summary_popup_key(&mut state, KeyEvent::from(KeyCode::End));
+        assert_eq!(state.summary_scroll(), usize::MAX);
+        handle_summary_popup_key(&mut state, KeyEvent::from(KeyCode::Home));
+        assert_eq!(state.summary_scroll(), 0);
+    }
+
+    #[test]
+    fn insights_detail_panel_cycle_wraps_and_resets_scroll() {
+        // h/l cycle the 4 panels with wraparound; every switch resets the
+        // body scroll so the new panel starts at its top.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 5 };
+        state.insights_panel = 0;
+        handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(state.insights_panel, 3, "left from panel 0 wraps to last");
+        assert_eq!(state.insights_detail_scroll(), 0, "switch resets scroll");
+        handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(state.insights_panel, 0, "right from last panel wraps to 0");
+    }
+
+    fn filter_popup(selected: usize, input_mode: bool, text: &str) -> crate::ActivePopup {
+        let mut input = crate::TextInput::default();
+        input.set(text.to_string());
+        crate::ActivePopup::FilterPopup {
+            selected,
+            input_mode,
+            input,
+            input_error: false,
+        }
+    }
+
+    #[test]
+    fn filter_popup_nav_clamps_to_row_range() {
+        // Rows are the presets plus the Custom row; k at the top and j past
+        // the bottom must both clamp instead of wrapping or overflowing.
+        let total = PeriodFilter::ALL_VARIANTS.len() + 1;
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = filter_popup(0, false, "");
+        handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(state.filter_popup_selected(), 0, "k at top stays at top");
+        for _ in 0..total + 5 {
+            handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            state.filter_popup_selected(),
+            total - 1,
+            "j clamps at the Custom row"
+        );
+    }
+
+    #[test]
+    fn filter_popup_digit_on_custom_row_enters_input_mode() {
+        let custom_idx = PeriodFilter::ALL_VARIANTS.len();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = filter_popup(custom_idx, false, "");
+        handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Char('2')));
+        assert!(
+            state.filter_input_mode(),
+            "digit on Custom row enters input"
+        );
+        assert_eq!(
+            state.filter_input().unwrap().text,
+            "2",
+            "the triggering digit is the first character"
+        );
+    }
+
+    #[test]
+    fn filter_popup_digit_on_preset_row_jumps_to_custom_input() {
+        // Starting to type a date from a preset row is unambiguous intent:
+        // the cursor jumps to Custom and the digit lands in the field.
+        let custom_idx = PeriodFilter::ALL_VARIANTS.len();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = filter_popup(0, false, "");
+        handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Char('2')));
+        assert!(state.filter_input_mode(), "digit starts date input");
+        assert_eq!(state.filter_popup_selected(), custom_idx);
+        assert_eq!(state.filter_input().map(|i| i.text.as_str()), Some("2"));
+        // Non-date chars stay dead on preset rows (no accidental jump).
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = filter_popup(0, false, "");
+        handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Char('x')));
+        assert!(!state.filter_input_mode());
+        assert_eq!(state.filter_popup_selected(), 0);
+    }
+
+    #[test]
+    fn filter_input_mode_ignores_non_date_chars() {
+        // Only digits and the date separators reach the field; nav/popup keys
+        // ('x'/'f'/'j') must neither edit the text nor close the popup.
+        let custom_idx = PeriodFilter::ALL_VARIANTS.len();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = filter_popup(custom_idx, true, "2026");
+        for c in ['x', 'f', 'j', ' '] {
+            handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(state.filter_input().unwrap().text, "2026");
+        assert!(
+            state.show_filter_popup(),
+            "popup keys must not leak through"
+        );
+        assert!(state.filter_input_mode());
+    }
+
+    #[test]
+    fn filter_enter_with_valid_year_applies_custom_filter() {
+        // A bare `YYYY` expands to the whole calendar year, closes the popup,
+        // and lands in `period_filter`.
+        let custom_idx = PeriodFilter::ALL_VARIANTS.len();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = filter_popup(custom_idx, true, "2026");
+        handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.active_popup, crate::ActivePopup::None);
+        let expected = PeriodFilter::Custom(
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()), // lint-ok: date-literal
+        );
+        assert_eq!(state.period_filter, expected);
+    }
+
+    #[test]
+    fn filter_enter_with_invalid_input_sets_error_and_stays_open() {
+        let custom_idx = PeriodFilter::ALL_VARIANTS.len();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = filter_popup(custom_idx, true, "2026-99");
+        handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(state.show_filter_popup(), "invalid input keeps the popup");
+        assert!(state.filter_input_error(), "error flag set for the draw");
+        assert_eq!(state.period_filter, PeriodFilter::All, "filter unchanged");
+    }
+
+    #[test]
+    fn filter_esc_in_input_mode_returns_to_preset_list() {
+        // First Esc backs out of the input field (popup stays, draft clears);
+        // second Esc closes the popup — the two-step exit.
+        let custom_idx = PeriodFilter::ALL_VARIANTS.len();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = filter_popup(custom_idx, true, "2026");
+        handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert!(state.show_filter_popup(), "first Esc keeps the popup open");
+        assert!(!state.filter_input_mode());
+        assert_eq!(state.filter_input().unwrap().text, "");
+        handle_filter_popup_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.active_popup, crate::ActivePopup::None);
+    }
+
+    fn state_with_projects(n: usize) -> AppState {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        state.project_list = (0..n).map(|i| (format!("proj{i}"), 100, date)).collect();
+        state
+    }
+
+    #[test]
+    fn project_popup_nav_clamps_to_row_range() {
+        // Rows are "All" plus one per project; j past the last project and
+        // k at "All" must both clamp.
+        let mut state = state_with_projects(2);
+        state.active_popup = crate::ActivePopup::ProjectPopup {
+            selected: 0,
+            scroll: 0,
+        };
+        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(state.project_popup_selected(), 0, "k at top stays at top");
+        for _ in 0..10 {
+            handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+        }
+        assert_eq!(
+            state.project_popup_selected(),
+            2,
+            "j clamps at the last project row"
+        );
+    }
+
+    #[test]
+    fn project_popup_enter_on_all_row_clears_filter() {
+        let mut state = state_with_projects(2);
+        state.project_filter = Some("proj1".to_string());
+        state.active_popup = crate::ActivePopup::ProjectPopup {
+            selected: 0,
+            scroll: 0,
+        };
+        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.project_filter, None, "row 0 = All clears the filter");
+        assert_eq!(state.active_popup, crate::ActivePopup::None);
+    }
+
+    #[test]
+    fn title_edit_cursor_keys_edit_variant_input() {
+        // Cursor/edit keys must act on the input INSIDE the popup variant, so
+        // a stale AppState-level field can't shadow it.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        let mut input = crate::TextInput::default();
+        input.set("abc".to_string());
+        state.active_popup = crate::ActivePopup::TitleEdit {
+            input,
+            path: std::path::PathBuf::from("/tmp/x.jsonl"),
+            return_to: crate::TitleEditReturn::Root,
+        };
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Left));
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(
+            state.title_input().unwrap().text,
+            "ac",
+            "Left+Backspace removes the char before the cursor, not the tail"
+        );
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Home));
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(state.title_input().unwrap().text, "xac");
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::End));
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Right));
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Char('z')));
+        assert_eq!(
+            state.title_input().unwrap().text,
+            "xacz",
+            "Right at end is a no-op; the char appends"
+        );
+    }
+
+    #[test]
+    fn title_edit_esc_closes_without_saving() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        let mut input = crate::TextInput::default();
+        input.set("draft".to_string());
+        state.active_popup = crate::ActivePopup::TitleEdit {
+            input,
+            path: std::path::PathBuf::from("/tmp/x.jsonl"),
+            return_to: crate::TitleEditReturn::Root,
+        };
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.active_popup, crate::ActivePopup::None);
+        assert!(state.toast_message.is_none(), "no save/error toast on Esc");
+    }
+
+    #[test]
+    fn esc_and_q_close_each_popup() {
+        // Every popup that closes to None must do so on both Esc and q.
+        // ProjectDetail (drill-back to DashboardDetail) and TitleEdit
+        // (q is a literal insert) are covered by their own tests.
+        type Handler = fn(&mut AppState, KeyEvent);
+        let cases: Vec<(&str, crate::ActivePopup, Handler)> = vec![
+            (
+                "help",
+                crate::ActivePopup::Help { scroll: 2 },
+                handle_help_key,
+            ),
+            (
+                "insights_detail",
+                crate::ActivePopup::InsightsDetail { scroll: 2 },
+                handle_insights_detail_key,
+            ),
+            (
+                "summary",
+                crate::ActivePopup::Summary { scroll: 2 },
+                handle_summary_popup_key,
+            ),
+            (
+                "filter",
+                filter_popup(0, false, ""),
+                handle_filter_popup_key,
+            ),
+            (
+                "project",
+                crate::ActivePopup::ProjectPopup {
+                    selected: 0,
+                    scroll: 0,
+                },
+                handle_project_popup_key,
+            ),
+            (
+                "dashboard_detail",
+                crate::ActivePopup::DashboardDetail,
+                handle_dashboard_detail_key,
+            ),
+            (
+                "session_detail",
+                crate::ActivePopup::Detail,
+                handle_session_detail_key,
+            ),
+        ];
+        for (name, popup, handler) in &cases {
+            for code in [KeyCode::Esc, KeyCode::Char('q')] {
+                let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+                state.active_popup = popup.clone();
+                handler(&mut state, KeyEvent::from(code));
+                assert_eq!(
+                    state.active_popup,
+                    crate::ActivePopup::None,
+                    "{name} must close on {code:?}"
+                );
+            }
+        }
     }
 }

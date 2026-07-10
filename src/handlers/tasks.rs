@@ -35,7 +35,7 @@ pub(crate) fn spawn_clipboard_write(text: String) -> mpsc::Receiver<Result<(), S
 /// `active_popup = Summary`, and `summary_type` so the popup shows immediately.
 pub(crate) fn start_session_summary(state: &mut AppState, session: SessionInfo, regenerate: bool) {
     state.generating_summary = true;
-    state.active_popup = crate::ActivePopup::Summary;
+    state.active_popup = crate::ActivePopup::Summary { scroll: 0 };
     state.summary_type = Some(SummaryType::Session(Box::new(session.clone())));
     let summary_date = state.daily_groups.get(state.selected_day).map(|g| g.date);
     let (tx, rx) = mpsc::channel();
@@ -54,7 +54,7 @@ pub(crate) fn start_session_summary(state: &mut AppState, session: SessionInfo, 
 /// effects as [`start_session_summary`] but for `SummaryType::Day`.
 pub(crate) fn start_day_summary(state: &mut AppState, group: DailyGroup, regenerate: bool) {
     state.generating_summary = true;
-    state.active_popup = crate::ActivePopup::Summary;
+    state.active_popup = crate::ActivePopup::Summary { scroll: 0 };
     state.summary_type = Some(SummaryType::Day(group.clone()));
     let (tx, rx) = mpsc::channel();
     state.summary_task = Some(rx);
@@ -68,9 +68,9 @@ pub(crate) fn start_day_summary(state: &mut AppState, group: DailyGroup, regener
     });
 }
 
-/// Spawn the JSONL-summary regeneration task triggered by `R` in Daily / Session
-/// detail popups. Records `(day, session)` indices in `state.updating_session`
-/// so the main loop can splice the result back into the right place.
+/// Spawn the JSONL custom-title generation task triggered by `t` in Daily /
+/// Session detail popups. Records `(day, session)` indices in
+/// `state.updating_session` so the main loop can splice the result back in.
 pub(crate) fn start_jsonl_regen(
     state: &mut AppState,
     session: SessionInfo,
@@ -83,7 +83,7 @@ pub(crate) fn start_jsonl_regen(
     state.updating_session = Some((day, sess));
     state.updating_task = Some((rx, file_path, day, sess, actual_idx));
     thread::spawn(move || {
-        let result = summary::regenerate_jsonl_summary(&session);
+        let result = summary::regenerate_jsonl_title(&session);
         let _ = tx.send(result);
     });
 }

@@ -6,3 +6,9 @@
 # The file itself is the leak, so it is NEVER committed. See
 # `.lint-forbidden-terms.example` for the format.
 /.lint-forbidden-terms
+
+# proptest writes a regression seed here on every failure. Seeds are RNG
+# state, not input bytes — they stop reproducing once a generator changes —
+# so committing them buys little and risks sweeping a stale seed in with
+# `git add -A`.
+/proptest-regressions

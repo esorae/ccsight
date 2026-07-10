@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
 # ccsight pre-push hook.
 #
-# Re-runs the CI-blocking gate (cargo fmt --check, cargo test, cargo clippy,
-# project lint) once before a push. pre-commit runs the same checks per
-# `git commit`, but `git cherry-pick` does not fire it (nor does a commit
-# made before the hooks were armed), so this is the last line that catches
-# those before code leaves the machine. The advisory tools (shellcheck,
-# cargo-audit) stay in pre-commit + CI.
+# The last gate that runs on a machine with the developer's real `~/.claude`
+# and their private denylist, so it carries everything the per-commit gate is
+# too hot for plus the checks CI structurally cannot do. It also re-runs the
+# per-commit checks, because `git cherry-pick` does not fire pre-commit (nor
+# does a commit made before the hooks were armed).
 #
 # To install: `bash scripts/install-hooks.sh` (configures `core.hooksPath`).
 
 set -e
+
+# GUI git clients invoke hooks from a non-login shell, so the PATH that has
+# `~/.cargo/bin` is absent and every `cargo` step would fail as if the check
+# itself had failed. Restore it, then verify — a missing toolchain is a
+# different problem from a dirty tree and must not be reported as one.
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "[pre-push] FAILED: cargo not on PATH. Install Rust or add ~/.cargo/bin to the PATH your git client uses."
+    exit 1
+fi
 
 # Locate repo root regardless of where git invokes the hook from.
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -22,8 +34,11 @@ if ! cargo fmt -- --check 2>&1; then
     exit 1
 fi
 
-echo "[pre-push] cargo test ..."
-if ! cargo test --quiet 2>&1; then
+# A push is infrequent enough to afford a deeper property search than the
+# per-commit budget. `PROPTEST_CASES` overrides each block's `with_cases`,
+# so this is the same suite explored harder — not a different one.
+echo "[pre-push] cargo test (PROPTEST_CASES=1024) ..."
+if ! PROPTEST_CASES=1024 cargo test --quiet 2>&1; then
     echo "[pre-push] FAILED: cargo test reported failures."
     exit 1
 fi
@@ -34,15 +49,49 @@ if ! cargo clippy --quiet -- -D warnings 2>&1; then
     exit 1
 fi
 
+# `cargo clippy -- -D warnings` skips `#[cfg(test)]` bodies, so dead code and
+# unused bindings accumulate in the large `mod tests` blocks unseen. No other
+# gate runs this variant. Debug profile on purpose: the lints are the same
+# either way, and `--release` would rebuild the whole tree in a second profile.
+echo "[pre-push] cargo clippy --tests -- -D warnings ..."
+if ! cargo clippy --quiet --tests -- -D warnings 2>&1; then
+    echo "[pre-push] FAILED: clippy reported warnings/errors in test code."
+    exit 1
+fi
+
 echo "[pre-push] bash scripts/lint.sh ..."
 if ! bash scripts/lint.sh; then
     echo "[pre-push] FAILED: project lint blocked the push."
     exit 1
 fi
 
-# Push is infrequent, so spend the time the per-commit gate can't: run the
-# EXHAUSTIVE real-data aggregation-agreement check over ALL of `~/.claude`
-# (the commit gate only samples it). No-ops in environments without local
+if command -v shellcheck >/dev/null 2>&1; then
+    echo "[pre-push] shellcheck --severity=warning scripts/*.sh scripts/hooks/* ..."
+    if ! shellcheck --severity=warning scripts/*.sh scripts/hooks/* 2>&1; then
+        echo "[pre-push] FAILED: shellcheck reported warning-level issues."
+        exit 1
+    fi
+else
+    echo "[pre-push] shellcheck not installed — skipped."
+fi
+
+if command -v cargo-audit >/dev/null 2>&1 || cargo audit --version >/dev/null 2>&1; then
+    echo "[pre-push] cargo audit ..."
+    if ! cargo audit --quiet 2>&1; then
+        echo "[pre-push] FAILED: cargo audit reported advisories."
+        exit 1
+    fi
+else
+    echo "[pre-push] cargo-audit not installed — skipped."
+fi
+
+# The TUI smoke test is deliberately NOT here: it needs a release binary, so
+# any source edit makes it rebuild the tree in a second profile — minutes on
+# every push. CI owns that one; run `bash scripts/smoke-ci.sh` by hand after
+# touching rendering or navigation.
+
+# The one check CI cannot run: the EXHAUSTIVE aggregation-agreement pass over
+# ALL of `~/.claude` (the commit gate only samples it). No-ops without local
 # Claude data. Slow (minutes on a large history) by design.
 echo "[pre-push] cargo test -- --ignored (full real-data agreement) ..."
 if ! cargo test --quiet test_stats_and_grouper_agree_on_token_totals -- --ignored 2>&1; then

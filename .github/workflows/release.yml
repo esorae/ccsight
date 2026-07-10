@@ -16,8 +16,15 @@ jobs:
       checks: write
     uses: ./.github/workflows/verify.yml
 
+  # Blocking, not advisory: the large-budget property run has to fail before
+  # the release assets and `cargo publish` exist, not alongside them.
+  deep-verify:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-verify.yml
+
   build:
-    needs: verify
+    needs: [verify, deep-verify]
     strategy:
       matrix:
         include:

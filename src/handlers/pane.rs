@@ -3,19 +3,65 @@
 //! conversation in a pane, plus text-selection extraction shared by the mouse
 //! Up handler and the Session Detail popup.
 
-use std::sync::mpsc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use crate::aggregator::DailyGroup;
 use crate::state::{ConvListMode, ConversationPane, MAX_PANES};
 use crate::{AppState, ConversationMessage, ui};
 
+type CachedMessages = Arc<Vec<ConversationMessage>>;
+
+/// Parsed-conversation cache keyed by (path, mtime): reopening the same
+/// unchanged session skips the full JSONL re-parse. The buffer is shared
+/// by `Arc`, so a cache hit is a refcount bump, not a deep copy.
+/// Module-global (like `CostCalculator::global()`) so no call site has to
+/// thread it through.
+static CONV_CACHE: OnceLock<Mutex<Vec<(PathBuf, u64, CachedMessages)>>> = OnceLock::new();
+const CONV_CACHE_CAP: usize = 8;
+
+fn conv_cache() -> &'static Mutex<Vec<(PathBuf, u64, CachedMessages)>> {
+    CONV_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn conv_cache_get(path: &std::path::Path, mtime: u64) -> Option<CachedMessages> {
+    let cache = conv_cache().lock().ok()?;
+    cache
+        .iter()
+        .find(|(p, m, _)| p == path && *m == mtime)
+        .map(|(_, _, msgs)| Arc::clone(msgs))
+}
+
+fn conv_cache_put(path: PathBuf, mtime: u64, messages: CachedMessages) {
+    let Ok(mut cache) = conv_cache().lock() else {
+        return;
+    };
+    cache.retain(|(p, _, _)| p != &path);
+    cache.push((path, mtime, messages));
+    if cache.len() > CONV_CACHE_CAP {
+        cache.remove(0);
+    }
+}
+
 pub(crate) fn spawn_load_conversation(
     file_path: &std::path::Path,
-) -> mpsc::Receiver<Vec<ConversationMessage>> {
+) -> mpsc::Receiver<CachedMessages> {
     let fp = file_path.to_path_buf();
     let (tx, rx) = mpsc::channel();
+    // mtime captured BEFORE the parse: a file that grows mid-parse lands in
+    // the cache under the old stamp, so the next open re-parses correctly.
+    let mtime = crate::infrastructure::get_file_modified_secs(&fp);
+    if mtime != 0
+        && let Some(hit) = conv_cache_get(&fp, mtime)
+    {
+        let _ = tx.send(hit);
+        return rx;
+    }
     std::thread::spawn(move || {
-        let messages = ui::load_conversation(&fp).unwrap_or_default();
+        let messages = Arc::new(ui::load_conversation(&fp).unwrap_or_default());
+        if mtime != 0 {
+            conv_cache_put(fp, mtime, Arc::clone(&messages));
+        }
         let _ = tx.send(messages);
     });
     rx
@@ -32,21 +78,28 @@ pub(crate) fn current_selected_session(state: &AppState) -> Option<crate::aggreg
         .cloned()
 }
 
-/// Same as [`current_selected_session`] but also returns the **raw index** into
-/// `group.sessions` (subagent-inclusive). Needed by `R` (JSONL regen) so the
-/// task helper can splice the result back into the unfiltered slot.
-pub(crate) fn current_selected_session_with_index(
+/// Locate a session by its on-disk path, returning `(day, sess, raw_idx)` where
+/// `sess` is the user-session (subagent-filtered) index and `raw_idx` is the
+/// subagent-inclusive slot — the shape `start_jsonl_regen` needs to splice a
+/// regenerated title back. Lets the Summary popup's resume-title write find
+/// its target without relying on the current selection still pointing at it.
+pub(crate) fn find_session_indices_by_path(
     state: &AppState,
-) -> Option<(usize, crate::aggregator::SessionInfo)> {
-    let group = state.daily_groups.get(state.selected_day)?;
-    let raw_idx = group
-        .sessions
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| !s.is_subagent)
-        .nth(state.selected_session)
-        .map(|(i, _)| i)?;
-    Some((raw_idx, group.sessions[raw_idx].clone()))
+    path: &std::path::Path,
+) -> Option<(usize, usize, usize)> {
+    for (day, group) in state.daily_groups.iter().enumerate() {
+        let mut sess = 0;
+        for (raw_idx, s) in group.sessions.iter().enumerate() {
+            if s.is_subagent {
+                continue;
+            }
+            if s.file_path == path {
+                return Some((day, sess, raw_idx));
+            }
+            sess += 1;
+        }
+    }
+    None
 }
 
 pub(crate) fn get_conv_session_file(state: &AppState, idx: usize) -> Option<std::path::PathBuf> {
@@ -142,6 +195,21 @@ pub(crate) fn toggle_pin(state: &mut AppState, path: &std::path::Path) {
     state.needs_draw = true;
 }
 
+/// Resolve a Live session's JSONL path to its indexed `SessionInfo`. Looks in
+/// `original_daily_groups` because Live sessions can sit outside the active
+/// filter. `None` means the aggregator hasn't picked the file up yet.
+pub(crate) fn find_indexed_session_by_path(
+    state: &AppState,
+    jsonl: &std::path::Path,
+) -> Option<crate::aggregator::SessionInfo> {
+    state.original_daily_groups.iter().find_map(|g| {
+        g.sessions
+            .iter()
+            .find(|s| s.file_path == jsonl && !s.is_subagent)
+            .cloned()
+    })
+}
+
 /// Open the Session Detail popup for the selected Live session. Live sessions
 /// can sit outside the active filter, so it looks up in `original_daily_groups`
 /// and stashes via `session_detail_override`. Returns false (and toasts) when
@@ -167,13 +235,7 @@ pub(crate) fn open_live_session_detail(state: &mut AppState) -> bool {
     let Some((Some(jsonl), pid, status, started)) = live_info else {
         return false;
     };
-    let found = state.original_daily_groups.iter().find_map(|g| {
-        g.sessions
-            .iter()
-            .find(|s| s.file_path == jsonl && !s.is_subagent)
-            .cloned()
-    });
-    if let Some(session) = found {
+    if let Some(session) = find_indexed_session_by_path(state, &jsonl) {
         state.session_detail_override = Some(session);
         state.session_detail_live_extra = Some((pid, status, started));
         state.active_popup = crate::ActivePopup::Detail;
@@ -195,6 +257,7 @@ pub(crate) fn extract_selected_text_from_buffer(
     conv_area: Option<ratatui::layout::Rect>,
     wrap_flags: Option<&[bool]>,
     conv_scroll: usize,
+    body_indent: usize,
 ) -> String {
     let (sc, sr, ec, er) = *sel;
     let buf_area = buffer.area;
@@ -279,25 +342,35 @@ pub(crate) fn extract_selected_text_from_buffer(
                 flags.get(flag_idx).copied().unwrap_or(false)
             })
             .collect();
-        return join_conversation_lines(&lines, &continuation_flags);
+        return join_conversation_lines(&lines, &continuation_flags, body_indent);
     }
 
     lines.join("\n")
 }
 
-pub(crate) fn join_conversation_lines(lines: &[String], wrap_continuation: &[bool]) -> String {
+pub(crate) fn join_conversation_lines(
+    lines: &[String],
+    wrap_continuation: &[bool],
+    body_indent: usize,
+) -> String {
     if lines.is_empty() {
         return String::new();
     }
 
     let strip_prefix = |s: &str| -> String {
-        if let Some(stripped) = s.strip_prefix("▶ ") {
-            stripped.to_string()
-        } else if let Some(stripped) = s.strip_prefix("  ") {
-            stripped.to_string()
-        } else {
-            s.to_string()
-        }
+        // Drop the draw-layer selection marker first, then up to `body_indent`
+        // of the compact body hang-indent — but only the indent itself, so the
+        // content's own leading whitespace (e.g. code indentation) survives.
+        let s = s
+            .strip_prefix("▶ ")
+            .or_else(|| s.strip_prefix("  "))
+            .unwrap_or(s);
+        let trim = s
+            .chars()
+            .take(body_indent)
+            .take_while(|c| *c == ' ')
+            .count();
+        s[trim..].to_string()
     };
 
     let mut result = String::new();
@@ -325,4 +398,86 @@ pub(crate) fn join_conversation_lines(lines: &[String], wrap_continuation: &[boo
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use chrono::NaiveDate;
+
+    use std::sync::Arc;
+
+    use super::{CONV_CACHE_CAP, conv_cache_get, conv_cache_put, find_session_indices_by_path};
+    use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+
+    #[test]
+    fn should_return_subagent_filtered_and_raw_indices() {
+        // Day 0: [user A, subagent, user B]. user B is user-index 1 but raw slot 2.
+        let mut sub = make_session("p", None, None);
+        sub.is_subagent = true;
+        sub.file_path = PathBuf::from("/tmp/sub.jsonl");
+        let a = {
+            let mut s = make_session("p", None, Some("a"));
+            s.file_path = PathBuf::from("/tmp/a.jsonl");
+            s
+        };
+        let b = {
+            let mut s = make_session("p", None, Some("b"));
+            s.file_path = PathBuf::from("/tmp/b.jsonl");
+            s
+        };
+        let day0 = make_daily_group(
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
+            vec![a, sub, b],
+        );
+        let c = {
+            let mut s = make_session("p", None, Some("c"));
+            s.file_path = PathBuf::from("/tmp/c.jsonl");
+            s
+        };
+        let day1 = make_daily_group(NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(), vec![c]); // lint-ok: date-literal
+        let state = make_test_app_state(vec![day0, day1]);
+
+        assert_eq!(
+            find_session_indices_by_path(&state, &PathBuf::from("/tmp/b.jsonl")),
+            Some((0, 1, 2))
+        );
+        assert_eq!(
+            find_session_indices_by_path(&state, &PathBuf::from("/tmp/c.jsonl")),
+            Some((1, 0, 0))
+        );
+        // Subagent sessions are skipped entirely — never a valid title target.
+        assert_eq!(
+            find_session_indices_by_path(&state, &PathBuf::from("/tmp/sub.jsonl")),
+            None
+        );
+        assert_eq!(
+            find_session_indices_by_path(&state, &PathBuf::from("/tmp/missing.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn conv_cache_hits_same_mtime_misses_on_change_and_evicts_at_cap() {
+        // Unique paths so the process-global cache can't collide with other
+        // tests that load conversations concurrently.
+        let base = std::env::temp_dir().join(format!("ccsight-convcache-{}", std::process::id()));
+        let p = |i: usize| base.join(format!("{i}.jsonl"));
+
+        conv_cache_put(p(0), 1, Arc::new(Vec::new()));
+        assert!(
+            conv_cache_get(&p(0), 1).is_some(),
+            "same (path, mtime) hits"
+        );
+        assert!(conv_cache_get(&p(0), 2).is_none(), "mtime change misses");
+
+        for i in 1..=CONV_CACHE_CAP {
+            conv_cache_put(p(i), 1, Arc::new(Vec::new()));
+        }
+        assert!(
+            conv_cache_get(&p(0), 1).is_none(),
+            "oldest entry falls out once the cap is exceeded"
+        );
+    }
 }

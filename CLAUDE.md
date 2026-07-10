@@ -13,8 +13,11 @@ cargo clippy -- -D warnings  # Lint (warnings are errors)
 bash scripts/lint.sh         # Project lint (UI patterns, safety)
 ```
 
-The `scripts/hooks/` pre-commit (per commit) and pre-push (before push) hooks
-run `cargo fmt --check` + test + clippy + lint; CI runs the same gate.
+`scripts/hooks/` pre-commit runs `cargo fmt --check` + test + clippy + lint +
+shellcheck + audit; CI runs that plus a release build, the TUI smoke test, and
+a Linux runner. pre-push re-runs the per-commit set and adds what only a
+developer machine can do: a deeper property search, `clippy --tests`, and the
+exhaustive real-data agreement pass.
 `build.rs` arms them on first build via `core.hooksPath` (opt out:
 `CCSIGHT_NO_HOOK_INSTALL=1`; manual: `install-hooks.sh`). pre-push exists
 because `git cherry-pick` skips pre-commit.
@@ -23,11 +26,11 @@ because `git cherry-pick` skips pre-commit.
 
 The TUI can't launch from a non-interactive shell — use tmux at **140x45** (the
 size popup-width math assumes; smaller terminals truncate rightmost columns).
-Wait `sleep 5` after launch for data + tantivy index, `sleep 1` between keys.
+Wait `sleep 5` after launch for data + tantivy index, `sleep 0.3`–`1` between keys.
 A reference scenario covering Tools popup, search → conv pane, filter / project
 popups, and Insights detail lives in `scripts/smoke.sh`. Watch for: rightmost
 column truncation, popup borders missing `border_style`, `▼/▶` arrow inversion,
-"Searching..." stuck after Enter (index not committed — see lint #18).
+"Searching..." stuck after Enter (index not committed — see lint #26).
 
 ## Monkey test
 
@@ -75,6 +78,26 @@ isn't obvious from the filename.
 | `shell.rs` | `posix_shell_quote` is the only sanctioned interpolation for `cd ... && claude -r ...`. Lint #28 enforces. |
 | `state.rs` | Adding a field is compiler-checked at every exhaustive `AppState { ... }` literal (`new_initial` + `test_helpers::make_test_app_state`). |
 
+### Library / binary split
+
+`src/lib.rs` (crate `ccsight`) holds the byte seams plus their bounded
+dependency closure — `parser`, `pins`, and the leaf
+`infrastructure::{atomic, state_dir}` / `domain` they need. The TUI, MCP,
+aggregator, and run loops stay in the binary. **Nothing outside the binary
+consumes the lib**, so the split earns its keep only if a second consumer
+appears — but `ccsight` publishes to crates.io with those modules `pub`, so
+collapsing it is a semver break for any downstream library user, not a free
+simplification.
+**Invariant while it stands:** the binary re-exports the lib modules so
+`crate::…` paths resolve identically in both crates — moving a module into the
+lib means adding the matching `pub(crate) use ccsight::…` re-export (and
+lib-side `pub` for anything the binary calls). The seams are `pub fn(&[u8])`:
+`parser::JsonlParser::parse_entries`,
+`pins::Pins::from_bytes`. `session_state.rs` (binary) holds the pure
+session-state detection (JSONL tail read + classification) shared by the MCP
+`live_sessions` tool and `--wait`; the one-shot `--wait` loop lives in
+`wait_run.rs`.
+
 ## Rules
 
 **Lint-enforced** (single source of truth: `scripts/lint.sh`):
@@ -112,7 +135,6 @@ govern, so they're seen at the moment of violation:
 
 **Compiler-enforced** (no rule needed):
 - AppState init parity — every `AppState { ... }` literal lists every field.
-- Real-world identifier shapes — fully covered by lint #16 / #17 / #21.
 
 **Real data never becomes a literal**: lint #17's denylist is *reactive* — it
 only matches terms already listed, so a fresh project / directory / glob /
@@ -124,8 +146,17 @@ identifier to a generic placeholder *before* it lands in committed source:
 `config/` not a real dir, `multi-word-dir` not a real repo, `~/proj` not a
 real path, `**/*.{a,b}` not a real glob. Then add the term to
 `.lint-forbidden-terms` (git-ignored) so the reactive net also catches a
-relapse — and note that this doc, README, and source are all scanned, so the
-denylisted term itself must never appear here either.
+relapse — and note that this doc, README, source, scripts/ and examples/ are all scanned, so the
+denylisted term itself must never appear here either. Because that file is
+git-ignored, **#17 exists only on the machine that has it** — CI evaluates zero
+terms. Credential shapes are the one part of this that is enforced everywhere:
+lint #48 pattern-matches provider token formats over every tracked file.
+
+`docs/assets/*.png` is the one leak surface no lint reaches — a screenshot is
+pixels. Regenerate only via `scripts/demo-assets.sh`, which points `HOME` at a
+synthetic fixture built by `scripts/demo_data.py`; capturing against the real
+`~/.claude` puts project names into a public image. Never press `s` (AI
+summary) during a capture — it shells out and pulls real paths into the frame.
 
 **Suppressing warnings (`#[allow(...)]`)**: never apply on a guess. Before
 adding `#[allow(dead_code)]` / `#[allow(clippy::...)]` / `#[allow(unused)]`,
@@ -157,8 +188,8 @@ Comments state invariants verifiable against the code in front of the
 reader. No history, incident numbers, captured values (%, $, K/M, dates,
 versions), `e.g.`-with-real-values, or "earlier/previously/was renamed"
 phrasings — those belong in the commit message. Lint #38 catches the
-common past-state words. `mod tests` docstrings are exempt (fixture
-arithmetic is part of the assertion).
+common past-state words; lint #23 catches captured numbers, with `mod
+tests` blocks exempt there (fixture arithmetic is part of the assertion).
 
 - ❌ `// regression in vA.B.C where two surfaces disagreed on the count.`
 - ❌ `// e.g. "94%" once crushed the bars to "0–1%".`
@@ -191,17 +222,49 @@ intensities so the per-commit gate stays fast without losing real-data
 coverage: **commit** — `stats_and_grouper_agree_on_sampled_real_files`
 samples a few real `~/.claude` files (oldest/newest + random middle), fast,
 no-ops on CI; **push** — the pre-push hook runs the `#[ignore]`d
-`test_stats_and_grouper_agree_on_token_totals` over ALL real data (slow,
-exhaustive); **CI** — `stats_and_grouper_agree_on_fixture` (deterministic
+`test_stats_and_grouper_agree_on_token_totals`: exact equality over every
+real file not written recently, identity-checked after both passes so a file
+that moved mid-run makes the result inconclusive instead of a false pass or a
+tolerance-hidden regression; **CI** — `stats_and_grouper_agree_on_fixture` (deterministic
 2-file fixture, also pins absolute values), since CI has no real data. No
 real `~/.claude` content is ever committed. CI smoke (`scripts/smoke-ci.sh`)
 drives the TUI through every tab + a popup under tmux with poll-until-ready,
 not just a first-frame capture.
 
+### Byte-seam hardening (two drivers)
+
+`parse_entries` and `Pins::from_bytes` take bytes straight off disk — a JSONL
+read while Claude Code is mid-write, a hand-edited `pins.json`. Both are
+guarded two ways, next to the seam:
+
+- **Property tests** (`proptest!`) carry the invariants a non-panic oracle
+  can't express — "a read failure yields `None`, never an empty pin set";
+  "an accepted entry re-parses". They run on the per-commit gate, where a
+  seam regression has to surface; `release-verify.yml` re-runs the suite with
+  a large `PROPTEST_CASES` for depth. Reach for `#[ignore]` only when a test
+  is genuinely slow or needs an environment CI lacks — measure before
+  assuming, and say which it is in the attribute's reason string.
+- **Seam regression tests** (`SEAM_INPUTS` in each seam's `mod tests`): a
+  fixed table of adversarial blobs, each row carrying its expected outcome —
+  a table asserting only "did not panic" passes for a seam that silently
+  drops everything. Pick blobs from the shapes that seam's own input takes.
+  Inline `&[u8]` literals rather than files on disk so a review diff shows
+  the bytes; a corpus directory would render as "Binary files differ".
+
+Adding a seam invariant = add it to the proptest AND the `SEAM_INPUTS` table.
+Coverage-guided fuzzing (cargo-fuzz) is deliberately absent: a seam's input
+arrives on the same machine, from Claude Code or the user's own editor —
+never over a network, never from a third party — so the exploration it buys
+is narrow next to its cost, and a promoted crash carries whatever bytes
+reproduced it (real paths included) inside a file `git diff` renders as
+"Binary files differ". Transcripts do embed third-party payloads (fetched
+pages, MCP responses), so treat their *content* as untrusted even though
+their *provenance* is local.
+
 **`cargo clippy -- -D warnings` (CI gate) does NOT check `#[cfg(test)]` code.**
-Unused vars and dead_code in test blocks slip through. After touching test
-files run `cargo clippy --release --tests -- -D warnings` locally before
-committing.
+Unused vars and dead_code in test blocks slip through it. pre-push runs
+`cargo clippy --tests -- -D warnings`, so a push catches them — run it by hand
+first if you want the failure before the commit is written.
 
 ## Verifying logic changes
 
@@ -222,12 +285,13 @@ fix worked.
 ## Key Patterns
 
 - **Search state**: `[Normal] → / → [Search] → Enter → [Preview] → Esc → [Search] → Esc → [Normal]`. Preview saves tab/position via `search_saved_state`.
-- **Pane search**: VS Code style — Enter/Shift+Enter = next/prev, Esc closes the bar (n/N still work).
+- **Pane search**: VS Code style — matches live on the logical messages (collapsed compact messages hit; the current match peek-expands its message), Enter/Shift+Enter = next/prev occurrence, Esc ends the search outright, `/` reopens with the last query preselected.
 - **Async**: Background threads for data load, summary, index build via `mpsc::channel`. UI must show "Searching..." (not "No results") while a loading flag is set. Every `Receiver` must be polled with `match` covering `Disconnected` — `let Ok(...) = rx.try_recv()` silently swallows worker-thread panics and freezes the task forever (lint #26).
-- **MCP tools** (`mcp.rs`): `stats` (+ per-server `mcp_servers` snapshot), `sessions`, `search`. All share `date_from` / `date_to` (`YYYY-MM-DD`, local timezone).
+- **MCP tools** (`mcp.rs`): `stats` (+ per-server `mcp_servers` snapshot), `sessions`, `search`, `live_sessions`. The first three share `date_from` / `date_to` (`YYYY-MM-DD`, local timezone); `live_sessions` reports the current poll only.
 - **Costs include subagents**: Overview, Costs panel, and `--daily` CLI all sum over `group.sessions` so totals match.
 - **stderr is forbidden** — writes corrupt the TUI rendering. Lint #20 enforces.
 - **Atomic file writes**: every `tmp + rename` write under `~/.ccsight/` must `sync_all` before the rename, otherwise the data isn't durable across power loss. Lint #29 enforces.
 - **Shell command escaping**: any string composed for the user to paste into a shell (`cd ... && claude -r ...`) must route both interpolations through `crate::shell::posix_shell_quote`. The cwd / session_id come from on-disk JSON. Lint #28 enforces.
+- **Resume dir is verified, never guessed**: `claude -r <id>` only finds a session when the cwd's official slug (non-alphanumeric → `-`) equals the transcript's storage dir name. Every resume surface routes through `AppState::resume_dir` (witnesses: transcript cwds via `verified_cwd`, `~/.claude.json` project keys, live pid cwds); no witness → say so honestly. Transcript cwds and slug reversals are NOT resume targets — the launch dir can differ from the storage dir after a relocation, and the slug is not reversible.
 - **Cursor vs viewport**: scrollable lists with a selection (Daily, Live, Projects detail, MCP server detail) decouple the cursor from the viewport — viewport adjusts only when the cursor leaves the visible window (Vim's `scrolloff` pattern). Scroll-only views collapse the two into one value. New panels with a selection cursor must follow the decoupled pattern.
 - **Render-stable sort**: any `Vec` built from a `HashMap` and sorted on a single key produces non-deterministic order for tied values (HashMap iteration is randomized per instance). Always add a tiebreaker (typically alphabetical on name) via `.then_with(|| a.0.cmp(b.0))` so rows don't shuffle between frames. Lint #30 enforces.

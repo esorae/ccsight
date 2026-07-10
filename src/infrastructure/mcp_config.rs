@@ -282,6 +282,31 @@ mod tests {
     }
 
     #[test]
+    fn is_underutilized_boundary_is_inclusive_at_threshold() {
+        // The comparison is `>=`, so exactly `threshold_days` counts as
+        // stale (not just days strictly greater than it).
+        let now = Utc::now();
+        let just_under = McpServerStatus {
+            name: "foo".to_string(),
+            configured: true,
+            last_used: Some(now - Duration::days(29)),
+            total_calls: 10,
+        };
+        assert!(!just_under.is_underutilized(now, 30), "29d < 30d threshold");
+
+        let at_threshold = McpServerStatus {
+            name: "foo".to_string(),
+            configured: true,
+            last_used: Some(now - Duration::days(30)),
+            total_calls: 10,
+        };
+        assert!(
+            at_threshold.is_underutilized(now, 30),
+            "30d hits the >= boundary"
+        );
+    }
+
+    #[test]
     fn test_compute_mcp_status_stable_sort_on_equal_calls() {
         // Regression: when multiple servers have the same total_calls, their ordering
         // must be deterministic (alphabetical by name) so the UI doesn't shuffle them
@@ -297,6 +322,7 @@ mod tests {
             let mut tu = HashMap::new();
             tu.insert(format!("mcp__{name}__action"), 5);
             SessionInfo {
+                verified_cwd: None,
                 file_path: PathBuf::from(format!("/tmp/{name}.jsonl")),
                 project_name: "p".to_string(),
                 git_branch: None,

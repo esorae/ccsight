@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // Bump on changes to: parser output, aggregator field semantics
 // (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
-const CACHE_VERSION: u32 = 34;
+const CACHE_VERSION: u32 = 36;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {
@@ -79,6 +79,11 @@ pub struct CachedFileStats {
     pub model_tokens: HashMap<String, CachedTokenStats>,
     pub session_date: Option<NaiveDate>,
     pub project_name: Option<String>,
+    /// First cwd in the file whose official slug matches the parent project
+    /// dir — the verified `claude -r` cd target. `None` = no witness in this
+    /// file (resume falls back to dir-level witnesses, never a guess).
+    #[serde(default)]
+    pub verified_cwd: Option<String>,
     pub session_id: Option<String>,
     pub git_branch: Option<String>,
     pub first_timestamp: Option<DateTime<Utc>>,
@@ -122,6 +127,16 @@ pub struct CachedFileStats {
     pub language_usage: HashMap<String, usize>,
     #[serde(default)]
     pub extension_usage: HashMap<String, usize>,
+}
+
+impl CachedFileStats {
+    /// Same "work tokens" concept as `aggregator::stats::TokenStats` —
+    /// input + output only, excluding cache. Named the same across both
+    /// types so the formula has one name to grep for instead of inline
+    /// arithmetic repeated per call site.
+    pub fn work_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
 }
 
 impl Default for CacheData {
@@ -270,6 +285,7 @@ mod tests {
             cache_read_tokens: 10,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
 
         assert_eq!(ts.input_tokens, 100);
@@ -328,6 +344,7 @@ mod tests {
                     map.insert(
                         key.clone(),
                         CachedFileStats {
+                            verified_cwd: None,
                             modified_secs: 1234,
                             file_size: 100,
                             entry_count: 10,

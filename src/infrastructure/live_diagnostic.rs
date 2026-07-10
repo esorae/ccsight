@@ -19,6 +19,10 @@ use std::time::SystemTime;
 
 use super::live_sessions::LiveSession;
 
+/// Identity fields mirror `live_snapshots::LiveSnapshotEntry` (this struct
+/// adds only `last_seen`) — not merged because each is serialized to a
+/// different on-disk shape read by existing files; add a new identity
+/// field to BOTH structs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     pub session_id: String,

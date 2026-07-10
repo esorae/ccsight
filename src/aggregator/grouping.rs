@@ -8,6 +8,7 @@ use crate::aggregator::{StatsAggregator, TokenStats};
 use crate::domain::EntryType;
 use crate::infrastructure::Cache;
 use crate::parser::JsonlParser;
+use crate::text::{clean_user_message_preview, looks_like_system_injection};
 
 pub type ModelTokens = TokenStats;
 
@@ -15,6 +16,9 @@ pub type ModelTokens = TokenStats;
 pub struct SessionInfo {
     pub file_path: PathBuf,
     pub project_name: String,
+    /// First cwd whose official slug matches the storage dir — the verified
+    /// `claude -r` cd target for this transcript (see `extract_verified_cwd`).
+    pub verified_cwd: Option<String>,
     pub git_branch: Option<String>,
     pub session_first_timestamp: DateTime<Utc>,
     pub day_first_timestamp: DateTime<Utc>,
@@ -58,6 +62,17 @@ impl SessionInfo {
         self.day_input_tokens + self.day_output_tokens
     }
 
+    /// The single representative line for a session, highest priority first:
+    /// the user-set custom title, then Anthropic's ai-title, then the legacy
+    /// summary. Single source of truth for title precedence — callers add only
+    /// their own further fallbacks (session name, first user message).
+    pub fn display_title(&self) -> Option<&str> {
+        self.custom_title
+            .as_deref()
+            .or(self.ai_title.as_deref())
+            .or(self.summary.as_deref())
+    }
+
     /// True when any of this day's models lacks a pricing entry — that
     /// model's share of [`Self::cost`] is silently 0, so displays must mark
     /// the figure ("$?" / "*") instead of presenting it as a real total.
@@ -95,6 +110,19 @@ impl DailyGroup {
     pub fn user_sessions(&self) -> impl Iterator<Item = &SessionInfo> + '_ {
         self.sessions.iter().filter(|s| !s.is_subagent)
     }
+}
+
+/// Count distinct non-subagent sessions across day groups, deduped by
+/// `file_path`. `daily_groups` carries one entry per (session, active day), so a
+/// plain sum over `user_sessions()` is session-days — it double-counts a session
+/// resumed across multiple days. This collapses those back to true session count.
+pub fn distinct_user_session_count(groups: &[DailyGroup]) -> usize {
+    groups
+        .iter()
+        .flat_map(DailyGroup::user_sessions)
+        .map(|s| &s.file_path)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 pub struct DailyGrouper;
@@ -217,6 +245,7 @@ impl DailyGrouper {
                     SessionInfo {
                         file_path: file.to_path_buf(),
                         project_name: project_name.clone(),
+                        verified_cwd: cached.verified_cwd.clone(),
                         git_branch: cached.git_branch.clone(),
                         session_first_timestamp: session_first,
                         day_first_timestamp: ds.first_timestamp.unwrap_or(session_first),
@@ -281,6 +310,7 @@ impl DailyGrouper {
             Self::extract_project_name_from_entries(&entries),
         )
         .unwrap_or_else(|| "unknown".to_string());
+        let verified_cwd = crate::aggregator::extract_verified_cwd(&entries, file);
 
         // Branch can change mid-session (`git checkout`, worktree switch),
         // so use the LATEST entry's value to match the user's mental model
@@ -573,6 +603,7 @@ impl DailyGrouper {
             let last_ts = daily_stats.values().filter_map(|d| d.last_timestamp).max();
             let session_duration_mins = last_ts.map(|l| (l - session_first).num_minutes());
             let full_entry = crate::infrastructure::CachedFileStats {
+                verified_cwd: verified_cwd.clone(),
                 modified_secs: std::fs::metadata(file)
                     .and_then(|m| m.modified())
                     .ok()
@@ -630,6 +661,7 @@ impl DailyGrouper {
                     SessionInfo {
                         file_path: file.to_path_buf(),
                         project_name: project_name.clone(),
+                        verified_cwd: verified_cwd.clone(),
                         git_branch: git_branch.clone(),
                         session_first_timestamp: session_first,
                         day_first_timestamp: stats.first_timestamp.unwrap_or(session_first),
@@ -716,74 +748,296 @@ fn extract_last_user_message(entries: &[crate::domain::LogEntry]) -> Option<Stri
         Some(cleaned)
     })
 }
-
-/// Heuristic: after the known-tag strip pass, any remaining `<kebab-case>`
-/// marker (one or more `-` inside ASCII alphanumeric) is treated as an
-/// unstripped system-injected wrapper. Single-word tags (`<foo>`) and
-/// arrow-style prose (`x < 3` / `if a > b`) are NOT matched so genuine
-/// user content with `<`/`>` is preserved.
-fn looks_like_system_injection(s: &str) -> bool {
-    let mut rest = s;
-    while let Some(start) = rest.find('<') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('>') else {
-            return false;
-        };
-        let inside = &rest[..end];
-        let name = inside.trim_start_matches('/');
-        let is_kebab_tag = name.contains('-')
-            && !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if is_kebab_tag {
-            return true;
-        }
-        rest = &rest[end + 1..];
-    }
-    false
+/// Lifetime aggregate of one session, summed across every day it appears. The
+/// canonical per-session total shared by the Live tab, the session detail popup,
+/// and the MCP `live_sessions` tool — consumers must NOT re-sum `day_*` slices
+/// themselves. `cost` is a lower bound when `unpriced` is set (a contributing
+/// day used a model without a price).
+#[derive(Default, Clone)]
+pub(crate) struct SessionCumulative {
+    pub(crate) days: usize,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_creation: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) cost: f64,
+    pub(crate) unpriced: bool,
+    pub(crate) user_msgs: u64,
+    pub(crate) assistant_msgs: u64,
+    /// `None` when no day matched — avoids coupling a sentinel `Utc::now()` to
+    /// the wall clock.
+    pub(crate) earliest_start: Option<DateTime<Utc>>,
+    pub(crate) total_work_mins: i64,
 }
 
-/// Strip injected XML wrappers and collapse whitespace so the preview line
-/// reads as a single natural-language snippet.
-fn clean_user_message_preview(raw: &str) -> String {
-    // Strip well-known injected tags. Treated greedily — these are emitted
-    // by Claude Code / hooks and never contain user-authored prose worth
-    // showing in a one-line preview.
-    let strip_tags = |s: String, tag: &str| -> String {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        let mut out = String::new();
-        let mut rest = s.as_str();
-        while let Some(start) = rest.find(&open) {
-            out.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find(&close) {
-                rest = &rest[start + end + close.len()..];
-            } else {
-                rest = &rest[start + open.len()..];
+/// Fold one day's `SessionInfo` slice into a running cumulative — the single
+/// accumulation site both public entry points share.
+fn fold_session_day(
+    cum: &mut SessionCumulative,
+    s: &SessionInfo,
+    calculator: &crate::aggregator::CostCalculator,
+) {
+    cum.days += 1;
+    cum.input_tokens += s.day_input_tokens;
+    cum.output_tokens += s.day_output_tokens;
+    cum.user_msgs += s.day_user_msgs;
+    cum.assistant_msgs += s.day_assistant_msgs;
+    for t in s.day_tokens_by_model.values() {
+        cum.cache_creation += t.cache_creation_tokens;
+        cum.cache_read += t.cache_read_tokens;
+    }
+    cum.cost += s.cost(calculator);
+    cum.unpriced |= s.has_unpriced_model(calculator);
+    cum.earliest_start = Some(match cum.earliest_start {
+        Some(prev) if prev < s.day_first_timestamp => prev,
+        _ => s.day_first_timestamp,
+    });
+    cum.total_work_mins += (s.day_last_timestamp - s.day_first_timestamp).num_minutes();
+}
+
+/// Lifetime cumulative for a single session (every day matching `file_path`).
+pub(crate) fn compute_session_cumulative(
+    file_path: &Path,
+    groups: &[DailyGroup],
+) -> SessionCumulative {
+    let calculator = crate::aggregator::CostCalculator::global();
+    let mut cum = SessionCumulative::default();
+    for group in groups {
+        for s in &group.sessions {
+            if s.file_path == *file_path {
+                fold_session_day(&mut cum, s, calculator);
             }
         }
-        out.push_str(rest);
-        out
-    };
-    let mut s = raw.to_string();
-    for tag in [
-        "command-name",
-        "command-message",
-        "command-args",
-        "system-reminder",
-        "local-command-stdout",
-        "user-prompt-submit-hook",
-    ] {
-        s = strip_tags(s, tag);
     }
-    // Collapse all whitespace runs to single spaces so multi-line messages
-    // become single-line previews.
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    cum
+}
+
+/// Lifetime cumulative for every session in one pass, keyed by `file_path` —
+/// the build-once map a per-row consumer (Live tab, MCP `live_sessions`) indexes
+/// instead of `compute_session_cumulative` per row (O(rows × slices)). The
+/// paired `&SessionInfo` keeps the first slice seen, so date-descending `groups`
+/// yield the newest day's model/title (session-representative-value rule).
+pub(crate) fn cumulative_by_path(
+    groups: &[DailyGroup],
+) -> HashMap<&Path, (SessionCumulative, &SessionInfo)> {
+    let calculator = crate::aggregator::CostCalculator::global();
+    let mut out: HashMap<&Path, (SessionCumulative, &SessionInfo)> = HashMap::new();
+    for group in groups {
+        for s in &group.sessions {
+            let entry = out
+                .entry(s.file_path.as_path())
+                .or_insert_with(|| (SessionCumulative::default(), s));
+            fold_session_day(&mut entry.0, s, calculator);
+        }
+    }
+    out
+}
+
+/// Owned cumulative per `file_path`, with no `&SessionInfo` meta — cacheable on
+/// `AppState` (a borrowed map can't outlive the groups it points into). This
+/// holds the expensive fold (a `cost`/`unpriced` pricing lookup per slice), so
+/// memoizing it across frames is what removes the per-frame rebuild cost; a
+/// draw pairs a lookup here with one in [`meta_by_path`] for the row's meta.
+pub(crate) fn cumulative_owned_by_path(
+    groups: &[DailyGroup],
+) -> HashMap<PathBuf, SessionCumulative> {
+    let calculator = crate::aggregator::CostCalculator::global();
+    let mut out: HashMap<PathBuf, SessionCumulative> = HashMap::new();
+    for group in groups {
+        for s in &group.sessions {
+            let entry = out.entry(s.file_path.clone()).or_default();
+            fold_session_day(entry, s, calculator);
+        }
+    }
+    out
+}
+
+/// Representative (newest-day) `SessionInfo` per `file_path` — reference-only,
+/// no fold and no clone. A per-row consumer pairs a lookup here with a lookup
+/// in the memoized [`cumulative_owned_by_path`] cache, so a draw resolves only
+/// the handful of visible rows instead of cloning a cumulative for every
+/// session. First slice wins, so date-descending `groups` yield the newest day.
+pub(crate) fn meta_by_path(groups: &[DailyGroup]) -> HashMap<&Path, &SessionInfo> {
+    let mut out: HashMap<&Path, &SessionInfo> = HashMap::new();
+    for group in groups {
+        for s in &group.sessions {
+            out.entry(s.file_path.as_path()).or_insert(s);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::infrastructure::CachedTokenStats;
+
+    // One session-day slice with a distinct path/model and an explicit
+    // timestamp so cross-day folding and newest-day meta are both observable.
+    fn cum_slice(path: &str, input: u64, output: u64, model: &str, day_ago: i64) -> SessionInfo {
+        let ts = Utc::now() - chrono::Duration::days(day_ago);
+        SessionInfo {
+            file_path: PathBuf::from(path),
+            day_first_timestamp: ts,
+            day_last_timestamp: ts + chrono::Duration::minutes(30),
+            ..crate::test_helpers::helpers::make_session_with_tokens(model, input, output, model)
+        }
+    }
+
+    #[test]
+    fn cumulative_by_path_agrees_with_per_session_compute_and_manual_sum() {
+        use crate::test_helpers::helpers::make_daily_group;
+        // Group dates are arbitrary labels here — folding keys on file_path, not
+        // the day — but derive from today so no fixed calendar literal lands.
+        let newer = chrono::Local::now().date_naive();
+        let older = newer - chrono::Duration::days(1);
+        // Date-descending, as real groups are. Path `/a` spans both days; the
+        // newer slice carries model "new" to pin the representative pick.
+        let groups = vec![
+            make_daily_group(
+                newer,
+                vec![
+                    cum_slice("/a.jsonl", 100, 10, "new", 0),
+                    cum_slice("/b.jsonl", 200, 20, "bee", 0),
+                ],
+            ),
+            make_daily_group(older, vec![cum_slice("/a.jsonl", 50, 5, "old", 1)]),
+        ];
+
+        let map = cumulative_by_path(&groups);
+
+        // `/a` folds both days; `/b` only one.
+        let (cum_a, meta_a) = map.get(Path::new("/a.jsonl")).unwrap();
+        assert_eq!(cum_a.input_tokens, 150);
+        assert_eq!(cum_a.output_tokens, 15);
+        assert_eq!(cum_a.days, 2);
+        // Representative meta is the newest day's slice (first inserted).
+        assert_eq!(meta_a.model.as_deref(), Some("new"));
+
+        // The map and the single-session entry point must never disagree, and
+        // both must equal a manual re-sum of the matching day slices.
+        for (path, (cum, meta)) in &map {
+            let solo = compute_session_cumulative(path, &groups);
+            assert_eq!(cum.input_tokens, solo.input_tokens);
+            assert_eq!(cum.output_tokens, solo.output_tokens);
+            assert_eq!(cum.cost, solo.cost);
+            assert_eq!(cum.days, solo.days);
+            assert_eq!(meta.file_path.as_path(), *path);
+
+            let mut manual_in = 0u64;
+            let mut manual_days = 0usize;
+            for g in &groups {
+                for s in g.sessions.iter().filter(|s| s.file_path.as_path() == *path) {
+                    manual_in += s.day_input_tokens;
+                    manual_days += 1;
+                }
+            }
+            assert_eq!(cum.input_tokens, manual_in);
+            assert_eq!(cum.days, manual_days);
+        }
+    }
+
+    #[test]
+    fn display_title_prefers_custom_over_ai_over_summary() {
+        let mut s = crate::test_helpers::helpers::make_session_with_tokens("p", 1, 1, "m");
+        s.custom_title = Some("CUSTOM".into());
+        s.ai_title = Some("AI".into());
+        s.summary = Some("SUM".into());
+        assert_eq!(s.display_title(), Some("CUSTOM"));
+        s.custom_title = None;
+        assert_eq!(s.display_title(), Some("AI"), "ai-title is second");
+        s.ai_title = None;
+        assert_eq!(s.display_title(), Some("SUM"), "summary is last");
+        s.summary = None;
+        assert_eq!(s.display_title(), None);
+    }
+
+    #[test]
+    fn cumulative_by_path_folds_cost_cache_and_message_counts() {
+        use crate::test_helpers::helpers::make_daily_group;
+        // The token-sum test leaves cost/cache/msgs/work_mins at zero (synthetic
+        // unpriced models, no cache, no message counts). This pins those fold
+        // fields with priced models and an independent re-sum oracle.
+        let slice = |model: &str,
+                     input: u64,
+                     output: u64,
+                     cache_c: u64,
+                     cache_r: u64,
+                     users: u64,
+                     assts: u64,
+                     day_ago: i64,
+                     work_mins: i64| {
+            let ts = Utc::now() - chrono::Duration::days(day_ago);
+            let mut by_model = HashMap::new();
+            by_model.insert(
+                model.to_string(),
+                crate::aggregator::ModelTokens {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_creation_tokens: cache_c,
+                    cache_read_tokens: cache_r,
+                    cache_creation_5m_tokens: 0,
+                    cache_creation_1h_tokens: 0,
+                    non_standard_speed: false,
+                },
+            );
+            SessionInfo {
+                file_path: PathBuf::from("/s.jsonl"),
+                day_first_timestamp: ts,
+                day_last_timestamp: ts + chrono::Duration::minutes(work_mins),
+                day_input_tokens: input,
+                day_output_tokens: output,
+                day_user_msgs: users,
+                day_assistant_msgs: assts,
+                day_tokens_by_model: by_model,
+                model: Some(model.to_string()),
+                ..crate::test_helpers::helpers::make_session_with_tokens(
+                    model, input, output, model,
+                )
+            }
+        };
+        let newer = chrono::Local::now().date_naive();
+        let older = newer - chrono::Duration::days(1);
+        let groups = vec![
+            make_daily_group(
+                newer,
+                vec![slice("claude-opus-4-8", 3000, 800, 100, 50, 4, 5, 0, 30)],
+            ),
+            make_daily_group(
+                older,
+                vec![slice("claude-sonnet-4-6", 1000, 200, 20, 10, 2, 3, 1, 12)],
+            ),
+        ];
+
+        let map = cumulative_by_path(&groups);
+        let (cum, _) = map.get(Path::new("/s.jsonl")).unwrap();
+
+        assert!(cum.cost > 0.0, "priced models must fold a non-zero cost");
+        assert!(!cum.unpriced, "all models priced → not flagged unpriced");
+
+        // Independent re-sum oracle over every fold field the token test omits.
+        let calc = crate::aggregator::CostCalculator::global();
+        let (mut cost, mut cc, mut cr, mut um, mut am, mut wm) =
+            (0.0, 0u64, 0u64, 0u64, 0u64, 0i64);
+        for g in &groups {
+            for s in &g.sessions {
+                cost += s.cost(calc);
+                for t in s.day_tokens_by_model.values() {
+                    cc += t.cache_creation_tokens;
+                    cr += t.cache_read_tokens;
+                }
+                um += s.day_user_msgs;
+                am += s.day_assistant_msgs;
+                wm += (s.day_last_timestamp - s.day_first_timestamp).num_minutes();
+            }
+        }
+        assert_eq!(cum.cost, cost);
+        assert_eq!(cum.cache_creation, cc);
+        assert_eq!(cum.cache_read, cr);
+        assert_eq!(cum.user_msgs, um);
+        assert_eq!(cum.assistant_msgs, am);
+        assert_eq!(cum.total_work_mins, wm);
+    }
 
     fn user_entry(text: &str) -> crate::domain::LogEntry {
         use crate::domain::{ContentBlock, EntryType, LogEntry, Message, MessageContent, Role};
@@ -811,6 +1065,7 @@ mod tests {
             is_sidechain: false,
             user_type: None,
             request_id: None,
+            level: None,
         }
     }
 
@@ -914,6 +1169,7 @@ mod tests {
             cache_read_tokens: 300,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         assert_eq!(tokens.work_tokens(), 1500);
     }
@@ -927,6 +1183,7 @@ mod tests {
             cache_read_tokens: 300,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         assert_eq!(tokens.all_tokens(), 2000);
     }
@@ -946,6 +1203,7 @@ mod tests {
             cache_read_tokens: 10,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         let model_tokens = cached.clone();
 
@@ -1016,6 +1274,7 @@ mod tests {
             is_sidechain: false,
             user_type: None,
             request_id: None,
+            level: None,
         }];
         let result = DailyGrouper::extract_project_name_from_entries(&entries);
         assert_eq!(result, Some("~/projects/myproject".to_string()));
@@ -1039,6 +1298,7 @@ mod tests {
             is_sidechain: false,
             user_type: None,
             request_id: None,
+            level: None,
         }];
         let result = DailyGrouper::extract_project_name_from_entries(&entries);
         assert_eq!(result, None);
@@ -1048,6 +1308,7 @@ mod tests {
 
     fn make_cached_file_stats(daily_stats: HashMap<String, CachedDailyStats>) -> CachedFileStats {
         CachedFileStats {
+            verified_cwd: None,
             modified_secs: 0,
             file_size: 0,
             entry_count: 0,
@@ -1116,6 +1377,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_5m_tokens: 0,
                 cache_creation_1h_tokens: 0,
+                non_standard_speed: false,
             },
         );
 
@@ -1391,19 +1653,14 @@ mod tests {
             .expect("grouper entry")
             .clone();
 
-        // Path 2: Stats parses the same file from scratch.
-        let cache_b = crate::infrastructure::Cache::new_empty();
-        let (_stats, _) = StatsAggregator::aggregate_with_shared_cache(
+        // Path 2: Stats parses the same file from scratch. The returned
+        // cache carries the freshly written entry, so the cross-check is
+        // hermetic (no dependency on a real ~/.ccsight cache).
+        let (_stats, _, cache_b) = StatsAggregator::aggregate_with_shared_cache(
             std::slice::from_ref(&path),
-            cache_b.clone(),
+            crate::infrastructure::Cache::new_empty(),
         );
-        let _ = cache_b;
-        let cache_b_loaded = crate::infrastructure::Cache::load()
-            .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
-        // Stats's aggregate writes to ~/.ccsight; load it back. If it's not
-        // there (test environment), skip the cross-check — the per-field
-        // assertions below still validate the grouper-written entry.
-        let entry_from_stats = cache_b_loaded.get(&path).cloned();
+        let entry_from_stats = cache_b.get(&path).cloned();
 
         std::fs::remove_file(&path).ok();
 

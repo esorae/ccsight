@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc, Weekday};
-use serde::{Deserialize, Serialize};
 
 use crate::domain::{EntryType, LogEntry, Usage};
 use crate::infrastructure::{
@@ -57,9 +56,7 @@ pub struct Stats {
     pub weekday_work_activity: HashMap<Weekday, u64>,
     pub tool_error_count: usize,
     pub tool_success_count: usize,
-    pub sessions_with_summary: usize,
     pub total_sessions_count: usize,
-    pub branch_stats: HashMap<String, BranchStats>,
     pub language_usage: HashMap<String, usize>,
     pub extension_usage: HashMap<String, usize>,
     /// Per-tool/Skills/Subagents/MCP key: distinct session-days that used this key at least once.
@@ -80,20 +77,14 @@ pub struct Stats {
     pub total_session_days: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BranchStats {
-    pub session_count: usize,
-    pub total_duration_mins: i64,
-    pub first_seen: Option<DateTime<Utc>>,
-    pub last_seen: Option<DateTime<Utc>>,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ProjectStats {
     pub sessions: usize,
     pub tokens: u64,
     pub work_tokens: u64,
 }
+
+pub(crate) const KNOWN_SPEED: &str = "standard";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenStats {
@@ -113,6 +104,11 @@ pub struct TokenStats {
     /// default, so on real data this is typically the larger half.
     #[serde(default)]
     pub cache_creation_1h_tokens: u64,
+
+    /// Sticky across the fold: one flagged message makes the whole
+    /// aggregate's cost unknown.
+    #[serde(default)]
+    pub non_standard_speed: bool,
 }
 
 impl TokenStats {
@@ -125,6 +121,7 @@ impl TokenStats {
     }
 
     pub fn add(&mut self, usage: &Usage) {
+        self.non_standard_speed |= usage.speed.as_deref().is_some_and(|s| s != KNOWN_SPEED);
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
         self.cache_creation_tokens += usage.cache_creation_input_tokens;
@@ -144,6 +141,7 @@ impl TokenStats {
     /// home for combining two token counts — a new token field is added here
     /// only, instead of in every per-field fold site.
     pub fn merge(&mut self, other: &TokenStats) {
+        self.non_standard_speed |= other.non_standard_speed;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.cache_creation_tokens += other.cache_creation_tokens;
@@ -214,6 +212,14 @@ struct FileStats {
     extension_usage: HashMap<String, usize>,
 }
 
+impl FileStats {
+    /// Same "work tokens" concept as `TokenStats::work_tokens` — input +
+    /// output only, excluding cache.
+    fn work_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
 pub struct CacheStats {
     pub cached_files: usize,
     pub parsed_files: usize,
@@ -268,7 +274,13 @@ impl StatsAggregator {
         }
     }
 
-    pub fn aggregate_with_shared_cache(files: &[PathBuf], mut cache: Cache) -> (Stats, CacheStats) {
+    /// Returns the updated cache so the caller can hand it to
+    /// `DailyGrouper::group_by_date_with_shared_cache` — every miss parsed
+    /// here becomes a grouper hit, keeping cold start at one parse per file.
+    pub fn aggregate_with_shared_cache(
+        files: &[PathBuf],
+        mut cache: Cache,
+    ) -> (Stats, CacheStats, Cache) {
         let mut stats = Stats::default();
 
         let mut cache_stats = CacheStats {
@@ -360,6 +372,7 @@ impl StatsAggregator {
                     .collect();
 
                 let cached_file_stats = CachedFileStats {
+                    verified_cwd: crate::aggregator::extract_verified_cwd(&entries, file),
                     modified_secs: get_file_modified_secs(file),
                     file_size: get_file_size(file),
                     entry_count: entries.len(),
@@ -406,7 +419,7 @@ impl StatsAggregator {
 
         let _ = cache.save();
 
-        (stats, cache_stats)
+        (stats, cache_stats, cache)
     }
 
     fn merge_cached_stats(
@@ -451,7 +464,7 @@ impl StatsAggregator {
             + cached.output_tokens
             + cached.cache_creation_tokens
             + cached.cache_read_tokens;
-        let session_work_tokens = cached.input_tokens + cached.output_tokens;
+        let session_work_tokens = cached.work_tokens();
 
         // Subagents are included so the per-project total matches the
         // Project filter popup (the single source of truth for "all activity
@@ -508,27 +521,6 @@ impl StatsAggregator {
     fn apply_productivity_stats(stats: &mut Stats, cached: &CachedFileStats) {
         if !cached.is_subagent {
             stats.total_sessions_count += 1;
-            if cached.summary.is_some() {
-                stats.sessions_with_summary += 1;
-            }
-
-            if let Some(ref branch) = cached.git_branch {
-                let branch_stats = stats.branch_stats.entry(branch.clone()).or_default();
-                branch_stats.session_count += 1;
-                if let Some(duration) = cached.session_duration_mins {
-                    branch_stats.total_duration_mins += duration;
-                }
-                if let Some(ts) = cached.first_timestamp
-                    && (branch_stats.first_seen.is_none() || Some(ts) < branch_stats.first_seen)
-                {
-                    branch_stats.first_seen = Some(ts);
-                }
-                if let Some(ts) = cached.last_timestamp
-                    && (branch_stats.last_seen.is_none() || Some(ts) > branch_stats.last_seen)
-                {
-                    branch_stats.last_seen = Some(ts);
-                }
-            }
         }
     }
 
@@ -677,7 +669,7 @@ impl StatsAggregator {
                             + usage.output_tokens
                             + usage.cache_creation_input_tokens
                             + usage.cache_read_input_tokens;
-                        let work_tokens = usage.input_tokens + usage.output_tokens;
+                        let work_tokens = usage.work_tokens();
 
                         *daily.hourly_activity.entry(hour).or_insert(0) += tokens;
                         *daily.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
@@ -760,7 +752,7 @@ impl StatsAggregator {
             + file_stats.output_tokens
             + file_stats.cache_creation_tokens
             + file_stats.cache_read_tokens;
-        let session_work_tokens = file_stats.input_tokens + file_stats.output_tokens;
+        let session_work_tokens = file_stats.work_tokens();
 
         // Mirror of `merge_cached_stats`: subagents are included so the
         // per-project total matches the Project filter popup.
@@ -984,6 +976,7 @@ mod tests {
             cache_read_tokens: 300,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         assert_eq!(stats.work_tokens(), 1500);
     }
@@ -997,6 +990,7 @@ mod tests {
             cache_read_tokens: 300,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         assert_eq!(stats.all_tokens(), 2000);
     }
@@ -1010,6 +1004,7 @@ mod tests {
             cache_read_tokens: 300,
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
+            non_standard_speed: false,
         };
         let cache_tokens = stats.cache_creation_tokens + stats.cache_read_tokens;
         assert_eq!(stats.all_tokens(), stats.work_tokens() + cache_tokens);
@@ -1025,6 +1020,7 @@ mod tests {
             cache_read_input_tokens: 30,
             service_tier: None,
             cache_creation: None,
+            speed: None,
         };
         stats.add(&usage);
 
@@ -1045,6 +1041,7 @@ mod tests {
             cache_read_input_tokens: 30,
             service_tier: None,
             cache_creation: None,
+            speed: None,
         };
         let usage2 = Usage {
             input_tokens: 200,
@@ -1053,6 +1050,7 @@ mod tests {
             cache_read_input_tokens: 60,
             service_tier: None,
             cache_creation: None,
+            speed: None,
         };
         stats.add(&usage1);
         stats.add(&usage2);

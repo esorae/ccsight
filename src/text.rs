@@ -246,6 +246,69 @@ pub fn parse_text_with_code_blocks(text: &str) -> Vec<TextSegment> {
     segments
 }
 
+/// Heuristic: after the known-tag strip pass, any remaining `<kebab-case>`
+/// marker (one or more `-` inside ASCII alphanumeric) is treated as an
+/// unstripped system-injected wrapper. Single-word tags (`<foo>`) and
+/// arrow-style prose (`x < 3` / `if a > b`) are NOT matched so genuine
+/// user content with `<`/`>` is preserved.
+pub fn looks_like_system_injection(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('>') else {
+            return false;
+        };
+        let inside = &rest[..end];
+        let name = inside.trim_start_matches('/');
+        let is_kebab_tag = name.contains('-')
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if is_kebab_tag {
+            return true;
+        }
+        rest = &rest[end + 1..];
+    }
+    false
+}
+
+/// Strip injected XML wrappers and collapse whitespace so the preview line
+/// reads as a single natural-language snippet.
+pub fn clean_user_message_preview(raw: &str) -> String {
+    // Strip well-known injected tags. Treated greedily — these are emitted
+    // by Claude Code / hooks and never contain user-authored prose worth
+    // showing in a one-line preview.
+    let strip_tags = |s: String, tag: &str| -> String {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut out = String::new();
+        let mut rest = s.as_str();
+        while let Some(start) = rest.find(&open) {
+            out.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find(&close) {
+                rest = &rest[start + end + close.len()..];
+            } else {
+                rest = &rest[start + open.len()..];
+            }
+        }
+        out.push_str(rest);
+        out
+    };
+    let mut s = raw.to_string();
+    for tag in [
+        "command-name",
+        "command-message",
+        "command-args",
+        "system-reminder",
+        "local-command-stdout",
+        "user-prompt-submit-hook",
+    ] {
+        s = strip_tags(s, tag);
+    }
+    // Collapse all whitespace runs to single spaces so multi-line messages
+    // become single-line previews.
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

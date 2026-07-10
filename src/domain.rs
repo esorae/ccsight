@@ -45,6 +45,12 @@ pub struct LogEntry {
 
     #[serde(rename = "requestId")]
     pub request_id: Option<String>,
+
+    /// `system` entries carry a level (suggestion / info / warning / error);
+    /// `level == "error"` is the only reliable "true error" signal (api_error
+    /// etc.), unlike the noisy per-tool `is_error`.
+    #[serde(default)]
+    pub level: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -202,6 +208,19 @@ pub struct Usage {
 
     #[serde(default)]
     pub service_tier: Option<String>,
+
+    #[serde(default)]
+    pub speed: Option<String>,
+}
+
+impl Usage {
+    /// Same "work tokens" concept as `aggregator::stats::TokenStats` and
+    /// `infrastructure::cache::CachedFileStats` — input + output only,
+    /// excluding cache. Named the same across all three so the formula has
+    /// one name to grep for instead of inline arithmetic repeated per site.
+    pub fn work_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -216,6 +235,20 @@ pub struct CacheCreationBreakdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_work_tokens_excludes_cache() {
+        let usage = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 9_000,
+            cache_read_input_tokens: 500_000,
+            cache_creation: None,
+            service_tier: None,
+            speed: None,
+        };
+        assert_eq!(usage.work_tokens(), 150);
+    }
 
     #[test]
     fn test_extract_text_empty() {

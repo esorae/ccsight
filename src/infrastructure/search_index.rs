@@ -162,12 +162,29 @@ fn collect_tasks(daily_groups: &[DailyGroup]) -> Vec<(usize, usize, PathBuf)> {
         .collect()
 }
 
+/// Sessions in the first-run head commit. `daily_groups` is newest-first,
+/// so the head covers the most recent (most-searched) sessions and the
+/// early handle makes search usable within seconds of a cold start.
+const FIRST_COMMIT_SESSIONS: usize = 200;
+
 impl SearchIndex {
     pub fn update_or_build(daily_groups: &[DailyGroup]) -> anyhow::Result<Self> {
+        Self::update_or_build_with_early(daily_groups, &|_| {})
+    }
+
+    /// Same as `update_or_build`, but on a full (first-run) build `early`
+    /// receives a read handle right after the head chunk commits, so the
+    /// caller can serve searches while the tail is still indexing. The
+    /// early handle's snapshot is frozen — the caller must replace it
+    /// with the returned final handle.
+    pub fn update_or_build_with_early(
+        daily_groups: &[DailyGroup],
+        early: &dyn Fn(Self),
+    ) -> anyhow::Result<Self> {
         let index_dir = Self::index_path()?;
 
         if !index_dir.exists() {
-            return Self::build(daily_groups);
+            return Self::build(daily_groups, early);
         }
 
         let manifest_path = index_dir.join("manifest.json");
@@ -176,7 +193,7 @@ impl SearchIndex {
             .and_then(|data| serde_json::from_str::<Manifest>(&data).ok())
         {
             Some(m) if m.version == INDEX_VERSION => m,
-            _ => return Self::build(daily_groups),
+            _ => return Self::build(daily_groups, early),
         };
 
         let current_files = build_file_map(daily_groups);
@@ -185,7 +202,7 @@ impl SearchIndex {
         // were saved at some point); rebuild instead of incrementally
         // re-adding every file every launch.
         if manifest.files.is_empty() && !current_files.is_empty() {
-            return Self::build(daily_groups);
+            return Self::build(daily_groups, early);
         }
 
         if manifest.files == current_files {
@@ -195,16 +212,26 @@ impl SearchIndex {
         Self::update_incremental(daily_groups, &index_dir, &manifest, &current_files)
     }
 
-    fn build(daily_groups: &[DailyGroup]) -> anyhow::Result<Self> {
+    fn build(daily_groups: &[DailyGroup], early: &dyn Fn(Self)) -> anyhow::Result<Self> {
         let index_dir = Self::index_path()?;
+        Self::build_in(&index_dir, daily_groups, early, FIRST_COMMIT_SESSIONS)
+    }
 
+    /// `index_dir` and `first_chunk` are injectable so tests can build in a
+    /// temp dir with a tiny head instead of touching the real index.
+    fn build_in(
+        index_dir: &Path,
+        daily_groups: &[DailyGroup],
+        early: &dyn Fn(Self),
+        first_chunk: usize,
+    ) -> anyhow::Result<Self> {
         if index_dir.exists() {
-            let _ = fs::remove_dir_all(&index_dir);
+            let _ = fs::remove_dir_all(index_dir);
         }
-        fs::create_dir_all(&index_dir)?;
+        fs::create_dir_all(index_dir)?;
 
         let (schema, fields) = Self::create_schema();
-        let dir = tantivy::directory::MmapDirectory::open(&index_dir)?;
+        let dir = tantivy::directory::MmapDirectory::open(index_dir)?;
         let index = Index::open_or_create(dir, schema)?;
         register_tokenizer(&index);
 
@@ -212,16 +239,32 @@ impl SearchIndex {
         install_merge_policy(&writer);
 
         let tasks = collect_tasks(daily_groups);
-        let parsed: Vec<ParsedDoc> = tasks
-            .par_iter()
-            .flat_map(|(day_idx, session_idx, path)| parse_session(path, *day_idx, *session_idx))
-            .collect();
+        let index_chunk =
+            |writer: &IndexWriter, chunk: &[(usize, usize, PathBuf)]| -> anyhow::Result<()> {
+                let parsed: Vec<ParsedDoc> = chunk
+                    .par_iter()
+                    .flat_map(|(day_idx, session_idx, path)| {
+                        parse_session(path, *day_idx, *session_idx)
+                    })
+                    .collect();
+                write_docs(writer, &fields, &parsed)
+            };
 
-        write_docs(&writer, &fields, &parsed)?;
+        let (head, tail) = tasks.split_at(tasks.len().min(first_chunk));
+        index_chunk(&writer, head)?;
         writer.commit()?;
+        if !tail.is_empty() {
+            // Early snapshot covers the head (newest sessions) while the
+            // tail is still indexing; skipped when this commit was final.
+            if let Ok(handle) = Self::open_existing(index_dir) {
+                early(handle);
+            }
+            index_chunk(&writer, tail)?;
+            writer.commit()?;
+        }
         // Block until merge threads finish; without this, writer drops
-        // mid-merge and pending segments leak across reloads (339+ files
-        // over a day in our bench). One-time cost; faster steady-state.
+        // mid-merge and pending segments leak across reloads. One-time
+        // cost; faster steady-state.
         writer.wait_merging_threads()?;
 
         let reader = index
@@ -230,7 +273,7 @@ impl SearchIndex {
             .try_into()?;
         let query_parser = QueryParser::for_index(&index, vec![fields.text]);
 
-        Self::save_manifest(daily_groups, &index_dir)?;
+        Self::save_manifest(daily_groups, index_dir)?;
 
         Ok(Self {
             reader,
@@ -483,8 +526,61 @@ mod tests {
     #[test]
     fn test_build_with_empty_groups() {
         let groups: Vec<DailyGroup> = vec![];
-        let index = SearchIndex::build(&groups).unwrap();
+        let index = SearchIndex::build(&groups, &|_| {}).unwrap();
         let results = index.search("test", 10, 50);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn early_handle_serves_head_before_tail_is_indexed() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+
+        let dir = std::env::temp_dir().join(format!("ccsight-earlyidx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write_session = |name: &str, word: &str| -> PathBuf {
+            let p = dir.join(name);
+            std::fs::write(
+                &p,
+                format!(
+                    r#"{{"type":"user","uuid":"u-{word}","timestamp":"2026-01-10T10:00:00Z","sessionId":"s-{word}","message":{{"role":"user","content":"{word}"}}}}"#
+                ),
+            )
+            .unwrap();
+            p
+        };
+        let head_file = write_session("head.jsonl", "alphaword");
+        let tail_file = write_session("tail.jsonl", "betaword");
+
+        let mut head_session = make_session("p", None, None);
+        head_session.file_path = head_file;
+        let mut tail_session = make_session("p", None, None);
+        tail_session.file_path = tail_file;
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(); // lint-ok: date-literal
+        let groups = vec![make_daily_group(date, vec![head_session, tail_session])];
+
+        // (head hits, tail hits) as seen by the early snapshot.
+        let early_seen: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+        let index_dir = dir.join("index");
+        let final_index = SearchIndex::build_in(
+            &index_dir,
+            &groups,
+            &|handle| {
+                let head = handle.search("alphaword", 10, 50).len();
+                let tail = handle.search("betaword", 10, 50).len();
+                *early_seen.lock().unwrap() = Some((head, tail));
+            },
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *early_seen.lock().unwrap(),
+            Some((1, 0)),
+            "early snapshot must contain the head chunk only"
+        );
+        assert_eq!(final_index.search("alphaword", 10, 50).len(), 1);
+        assert_eq!(final_index.search("betaword", 10, 50).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,8 +1,38 @@
 # ccsight
 
-Claude Code session analytics TUI. Browse what's running now, drill into a day,
-reconcile spend across projects and models, and search every past conversation
-— all from the terminal, against your local `~/.claude/` logs.
+Claude Code session analytics in the terminal, read from your local
+`~/.claude/` logs.
+
+![Dashboard](docs/assets/dashboard.png)
+
+## Why ccsight
+
+`/usage` and other trackers already give you cost totals. ccsight is built
+around three things they don't:
+
+- **Find & resume past work** — full-text search (tantivy) over every
+  conversation, straight into the transcript viewer, then copy a ready-to-paste
+  `claude -r` resume command.
+- **Know when a session needs you** — the Live tab tracks busy / paused
+  sessions (surviving reboots), and `--wait` blocks on one session until it
+  is awaiting input, stalled, errored, exited mid-task, or ended.
+- **Audit your setup** — every MCP server, skill, command, and subagent
+  classified as active, stale, or installed-but-never-invoked.
+
+Plus the usual analytics: cost with the 5m / 1h cache-write TTL split,
+subagent-inclusive totals that reconcile across every view, per-project /
+model / tool / language breakdowns, heatmap, hourly pattern, and weekly /
+monthly trends.
+
+<img src="docs/assets/live.png" alt="Live sessions" width="49%"><img src="docs/assets/search.png" alt="Full-text search" width="49%">
+<img src="docs/assets/conversation.png" alt="Conversation viewer" width="49%"><img src="docs/assets/insights.png" alt="Insights" width="49%">
+
+<details>
+<summary>More screenshots: Daily view</summary>
+
+![Daily view](docs/assets/daily.png)
+
+</details>
 
 ## Features
 
@@ -47,12 +77,31 @@ ccsight                    # Run TUI
 ccsight --daily            # Print daily cost table to stdout (date / tokens / cost)
 ccsight --weekly           # Same shape, aggregated by ISO week (Mon-Sun)
 ccsight --monthly          # Same shape, aggregated by calendar month
+ccsight --daily --json     # Any of the three as JSON ({rows, total} — jq-friendly)
 ccsight --mcp              # Run as MCP server (stdio)
+ccsight --wait <id>        # Block until ONE session needs you, print one line, exit
 ccsight --clear-cache      # Drop the JSON cache + tantivy index, rebuild on next run
 ccsight --limit 50         # Load only the 50 most recent sessions (faster startup)
 ```
 
 Run `ccsight --help` for the full flag list. Press `?` in the TUI for key bindings.
+
+### Wait (`--wait`)
+
+Blocks until one session stops working, then prints a tab-separated line
+(`state`, `session id`, `reason`) and exits 0. It polls `~/.claude` on disk —
+no TUI, no hooks — so any shell command can be the notifier:
+
+```bash
+ccsight --wait 1f3a && say "agent needs you"      # id prefix is enough if unique
+ccsight --wait 1f3a9c2e-4b7d-4e0a-9c66-0e2b5f8a1d34
+```
+
+States it fires on: `awaiting_input` (turn finished or tool call awaiting
+approval), `stalled` (Claude owes output but is idle), `error` (unrecovered
+hard error), `exited` (process died mid-task), `ended` (session is no longer
+running). An unknown or ambiguous session id exits 2 with candidates on
+stderr. One wait watches one session; run several for several sessions.
 
 ### Reading the numbers
 
@@ -72,7 +121,7 @@ of these tokens to narrow the result set further:
 | Token | Effect |
 |-------|--------|
 | `filter:live` / `filter:paused` / `filter:busy` | Limit to sessions in the current Live / paused / busy poll |
-| `filter:today` / `filter:week` / `filter:month` | Calendar window (local timezone) |
+| `filter:today` / `filter:week` / `filter:month` | Rolling window (local timezone): today, last 7 days, last 30 days |
 | `filter:date:YYYY-MM-DD` | Exact date |
 | `project:NAME` / `branch:NAME` / `model:NAME` | Substring match (case-insensitive) |
 
@@ -83,7 +132,7 @@ Tokens can be combined freely with each other and with free text:
 /filter:month model:opus mcp setup        # last 30 days, Opus, containing "mcp setup"
 ```
 
-The Live tab pre-fills `filter:live `, and the search popup chips up recognised tokens so you can confirm parsing.
+The Live tab pre-fills `filter:live `, and the search popup renders recognised tokens as chips so you can confirm parsing.
 
 ## MCP Server
 
@@ -118,8 +167,8 @@ Reads inputs from these locations:
   Skills / Commands / Subagents. Surfaced as zero-call rows in the Tools popup
   for entries you've installed but never invoked.
 - **`~/Library/Application Support/Claude/local-agent-mode-sessions/`** *(macOS only)*
-  — Claude Desktop "Cowork" sessions. Read via a side-channel format; if a
-  release breaks it, individual sessions silent-skip rather than crashing.
+  — Claude Desktop "Cowork" sessions. The format is undocumented, so a session
+  that stops parsing is skipped rather than failing the run.
 
 State lives under `~/.ccsight/`: the parsed-session cache, the full-text
 index, pins, and live-session history. `--clear-cache` removes the cache and

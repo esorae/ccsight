@@ -13,7 +13,7 @@ use std::path::Path;
 /// Durably write `bytes` to `path` via a sibling `.tmp` + rename, 0o600 on
 /// Unix. Recovers once from a stale wrong-owned tmp by removing it and
 /// retrying the create; the target itself is only ever replaced by rename.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_write_with(path, |w| w.write_all(bytes))
 }
 
@@ -21,7 +21,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// serializers can stream straight to disk instead of building the whole
 /// payload in memory first — the cache file is tens of MB, and a `to_vec`
 /// there spikes RSS on every save.
-pub(crate) fn atomic_write_with(
+pub fn atomic_write_with(
     path: &Path,
     write: impl FnOnce(&mut io::BufWriter<File>) -> io::Result<()>,
 ) -> io::Result<()> {

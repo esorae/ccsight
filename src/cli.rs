@@ -300,12 +300,92 @@ fn print_bucket_rows(
     );
 }
 
+/// Pure JSON assembly for `--json`: zero rows are skipped and the total is
+/// summed over kept rows only, matching the table renderers exactly so the
+/// two output shapes can never disagree.
+fn buckets_to_json(period: &str, rows: &[(String, u64, u64, u64, u64, f64)]) -> serde_json::Value {
+    let mut total = (0u64, 0u64, 0u64, 0u64, 0.0f64);
+    let json_rows: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|(_, input, output, cw, cr, _)| *input != 0 || *output != 0 || *cw != 0 || *cr != 0)
+        .map(|(label, input, output, cw, cr, cost)| {
+            total.0 += input;
+            total.1 += output;
+            total.2 += cw;
+            total.3 += cr;
+            total.4 += cost;
+            serde_json::json!({
+                "label": label,
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_write_tokens": cw,
+                "cache_read_tokens": cr,
+                "cost_usd": cost,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "period": period,
+        "rows": json_rows,
+        "total": {
+            "input_tokens": total.0,
+            "output_tokens": total.1,
+            "cache_write_tokens": total.2,
+            "cache_read_tokens": total.3,
+            "cost_usd": total.4,
+        },
+    })
+}
+
+/// `--json` with `--daily` / `--weekly` / `--monthly`: same buckets and
+/// labels as the tables, one JSON document on stdout.
+pub fn show_costs_json(period: &str, limit: usize) {
+    let files = match FileDiscovery::find_jsonl_files_with_limit(limit) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error finding files: {e}");
+            return;
+        }
+    };
+    let mut cache = crate::infrastructure::Cache::load().ok();
+    let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
+    let rows = match period {
+        "weekly" => aggregate_buckets(&daily_groups, week_label),
+        "monthly" => aggregate_buckets(&daily_groups, month_label),
+        _ => aggregate_buckets(&daily_groups, |d| d.format("%Y-%m-%d").to_string()),
+    };
+    println!("{}", buckets_to_json(period, &rows));
+}
+
+/// ISO 8601-1:2019 §5.5.4 time-interval notation for a Mon-Sun week: two
+/// endpoints joined by `/`, the end abbreviated to whatever differs from
+/// the start. Shared by the weekly table and `--json` so labels agree.
+fn week_label(d: chrono::NaiveDate) -> String {
+    use chrono::{Datelike, Duration};
+    let monday = d - Duration::days(d.weekday().num_days_from_monday() as i64);
+    let sunday = monday + Duration::days(6);
+    let end_fmt = if monday.year() == sunday.year() {
+        if monday.month() == sunday.month() {
+            "%d"
+        } else {
+            "%m-%d"
+        }
+    } else {
+        "%Y-%m-%d"
+    };
+    format!("{}/{}", monday.format("%Y-%m-%d"), sunday.format(end_fmt))
+}
+
+fn month_label(d: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    format!("{}-{:02}", d.year(), d.month())
+}
+
 /// Group days into ISO weeks (Mon-Sun). The label spells out the date
 /// range so users don't have to mentally convert `2026-W22` into "what
 /// dates did that cover" — format: `Wnn  mm-dd–mm-dd` (en dash range
 /// inside the same year, matching the Daily detail popup's weekly view).
 pub fn show_weekly_costs(limit: usize) {
-    use chrono::{Datelike, Duration};
     let files = match FileDiscovery::find_jsonl_files_with_limit(limit) {
         Ok(f) => f,
         Err(e) => {
@@ -319,29 +399,12 @@ pub fn show_weekly_costs(limit: usize) {
     }
     let mut cache = crate::infrastructure::Cache::load().ok();
     let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
-    let rows = aggregate_buckets(&daily_groups, |d| {
-        let monday = d - Duration::days(d.weekday().num_days_from_monday() as i64);
-        let sunday = monday + Duration::days(6);
-        // ISO 8601-1:2019 §5.5.4 time-interval notation: two endpoints
-        // joined by `/`, with the end abbreviated to whatever differs
-        // from the start. Same year + month → only the day differs.
-        let end_fmt = if monday.year() == sunday.year() {
-            if monday.month() == sunday.month() {
-                "%d"
-            } else {
-                "%m-%d"
-            }
-        } else {
-            "%Y-%m-%d"
-        };
-        format!("{}/{}", monday.format("%Y-%m-%d"), sunday.format(end_fmt))
-    });
+    let rows = aggregate_buckets(&daily_groups, week_label);
     print_bucket_rows(rows, "Week", 22);
 }
 
 /// Group days into calendar months. Label `YYYY-MM`.
 pub fn show_monthly_costs(limit: usize) {
-    use chrono::Datelike;
     let files = match FileDiscovery::find_jsonl_files_with_limit(limit) {
         Ok(f) => f,
         Err(e) => {
@@ -355,6 +418,70 @@ pub fn show_monthly_costs(limit: usize) {
     }
     let mut cache = crate::infrastructure::Cache::load().ok();
     let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
-    let rows = aggregate_buckets(&daily_groups, |d| format!("{}-{:02}", d.year(), d.month()));
+    let rows = aggregate_buckets(&daily_groups, month_label);
     print_bucket_rows(rows, "Month", 12);
+}
+
+#[cfg(test)]
+mod tests {
+    //! Fixture arithmetic: two non-zero rows (10+5 input, 20+1 output,
+    //! 30 cache-write, 40 cache-read, $1.5+$0.25) plus one all-zero row
+    //! that must be skipped by both the table and the JSON path.
+    use super::*;
+
+    fn rows() -> Vec<(String, u64, u64, u64, u64, f64)> {
+        // Labels are opaque to the JSON assembly; day-N stands in for dates.
+        vec![
+            ("day-1".to_string(), 10, 20, 30, 40, 1.5),
+            ("day-2".to_string(), 0, 0, 0, 0, 0.0),
+            ("day-3".to_string(), 5, 1, 0, 0, 0.25),
+        ]
+    }
+
+    #[test]
+    fn json_skips_zero_rows_and_totals_kept_rows() {
+        let v = buckets_to_json("daily", &rows());
+        assert_eq!(v["period"], "daily");
+        let out_rows = v["rows"].as_array().unwrap();
+        assert_eq!(out_rows.len(), 2);
+        assert_eq!(out_rows[0]["label"], "day-1");
+        assert_eq!(out_rows[1]["label"], "day-3");
+        assert_eq!(v["total"]["input_tokens"], 15);
+        assert_eq!(v["total"]["output_tokens"], 21);
+        assert_eq!(v["total"]["cache_write_tokens"], 30);
+        assert_eq!(v["total"]["cache_read_tokens"], 40);
+        assert!((v["total"]["cost_usd"].as_f64().unwrap() - 1.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn json_row_carries_full_schema() {
+        let v = buckets_to_json("weekly", &rows());
+        let row = &v["rows"][0];
+        for key in [
+            "label",
+            "input_tokens",
+            "output_tokens",
+            "cache_write_tokens",
+            "cache_read_tokens",
+            "cost_usd",
+        ] {
+            assert!(row.get(key).is_some(), "missing key: {key}");
+        }
+    }
+
+    #[test]
+    fn week_label_matches_iso_interval_notation() {
+        // Mid-week date collapses to its Mon-Sun span; same month → day-only end.
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 7).unwrap(); // lint-ok: date-literal
+        assert_eq!(week_label(d), "2026-01-05/11"); // lint-ok: date-literal
+        // Month boundary keeps month in the end label.
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 1, 30).unwrap(); // lint-ok: date-literal
+        assert_eq!(week_label(d), "2026-01-26/02-01"); // lint-ok: date-literal
+    }
+
+    #[test]
+    fn month_label_is_year_dash_month() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 3, 9).unwrap(); // lint-ok: date-literal
+        assert_eq!(month_label(d), "2026-03");
+    }
 }

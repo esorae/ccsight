@@ -13,6 +13,7 @@ pub mod helpers {
     /// focused on its discriminating fields rather than re-listing 18 defaults.
     fn default_session() -> SessionInfo {
         SessionInfo {
+            verified_cwd: None,
             file_path: PathBuf::from("/tmp/test.jsonl"),
             project_name: String::new(),
             git_branch: None,
@@ -77,6 +78,7 @@ pub mod helpers {
                 cache_read_tokens: 0,
                 cache_creation_5m_tokens: 0,
                 cache_creation_1h_tokens: 0,
+                non_standard_speed: false,
             },
         );
         SessionInfo {
@@ -126,12 +128,16 @@ pub mod helpers {
             live_past_sessions: Vec::new(),
             live_past_snapshot_meta: None,
             live_past_snapshot_total: 0,
-            project_detail_path: String::new(),
-            project_detail_scroll: 0,
-            help_scroll: 0,
+            // Mirror production: build the cumulative cache from the same groups
+            // so Live-tab render tests see real lifetime totals, not zeros.
+            live_cumulative: crate::aggregator::cumulative_owned_by_path(&groups),
+            live_pane_mode: crate::LivePaneMode::Split,
+            session_titles: crate::aggregator::meta_by_path(&groups)
+                .into_iter()
+                .filter_map(|(p, m)| m.display_title().map(|t| (p.to_path_buf(), t.to_string())))
+                .collect(),
             show_conversation: false,
             summary_content: String::new(),
-            summary_scroll: 0,
             summary_type: None,
             daily_breakdown_focus: false,
             daily_breakdown_scroll: 0,
@@ -146,12 +152,14 @@ pub mod helpers {
             dashboard_scroll: [0; 7],
             dashboard_viewport: [0; 7],
             activity_view_weekly: false,
+            show_empty_days: false,
             tools_detail_section: 0,
             mcp_expanded_servers: std::collections::HashSet::new(),
             mcp_selected_server: 0,
             mcp_selected_tool: None,
             search_mode: false,
             search_input: TextInput::default(),
+            search_select_all: false,
             search_results: Vec::new(),
             search_selected: 0,
             search_task: None,
@@ -181,7 +189,6 @@ pub mod helpers {
             animation_frame: 0,
             retention_warning: None,
             retention_warning_dismissed: false,
-            insights_detail_scroll: 0,
             session_detail_scroll: 0,
             session_detail_recent: None,
             session_detail_recent_task: None,
@@ -194,16 +201,11 @@ pub mod helpers {
             session_list_hidden: false,
             layout: crate::LayoutAreas::default(),
             period_filter: crate::PeriodFilter::All,
-            filter_popup_selected: 0,
-            filter_input_mode: false,
-            filter_input: TextInput::default(),
-            filter_input_error: false,
             project_filter: None,
-            project_popup_selected: 0,
-            project_popup_scroll: 0,
             project_list: Vec::new(),
             project_labels: HashMap::new(),
             original_daily_groups: groups,
+            verified_project_paths: std::collections::HashMap::new(),
             original_daily_costs: daily_costs.clone(),
             original_stats: crate::aggregator::Stats::default(),
             original_total_cost: daily_costs.len() as f64,

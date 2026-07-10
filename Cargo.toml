@@ -1,6 +1,6 @@
 [package]
 name = "ccsight"
-version = "1.2.5"
+version = "1.2.6"
 edition = "2024"
 rust-version = "1.87"
 build = "build.rs"
@@ -9,6 +9,13 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/esorae/ccsight"
 keywords = ["claude", "tui", "analytics", "cli"]
 categories = ["command-line-utilities"]
+
+# cargo-binstall: resolve GitHub Release assets (ccsight-<target>.tar.gz,
+# binary at archive root) instead of building from source.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
 # TUI
@@ -58,7 +65,7 @@ unicode-width = "0.2"
 arboard = "3"
 
 # MCP server
-rmcp = { version = "1.3", features = ["server", "transport-io"] }
+rmcp = { version = "2.0", features = ["server", "transport-io"] }
 schemars = "1"
 
 # Full-text search

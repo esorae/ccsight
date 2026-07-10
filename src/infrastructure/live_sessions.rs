@@ -75,11 +75,40 @@ pub struct LiveSession {
     pub was_recently_live: bool,
 }
 
-/// Slugify a cwd path into the directory name Claude Code uses under
-/// `~/.claude/projects/`. Every `/` becomes `-`; leading slash produces a
-/// leading `-` (e.g. `/Users/x/dev/foo` → `-Users-x-dev-foo`).
+/// Slugify a path exactly like Claude Code names `~/.claude/projects/`
+/// entries: every non-alphanumeric char becomes `-` (not just `/` — `.` and
+/// `_` collapse too), so the mapping is NOT reversible. `claude -r` resolves
+/// a session by slugifying the current cwd, which makes "slug(candidate) ==
+/// storage dir name" the one correct test for a resume target.
+pub fn official_project_slug(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 fn cwd_to_project_dir(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace('/', "-")
+    official_project_slug(&cwd.to_string_lossy())
+}
+
+/// Real project paths Claude Code itself recorded as `projects` keys in
+/// `~/.claude.json` — secondary resume witnesses for storage dirs whose
+/// transcripts carry no usable cwd. Missing / unparsable file → empty.
+pub fn claude_json_project_paths() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let path = PathBuf::from(home).join(".claude.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("projects")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().cloned().collect())
+        })
+        .unwrap_or_default()
 }
 
 fn claude_sessions_dir() -> Option<PathBuf> {
@@ -198,9 +227,9 @@ pub fn discover_live() -> Vec<LiveSession> {
 
 /// Read the launch `cwd` from a session JSONL — recorded on message entries,
 /// not the leading summary line, so it surfaces within the first few lines.
-/// Returns the FIRST match (the session's project dir = the right `cd` target
-/// for resume) — deliberately not the reverse-walk last value. `MAX_LINES`
-/// bounds the probe; a session with no message yet yields `None`.
+/// Returns the FIRST match; display-label use only. It is NOT a resume
+/// target: the launch cwd can differ from the storage dir after a
+/// relocation — resume goes through `AppState::resume_dir` instead.
 pub fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
     use std::io::{BufRead, BufReader};
     const MAX_LINES: usize = 100;
@@ -276,17 +305,17 @@ pub fn discover_recently_paused(
                 continue;
             }
             let jsonl_mtime = mtime_utc(&jsonl_path);
-            // Prefer the JSONL's authoritative `cwd` over the slug: a real
-            // `-` in the path is indistinguishable from the `/`→`-`
-            // separator, so reversing the slug collapses `foo-bar-baz` to
-            // `foo/bar/baz` and the label loses everything but the tail.
+            // Label source: the JSONL's own `cwd`. When a file carries none,
+            // show the raw storage-dir slug — the slug is not reversible
+            // (`-` stands for `/`, `.` and `_` alike), so any reconstructed
+            // path would be a guess dressed up as a real one.
             let cwd = read_cwd_from_jsonl(&jsonl_path).map_or_else(
                 || {
                     let dir_name = project_path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("");
-                    PathBuf::from(dir_name.replace('-', "/"))
+                    PathBuf::from(dir_name)
                 },
                 PathBuf::from,
             );
@@ -344,6 +373,18 @@ pub fn mark_was_recently_live(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn official_slug_collapses_every_non_alphanumeric_char() {
+        // Not just `/`: `.`, `_` and `-` all become `-`, matching how Claude
+        // Code names `~/.claude/projects/` dirs — which is why the slug can
+        // never be reversed back into a path.
+        assert_eq!(
+            official_project_slug("/home/me/dev/foo.bar_baz-qux"),
+            "-home-me-dev-foo-bar-baz-qux"
+        );
+        assert_eq!(official_project_slug("/a/.claude/x"), "-a--claude-x");
+    }
 
     #[test]
     fn read_cwd_from_jsonl_returns_authoritative_path_with_literal_dash() {

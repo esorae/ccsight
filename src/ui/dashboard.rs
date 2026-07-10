@@ -16,8 +16,8 @@ use crate::AppState;
 use crate::aggregator::CostCalculator;
 
 /// Border + title styles for a dashboard panel, keyed off focus. Single source
-/// for the seven panels' focused-color rule (gotchas.md Block Construction
-/// Consistency); the ◈/◇ marker stays per-panel since its glyph form varies.
+/// for the seven panels' focused-color rule; the ◈/◇ marker stays per-panel
+/// since its glyph form varies.
 fn panel_styles(selected: bool) -> (Style, Style) {
     if selected {
         (
@@ -155,9 +155,9 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
         state.dashboard_scroll[4],
     );
 
-    // Footer: route through `help_bar` — keys/format live in one place. A
-    // global keybind still needs adding at each tab's bar (see gotchas.md
-    // Bottom Bar sync), but spacing/styling can no longer drift per site.
+    // Footer: route through `help_bar` — keys/format live in one place.
+    // Adding a global keybind still means listing it in each tab's bar,
+    // but spacing/styling are centralised so sites can't drift.
     let help_line = Paragraph::new(super::help_bar(&[
         ("?", "help"),
         ("q", "quit"),
@@ -189,11 +189,7 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
     ])
     .split(inner);
 
-    let session_count: usize = state
-        .daily_groups
-        .iter()
-        .map(|g| g.user_sessions().count())
-        .sum();
+    let session_count = crate::aggregator::distinct_user_session_count(&state.daily_groups);
     let sessions_card = Paragraph::new(vec![
         Line::from(Span::styled(
             format!("{session_count}"),
@@ -491,15 +487,15 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
     let (border_style, title_style) = panel_styles(selected);
 
     let actual_end = display_end.min(today);
-    // Year-qualified full dates (`YY-MM-DD`) so the span reads unambiguously:
-    // the bottom legend's `%m-%d` axis labels (`06-08 - 06-05`) look reversed
-    // when the window crosses a year, so the title carries the authoritative
-    // range with the year. ISO 8601 `-` separator per the project date rule.
+    // Year-qualified full dates so the span reads unambiguously: the bottom
+    // legend's `%m-%d` axis labels look reversed when the window crosses a
+    // year, so the title carries the authoritative range. Full `%Y` — a
+    // 2-digit year reads as a month-day pair at a glance.
     let marker = if selected { '◈' } else { '◇' };
     let title = format!(
         " {marker} Activity {} - {}",
-        adjusted_start.format("%y-%m-%d"),
-        actual_end.format("%y-%m-%d"),
+        adjusted_start.format("%Y-%m-%d"),
+        actual_end.format("%Y-%m-%d"),
     );
 
     // The date (left) and intensity key (right) share the bottom border row;
@@ -584,7 +580,11 @@ fn draw_hourly_pattern(
         Style::default().fg(theme::DIM),
     )));
 
-    let peak_entry = hourly_avg.iter().max_by_key(|(_, t)| *t);
+    // Tie-break on the hour: HashMap iteration order is randomized, so a
+    // bare max_by_key flips the label between equal-value hours per frame.
+    let peak_entry = hourly_avg
+        .iter()
+        .max_by_key(|(h, t)| (*t, std::cmp::Reverse(*h)));
     let peak_title = if let Some((h, t)) = peak_entry {
         format!(" Peak: {}-{}h ({}) ", h, h + 1, crate::format_number(*t))
     } else {
@@ -922,7 +922,7 @@ fn draw_tool_usage(
         ),
     ];
 
-    // Stale MCP servers (>30d) get inlined on the MCP row whenever there are any,
+    // Stale MCP servers (≥30d) get inlined on the MCP row whenever there are any,
     // regardless of which tiers are visible. Tier 3 may also list them as a
     // standalone alert; the duplication is intentional — tying the warning to its
     // category line makes "which thing is stale" visually unambiguous.
@@ -945,7 +945,7 @@ fn draw_tool_usage(
     }
     if stale_mcp_count > 0 {
         alerts.push((
-            format!("! {stale_mcp_count} stale MCP servers (>30d)"),
+            format!("! {stale_mcp_count} stale MCP servers (≥30d)"),
             theme::WARNING,
         ));
     }
@@ -1280,8 +1280,8 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
     let total_usage: usize = entries.iter().map(|(_, c, _)| *c).sum();
     let (visible_height, _, scroll) = calc_scroll(area.height, entries.len(), scroll, 2);
 
-    // Same Min(8) name column as Models; trailing fixed columns are wider here
-    // (rank 4, count 6, pct 4) plus 3 inter-column gaps and 2 borders.
+    // Same Min(8) name column as Models; trailing fixed columns are
+    // rank 4, count 5, pct 4, plus 3 inter-column gaps and 2 borders.
     let name_w = (area.width as usize)
         .saturating_sub(4 + 6 + 4 + 3 + 2)
         .max(4);
@@ -1303,7 +1303,10 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
             Row::new(vec![
                 Cell::from(rank).style(Style::default().fg(theme::DIM)),
                 Cell::from(super::truncate_with_ellipsis(name, name_w)).style(name_style),
-                Cell::from(count.to_string()).style(Style::default().fg(theme::PRIMARY)),
+                // K/M formatting: a raw 6-digit count would be cut by the
+                // fixed cell width and read as a smaller number.
+                Cell::from(crate::format_number(*count as u64))
+                    .style(Style::default().fg(theme::PRIMARY)),
                 Cell::from(pct_str).style(Style::default().fg(theme::MUTED)),
             ])
         })
@@ -1466,16 +1469,39 @@ where
 /// this-month spend / forecast / MoM delta + top-model composition, then a separator.
 pub(crate) const COSTS_HEADER_ROWS: usize = 5;
 
-/// Month-boundary divider lines inserted when rendering the active-date sequence.
-/// The Costs and Daily-Activity popups both walk the same `daily_costs` date set
-/// (newest-first) and emit one divider on each month change after the first, so
-/// the count is shared. Walk transitions rather than assuming `distinct months - 1`
-/// to stay correct under any ordering.
-pub(crate) fn active_month_divider_count(state: &AppState) -> usize {
+/// Dates the Costs / Daily-Activity detail bodies render, newest-first. Default
+/// is the active-day set (`daily_costs`, already newest-first). With
+/// `show_empty_days`, every calendar day from the oldest active date through
+/// `today` fills in so idle gaps show (absent days render zero). Scroll-count
+/// helpers and both body builders walk THIS, staying in sync by construction.
+pub(crate) fn detail_dates(state: &AppState, today: chrono::NaiveDate) -> Vec<chrono::NaiveDate> {
+    let active: Vec<chrono::NaiveDate> = state.daily_costs.iter().map(|(d, _)| *d).collect();
+    if !state.show_empty_days {
+        return active;
+    }
+    let Some(oldest) = active.iter().min().copied() else {
+        return active;
+    };
+    // Newest active date may post-date `today` only under clock skew; clamp the
+    // upper bound so the fill always reaches the present.
+    let end = active.iter().max().copied().unwrap_or(today).max(today);
+    let mut dates = Vec::new();
+    let mut d = end;
+    while d >= oldest {
+        dates.push(d);
+        d -= chrono::Duration::days(1);
+    }
+    dates
+}
+
+/// Month-boundary divider count over a newest-first date sequence: one divider
+/// on each month change after the first. Walk transitions rather than assuming
+/// `distinct months - 1` to stay correct under any ordering.
+fn month_divider_count(dates: &[chrono::NaiveDate]) -> usize {
     use chrono::Datelike;
     let mut prev: Option<(i32, u32)> = None;
     let mut n = 0;
-    for (date, _) in &state.daily_costs {
+    for date in dates {
         let key = (date.year(), date.month());
         if prev.is_some_and(|p| p != key) {
             n += 1;
@@ -1486,12 +1512,13 @@ pub(crate) fn active_month_divider_count(state: &AppState) -> usize {
 }
 
 /// Scrollable body line count for both the Costs and Daily-Activity popups:
-/// one row per active day plus the month-divider rows between them. The popup
+/// one row per rendered day plus the month-divider rows between them. The popup
 /// scroll clamp, the `N-M/Total` footer, and the j/G key bounds MUST use this
 /// (not the bare day count) — otherwise the divider rows push the oldest days
 /// below the visible fold and the footer claims rows that never render.
-pub(crate) fn active_days_body_line_count(state: &AppState) -> usize {
-    state.daily_costs.len() + active_month_divider_count(state)
+pub(crate) fn active_days_body_line_count(state: &AppState, today: chrono::NaiveDate) -> usize {
+    let dates = detail_dates(state, today);
+    dates.len() + month_divider_count(&dates)
 }
 
 /// Daily Costs header — MTD + forecast + MoM + top model contributors.
@@ -1842,14 +1869,16 @@ pub(crate) fn activity_header_lines(
     // Top contributors this week: highest project by tokens and highest
     // tool by call count. Skips the row entirely when the current week has
     // no activity so empty weeks don't claim header real estate.
+    // Alphabetical tie-break: HashMap iteration order is randomized, so a
+    // bare max_by_key shuffles equal-count names between reloads.
     let top_project = this_project_tokens
         .iter()
-        .max_by_key(|(_, v)| **v)
+        .max_by_key(|(name, v)| (**v, std::cmp::Reverse(name.as_str())))
         .map(|(name, tokens)| (name.clone(), *tokens));
     let top_tool = this_tool_count
         .iter()
         .filter(|(name, _)| !name.is_empty())
-        .max_by_key(|(_, v)| **v)
+        .max_by_key(|(name, v)| (**v, std::cmp::Reverse(name.as_str())))
         .map(|(name, count)| (name.clone(), *count));
     let mut top_line: Vec<Span> = vec![Span::styled(
         "  This week  ",
@@ -1964,9 +1993,11 @@ fn push_month_divider_line(
 ) {
     let avg_per_day = if days > 0 { cost / days as f64 } else { 0.0 };
     // Route $ through format_cost (sig-figs) so the divider matches every
-    // other compact cost surface (lint #39's intent).
+    // other compact cost surface (lint #39's intent). `/active day` names the
+    // divisor: Insights divides the same-looking `$/day` by calendar days, so
+    // an unqualified label here would read as the other figure.
     let label = format!(
-        "{:02}-{:02}  {}d  {}  {}  avg {}/day",
+        "{:02}-{:02}  {}d  {}  {}  avg {}/active day",
         year % 100,
         month,
         days,
@@ -2038,9 +2069,16 @@ fn detail_panel_costs(
     // Build the whole body (day rows + month dividers) and slice by LINE, not by
     // day — divider rows then count toward scroll/footer so the oldest day stays
     // reachable. `active_days_body_line_count` is the matching total.
+    let cost_by_date: std::collections::HashMap<NaiveDate, f64> =
+        state.daily_costs.iter().copied().collect();
+    let dates = detail_dates(state, today);
     let mut body: Vec<Line> = Vec::new();
     let mut prev_month: Option<(i32, u32)> = None;
-    for (i, (date, cost)) in state.daily_costs.iter().enumerate() {
+    for (i, date) in dates.iter().enumerate() {
+        // Filled idle days (absent from the active set) recede to FAINT so they
+        // read as "no activity" backdrop, not as real zero-cost sessions.
+        let is_empty = !cost_by_date.contains_key(date);
+        let cost = cost_by_date.get(date).copied().unwrap_or(0.0);
         let key = (date.year(), date.month());
         if let Some(pm) = prev_month
             && pm != key
@@ -2052,33 +2090,45 @@ fn detail_panel_costs(
         prev_month = Some(key);
 
         let cost_display = cost.max(0.0);
-        let ratio = if max_cost > 0.0 {
-            *cost / max_cost
-        } else {
-            0.0
-        };
+        let ratio = if max_cost > 0.0 { cost / max_cost } else { 0.0 };
         let filled = (ratio * bar_width as f64).round() as usize;
         let bar = crate::text::hbar(filled, bar_width);
-        let intensity = (ratio * 0.7 + 0.3).min(1.0);
-        let bar_color = theme::primary_with_intensity(intensity);
+        let intensity = theme::bar_intensity(ratio);
+        let bar_color = if is_empty {
+            theme::FAINT
+        } else {
+            theme::primary_with_intensity(intensity)
+        };
 
         let tokens = day_tok.get(date).copied().unwrap_or(0);
 
+        let rank_color = if is_empty { theme::FAINT } else { theme::DIM };
+        let date_color = if is_empty {
+            theme::FAINT
+        } else {
+            theme::LABEL_MUTED
+        };
+        let cost_span_style = if is_empty {
+            Style::default().fg(theme::FAINT)
+        } else {
+            cost_style(cost)
+        };
+
         body.push(Line::from(vec![
-            Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
+            Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(rank_color)),
             Span::styled(
                 format!("{} ({})", date, date.format("%a")),
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(date_color),
             ),
             Span::raw(" "),
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
                 format!(" {}", super::format_cost(cost_display, 2)),
-                cost_style(*cost),
+                cost_span_style,
             ),
             Span::styled(
                 format!(" ({})", crate::format_number(tokens)),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(rank_color),
             ),
         ]));
     }
@@ -2202,12 +2252,8 @@ fn detail_panel_projects(
         let ratio = stats.work_tokens as f64 / max_tokens as f64;
         let filled = (ratio * bar_width as f64).round() as usize;
         let bar = crate::text::hbar(filled, bar_width);
-        let intensity = (ratio * 0.7 + 0.3).min(1.0);
-        let bar_color = Color::Rgb(
-            (140.0 + 78.0 * intensity) as u8,
-            (100.0 + 68.0 * intensity) as u8,
-            (180.0 + 75.0 * intensity) as u8,
-        );
+        let intensity = theme::bar_intensity(ratio);
+        let bar_color = theme::ramp_color(theme::RAMP_PURPLE, intensity);
         // Show basename only; the absolute path is in the popup title.
         let basename = name.rsplit('/').next().unwrap_or(name.as_str());
         let display_name = super::truncate_with_ellipsis(basename, name_width);
@@ -2411,12 +2457,8 @@ fn detail_panel_models(
         let bar_color = if unknown {
             theme::WARNING
         } else {
-            let intensity = (ratio * 0.7 + 0.3).min(1.0);
-            Color::Rgb(
-                (100.0 + 118.0 * intensity) as u8,
-                (140.0 + 78.0 * intensity) as u8,
-                (200.0 + 55.0 * intensity) as u8,
-            )
+            let intensity = theme::bar_intensity(ratio);
+            theme::ramp_color(theme::RAMP_BLUE, intensity)
         };
 
         let display_name = super::truncate_with_ellipsis(model, name_width);
@@ -2450,7 +2492,7 @@ fn detail_panel_models(
                 crate::format_number(ts.input_tokens),
                 crate::format_number(ts.output_tokens),
                 crate::format_number(ts.cache_creation_tokens + ts.cache_read_tokens),
-                cost,
+                cost.max(0.0),
                 rates,
             )
         };
@@ -2627,7 +2669,7 @@ fn detail_panel_ecosystem(
     const COMMAND_RGB: [f64; 6] = [180.0, 130.0, 200.0, 55.0, 60.0, 50.0];
 
     fn rgb_from_table(table: &[f64; 6], ratio: f64) -> (u8, u8, u8) {
-        let intensity = (ratio * 0.7 + 0.3).min(1.0);
+        let intensity = theme::bar_intensity(ratio);
         (
             (table[0] + table[3] * intensity) as u8,
             (table[1] + table[4] * intensity) as u8,
@@ -2771,7 +2813,7 @@ fn detail_panel_ecosystem(
     )]));
 
     // Active section body only.
-    // Tab indices: 0=Tools (Built-in + MCP) → 1=Skills → 2=Subagents → 3=Commands.
+    // Tab indices: 0=Tools (Built-in + MCP) → 1=Skills → 2=Commands → 3=Subagents.
     // The Tools tab renders two subsections back-to-back: Built-in
     // (flat list) followed by MCP servers (server-grouped, expandable).
     if !tab_has_rows(active) {
@@ -2933,7 +2975,7 @@ fn detail_panel_ecosystem(
         }
         if stale_count > 0 {
             lines.push(Line::from(vec![Span::styled(
-                format!("  ⚠ {stale_count} stale (>30d)"),
+                format!("  ⚠ {stale_count} stale (≥30d)"),
                 Style::default().fg(theme::DIM),
             )]));
         }
@@ -3016,7 +3058,7 @@ fn detail_panel_ecosystem(
             };
             let row_rgb_table = if agg.is_builtin { BUILTIN_RGB } else { MCP_RGB };
             let (r, g, b) = rgb_from_table(&row_rgb_table, ratio);
-            let bar_color = Color::Rgb(r, g, b);
+            let bar_color = Color::Rgb(r, g, b); // lint-ok: raw-rgb — rgb_from_table output
             let display_name = super::truncate_with_ellipsis(group, group_name_width);
             let sessions = if agg.is_builtin {
                 // Sum of distinct sessions across built-in tool keys is
@@ -3228,7 +3270,7 @@ fn detail_panel_ecosystem(
                 "░".repeat(bar_width.saturating_sub(filled))
             );
             let (r, g, b) = rgb_from_table(&sec.bar_rgb_table, ratio);
-            let bar_color = Color::Rgb(r, g, b);
+            let bar_color = Color::Rgb(r, g, b); // lint-ok: raw-rgb — rgb_from_table output
             let display_raw = (sec.format_name)(name);
             let display_name = super::truncate_with_ellipsis(&display_raw, name_width);
             let ses = state.stats.tool_sessions.get(*name).copied().unwrap_or(0);
@@ -3384,15 +3426,11 @@ fn detail_panel_languages(
         let ratio = count as f64 / max_count as f64;
         let filled = (ratio * bar_width as f64).round() as usize;
         let intensity = if is_known {
-            (ratio * 0.7 + 0.3).min(1.0)
+            theme::bar_intensity(ratio)
         } else {
             (ratio * 0.4 + 0.2).min(0.8)
         };
-        let bar_color = Color::Rgb(
-            (40.0 + 46.0 * intensity) as u8,
-            (80.0 + 85.0 * intensity) as u8,
-            (90.0 + 90.0 * intensity) as u8,
-        );
+        let bar_color = theme::ramp_color(theme::RAMP_DEEP_TEAL, intensity);
         let bar = crate::text::hbar(filled, bar_width);
         let pct_str = crate::text::format_pct(count as u64, total_usage as u64);
         let name_label = super::truncate_with_ellipsis(&display_name, name_width);
@@ -3414,7 +3452,7 @@ fn detail_panel_languages(
             Span::raw(" "),
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
-                format!(" {count:>5}"),
+                format!(" {:>6}", crate::format_number(count as u64)),
                 Style::default().fg(theme::TEXT_BRIGHT),
             ),
             Span::styled(format!(" {pct_str:>4}"), Style::default().fg(theme::DIM)),
@@ -3506,12 +3544,8 @@ fn detail_panel_activity_weekly(
     for (i, w) in weekly.iter().enumerate().skip(scroll).take(body_height) {
         let ratio = w.tokens as f64 / max_tokens as f64;
         let filled = (ratio * bar_width as f64).round() as usize;
-        let intensity = (ratio * 0.7 + 0.3).min(1.0);
-        let bar_color = Color::Rgb(
-            (80.0 + 100.0 * intensity) as u8,
-            (160.0 + 58.0 * intensity) as u8,
-            (180.0 + 75.0 * intensity) as u8,
-        );
+        let intensity = theme::bar_intensity(ratio);
+        let bar_color = theme::ramp_color(theme::RAMP_TEAL, intensity);
         let bar = crate::text::hbar(filled, bar_width);
         lines.push(Line::from(vec![
             Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
@@ -3606,9 +3640,15 @@ fn detail_panel_activity_daily(
     // Build the whole body (day rows + month dividers) and slice by LINE so the
     // divider rows count toward scroll/footer and the oldest day stays reachable
     // (matches `active_days_body_line_count`, shared with the Costs panel).
+    let by_date: std::collections::HashMap<NaiveDate, (u64, u64, u64, u64, u64)> = daily
+        .iter()
+        .map(|(d, w, i, o, cw, cr)| (*d, (*w, *i, *o, *cw, *cr)))
+        .collect();
+    let dates = detail_dates(state, today);
     let mut body: Vec<Line> = Vec::new();
     let mut prev_month: Option<(i32, u32)> = None;
-    for (i, (date, work, input, output, cw, cr)) in daily.iter().enumerate() {
+    for (i, date) in dates.iter().enumerate() {
+        let (work, input, output, cw, cr) = by_date.get(date).copied().unwrap_or((0, 0, 0, 0, 0));
         let key = (date.year(), date.month());
         if let Some(pm) = prev_month
             && pm != key
@@ -3619,37 +3659,46 @@ fn detail_panel_activity_daily(
         }
         prev_month = Some(key);
 
-        let ratio = *work as f64 / max_tokens as f64;
+        // Filled idle days (absent from the active set) recede to FAINT so they
+        // read as "no activity" backdrop, not as real zero-token sessions.
+        let is_empty = !by_date.contains_key(date);
+        let ratio = work as f64 / max_tokens as f64;
         let filled = (ratio * bar_width as f64).round() as usize;
-        let intensity = (ratio * 0.7 + 0.3).min(1.0);
-        let bar_color = Color::Rgb(
-            (80.0 + 100.0 * intensity) as u8,
-            (160.0 + 58.0 * intensity) as u8,
-            (180.0 + 75.0 * intensity) as u8,
-        );
+        let intensity = theme::bar_intensity(ratio);
+        let bar_color = if is_empty {
+            theme::FAINT
+        } else {
+            theme::ramp_color(theme::RAMP_TEAL, intensity)
+        };
         let bar = crate::text::hbar(filled, bar_width);
 
+        let (rank_color, date_color, work_color) = if is_empty {
+            (theme::FAINT, theme::FAINT, theme::FAINT)
+        } else {
+            (theme::DIM, theme::LABEL_MUTED, theme::PRIMARY)
+        };
+
         body.push(Line::from(vec![
-            Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
+            Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(rank_color)),
             Span::styled(
                 format!("{} ({})", date, date.format("%a")),
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(date_color),
             ),
             Span::raw(" "),
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
-                format!(" {:>7}", crate::format_number(*work)),
-                Style::default().fg(theme::PRIMARY),
+                format!(" {:>7}", crate::format_number(work)),
+                Style::default().fg(work_color),
             ),
             Span::styled(
                 format!(
                     "  in {:>5} out {:>5} cw {:>5} cr {:>5}",
-                    crate::format_number(*input),
-                    crate::format_number(*output),
-                    crate::format_number(*cw),
-                    crate::format_number(*cr),
+                    crate::format_number(input),
+                    crate::format_number(output),
+                    crate::format_number(cw),
+                    crate::format_number(cr),
                 ),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(rank_color),
             ),
         ]));
     }
@@ -3695,7 +3744,7 @@ fn detail_panel_hourly(
         let tokens = hourly_avg.get(&hour).copied().unwrap_or(0);
         let ratio = tokens as f64 / max_tokens as f64;
         let filled = (ratio * bar_width as f64).round() as usize;
-        let intensity = (ratio * 0.7 + 0.3).min(1.0);
+        let intensity = theme::bar_intensity(ratio);
         let bar_color = theme::primary_with_intensity(intensity);
         let bar = crate::text::hbar(filled, bar_width);
         let pct = if total_avg > 0 {
@@ -3742,7 +3791,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
     let total_items = match state.dashboard_panel {
         // Body = day rows + month dividers; count both so the footer and clamp
         // don't leave the oldest day below the fold.
-        0 => active_days_body_line_count(state),
+        0 => active_days_body_line_count(state, today),
         1 => state.stats.project_stats.len(),
         2 => state.model_costs.len(),
         3 => tool_usage_line_count(state),
@@ -3769,7 +3818,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 // days are already excluded from `daily_costs`). Counting the
                 // dividers keeps the `1-N/M` indicator honest and the oldest
                 // day reachable.
-                active_days_body_line_count(state)
+                active_days_body_line_count(state, today)
             }
         }
         6 => 24,
@@ -3895,35 +3944,35 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         String::new()
     };
 
-    let popup = Paragraph::new(content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::PRIMARY))
-            .title(Span::styled(
-                title,
-                Style::default().fg(theme::PRIMARY).bold(),
-            ))
-            .title_bottom(Line::from(vec![
-                Span::styled(
-                    if state.dashboard_panel == 3 && state.tools_detail_section == 1 {
-                        " ←→: section  ↑↓: nav  Enter: expand  o/c: all  s: sort  q: close "
-                    } else if state.dashboard_panel == 3 {
-                        " ←→: section  ↑↓: scroll  s: sort  q: close "
-                    } else if state.dashboard_panel == 5 {
-                        if state.activity_view_weekly {
-                            " ↑↓: scroll  w: daily  q: close "
-                        } else {
-                            " ↑↓: scroll  w: weekly  q: close "
-                        }
+    let popup =
+        Paragraph::new(content).block(super::popup_block(&title).title_bottom(Line::from(vec![
+            Span::styled(
+                if state.dashboard_panel == 3 && state.tools_detail_section == 0 {
+                    " ←→: section  ↑↓: nav  Enter: expand  o/c: all  s: sort  q: close "
+                } else if state.dashboard_panel == 3 {
+                    " ←→: section  ↑↓: scroll  s: sort  q: close "
+                } else if state.dashboard_panel == 5 {
+                    if state.activity_view_weekly {
+                        " ↑↓: scroll  w: daily  q: close "
+                    } else if state.show_empty_days {
+                        " ↑↓: scroll  w: weekly  z: hide gaps  q: close "
                     } else {
-                        " ↑↓: scroll  q: close "
-                    },
-                    Style::default().fg(theme::DIM),
-                ),
-                Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
-                Span::styled(position_info, Style::default().fg(theme::DIM)),
-            ])),
-    );
+                        " ↑↓: scroll  w: weekly  z: all days  q: close "
+                    }
+                } else if state.dashboard_panel == 0 {
+                    if state.show_empty_days {
+                        " ↑↓: scroll  z: hide gaps  q: close "
+                    } else {
+                        " ↑↓: scroll  z: all days  q: close "
+                    }
+                } else {
+                    " ↑↓: scroll  q: close "
+                },
+                Style::default().fg(theme::DIM),
+            ),
+            Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
+            Span::styled(position_info, Style::default().fg(theme::DIM)),
+        ])));
 
     frame.render_widget(popup, popup_area);
 }
@@ -3948,7 +3997,18 @@ mod tests {
         assert!(text.contains("$706"));
         assert!(text.contains("2.24M"));
         // 706 / 3 = 235.33 → ${:.0} → 235
-        assert!(text.contains("avg $235/day"), "got: {text}");
+        assert!(text.contains("avg $235/active day"), "got: {text}");
+    }
+
+    #[test]
+    fn divider_fits_the_narrowest_supported_popup() {
+        // 60-column terminal → `detail_popup_area` gives a 56-wide popup, so
+        // 52 content columns. A heavy month is the widest the label ever gets;
+        // one column over and ratatui clips the qualifier mid-word.
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_month_divider_line(&mut lines, 2026, 5, 31, 38_000.0, 247_000_000, 52);
+        let w = unicode_width::UnicodeWidthStr::width(line_text(&lines[0]).as_str());
+        assert!(w <= 52, "divider overflows and clips: {w} > 52");
     }
 
     #[test]
@@ -3957,7 +4017,7 @@ mod tests {
         push_month_divider_line(&mut lines, 2026, 5, 0, 0.0, 0, 80);
         let text = line_text(&lines[0]);
         assert!(text.contains("0d"));
-        assert!(text.contains("avg $0/day"));
+        assert!(text.contains("avg $0/active day"));
     }
 
     #[test]
@@ -3968,6 +4028,32 @@ mod tests {
         assert!(
             text.contains("$0"),
             "negative cost should clamp to 0, got: {text}"
+        );
+    }
+
+    #[test]
+    fn detail_dates_lists_active_only_by_default_and_fills_gaps_when_toggled() {
+        use crate::test_helpers::helpers::make_test_app_state;
+        use chrono::NaiveDate;
+
+        let d = |day| NaiveDate::from_ymd_opt(2026, 1, day).unwrap(); // lint-ok: date-literal
+        let mut state = make_test_app_state(vec![]);
+        // Newest-first active set with a 2-day interior gap (Jan 10, Jan 7).
+        state.daily_costs = vec![(d(10), 5.0), (d(7), 3.0)];
+
+        state.show_empty_days = false;
+        assert_eq!(super::detail_dates(&state, d(10)), vec![d(10), d(7)]);
+
+        // Dense fill spans oldest active → today, newest-first, gaps included.
+        state.show_empty_days = true;
+        assert_eq!(
+            super::detail_dates(&state, d(10)),
+            vec![d(10), d(9), d(8), d(7)]
+        );
+        // Today past the newest active date → trailing idle days reach the present.
+        assert_eq!(
+            super::detail_dates(&state, d(12)),
+            vec![d(12), d(11), d(10), d(9), d(8), d(7)]
         );
     }
 

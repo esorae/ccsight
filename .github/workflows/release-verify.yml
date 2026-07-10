@@ -1,0 +1,37 @@
+name: Release verify
+
+# Depth the per-commit gate can't afford: every property test re-run with a
+# large case budget, plus the #[ignore]d soak / bench / real-data checks.
+# release.yml blocks its build on this, so a failure here stops the ship
+# instead of landing after publish; manual trigger between releases.
+
+on:
+  # No `tags` trigger: release.yml calls this, and both firing on the same tag
+  # would run the whole thing twice.
+  workflow_call: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  proptest:
+    name: Property tests + soak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      # Two steps, not one `--include-ignored`: the property tests live on the
+      # per-commit gate now, so only a default run reaches them with the large
+      # budget — while the `#[ignore]`d tests must stay in their own run. They
+      # contend for the tantivy index lock, the shared cache file, and a stable
+      # open-fd count, so sharing a run with 600+ parallel tests fails them.
+      - name: Property tests with a large case budget
+        env:
+          PROPTEST_CASES: "4096"
+        run: cargo test --locked --release
+      # Real-data tests no-op without ~/.claude, so this stays green on a
+      # clean runner.
+      - name: Ignored tests (soak + bench + real-data)
+        run: cargo test --locked --release -- --ignored

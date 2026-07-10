@@ -617,39 +617,64 @@ fn generate_session_summary_internal(
     result
 }
 
-// JSONL summary regeneration / append.
-// Writes the result back into the session's JSONL as a `type: "summary"` row,
-// so external tools (and ccsight on next reload) see the updated label.
+// JSONL title regeneration / append.
+// Writes the result back into the session's JSONL as a `type: "custom-title"`
+// row (the field the resume picker shows and `display_title` ranks first), so
+// external tools and ccsight on next reload see the updated label.
 
-pub(crate) fn regenerate_jsonl_summary(
+/// First 3 + last 2 user requests so a long session's title reflects both the
+/// opening ask and where it ended, not just the opening. Sessions with <=5
+/// requests pass through whole; for more, the two ranges never overlap so no
+/// dedup is needed.
+fn sample_title_requests(reqs: &[String]) -> Vec<&String> {
+    if reqs.len() <= 5 {
+        return reqs.iter().collect();
+    }
+    reqs.iter()
+        .take(3)
+        .chain(reqs.iter().skip(reqs.len() - 2))
+        .collect()
+}
+
+/// Build the title-generation prompt context. The session's own recap (latest
+/// `type:summary`) is the strongest signal for what it became, so it leads;
+/// file names are generic and add little to a title, so they're omitted.
+fn build_title_context(project: &str, summary: Option<&str>, user_requests: &[String]) -> String {
+    let mut context = format!("Project: {project}\n");
+    if let Some(summary) = summary {
+        let recap: String = summary.chars().take(300).collect();
+        context.push_str(&format!("\nSession recap:\n{recap}\n"));
+    }
+    context.push_str("\nUser requests:\n");
+    for req in sample_title_requests(user_requests) {
+        let truncated: String = req.chars().take(100).collect();
+        context.push_str(&format!("- {truncated}\n"));
+    }
+    context
+}
+
+pub(crate) fn regenerate_jsonl_title(
     session: &crate::aggregator::SessionInfo,
 ) -> Result<String, String> {
     use std::process::Command;
 
-    let (user_requests, files_modified, _) = extract_session_details(&session.file_path);
+    let (user_requests, _, _) = extract_session_details(&session.file_path);
 
     if user_requests.is_empty() {
         return Err("No conversation to summarize".to_string());
     }
 
-    let mut context = String::new();
-    context.push_str(&format!("Project: {}\n", session.project_name));
-    context.push_str("\nUser requests:\n");
-    for req in user_requests.iter().take(5) {
-        let truncated: String = req.chars().take(100).collect();
-        context.push_str(&format!("- {truncated}\n"));
-    }
-    if !files_modified.is_empty() {
-        context.push_str("\nFiles modified:\n");
-        for file in files_modified.iter().take(10) {
-            context.push_str(&format!("- {file}\n"));
-        }
-    }
+    let context = build_title_context(
+        &session.project_name,
+        session.summary.as_deref(),
+        &user_requests,
+    );
 
     let prompt = format!(
-        "Based on this Claude Code session, generate a VERY SHORT summary (max 60 chars).\n\
-        Format: Brief description of what was done (e.g. \"Fix login bug and add tests\")\n\
-        Use emoji if appropriate. Reply with ONLY the summary, nothing else.\n\n\
+        "Based on this Claude Code session, generate a VERY SHORT title (max 60 chars)\n\
+        in the same language as the session. Prefer the session recap when present;\n\
+        otherwise infer from the user requests. Format: a brief noun phrase naming\n\
+        what the session is about. Reply with ONLY the title, nothing else.\n\n\
         ---\n{context}\n---"
     );
 
@@ -697,44 +722,26 @@ pub(crate) fn regenerate_jsonl_summary(
         return Err(format!("claude error: {}", stderr.trim()));
     }
 
-    let summary = if unicode_width::UnicodeWidthStr::width(summary.as_str()) > 80 {
-        let truncated = crate::ui::truncate_to_display_width(&summary, 77);
-        format!("{truncated}...")
-    } else {
-        summary
-    };
-    Ok(summary)
+    // `truncate_with_ellipsis` is width-aware and no-ops when it fits.
+    Ok(crate::text::truncate_with_ellipsis(&summary, 80))
 }
 
-pub(crate) fn update_jsonl_summary(
+// Appends a `type: "custom-title"` row keyed by `sessionId` — the same shape
+// Claude Code's `/rename` writes and the resume picker reads. Append-only and
+// last-wins, so the latest row is the active title (matching `display_title`'s
+// reverse-walk read). Unlike `summary`, no leafUuid scan is needed.
+pub(crate) fn update_jsonl_custom_title(
     file_path: &std::path::Path,
-    new_summary: &str,
+    session_id: &str,
+    title: &str,
 ) -> Result<(), String> {
     use std::fs::OpenOptions;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::Write;
 
-    let file = std::fs::File::open(file_path).map_err(|e| format!("Failed to open file: {e}"))?;
-    let reader = BufReader::new(file);
-
-    let mut last_leaf_uuid: Option<String> = None;
-
-    for line_result in reader.lines() {
-        let line = line_result.map_err(|e| format!("Read error: {e}"))?;
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
-            && value.get("uuid").is_some()
-        {
-            last_leaf_uuid = value
-                .get("uuid")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
-        }
-    }
-
-    let leaf_uuid = last_leaf_uuid.unwrap_or_default();
     let new_entry = serde_json::json!({
-        "type": "summary",
-        "summary": new_summary,
-        "leafUuid": leaf_uuid
+        "type": "custom-title",
+        "customTitle": title,
+        "sessionId": session_id,
     });
 
     let mut file = OpenOptions::new()
@@ -754,6 +761,39 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+
+    #[test]
+    fn title_context_leads_with_recap_and_omits_files() {
+        let reqs = vec!["fix the parser".to_string(), "add a test".to_string()];
+        let ctx = build_title_context("myproj", Some("Refactored the JSONL parser"), &reqs);
+        assert!(ctx.contains("Project: myproj"));
+        assert!(ctx.contains("Session recap:\nRefactored the JSONL parser"));
+        assert!(ctx.contains("- fix the parser"));
+        // Files are intentionally not fed to the title prompt.
+        assert!(!ctx.contains("Files modified"));
+        // Recap precedes the user requests so the model weights it first.
+        assert!(ctx.find("Session recap").unwrap() < ctx.find("User requests").unwrap());
+    }
+
+    #[test]
+    fn title_context_without_summary_falls_back_to_requests() {
+        let reqs: Vec<String> = (0..8).map(|i| format!("request number {i}")).collect();
+        let ctx = build_title_context("p", None, &reqs);
+        assert!(!ctx.contains("Session recap"));
+        // First 3 + last 2 = 5 lines: opening ask AND final direction, never
+        // just the opening — a long session's title must reflect where it ended.
+        assert_eq!(ctx.matches("- request number").count(), 5);
+        assert!(ctx.contains("request number 0"), "keeps the opening");
+        assert!(ctx.contains("request number 7"), "keeps the last");
+        assert!(!ctx.contains("request number 4"), "drops the middle");
+    }
+
+    #[test]
+    fn sample_title_requests_passes_short_lists_whole() {
+        let reqs: Vec<String> = (0..4).map(|i| i.to_string()).collect();
+        let sampled: Vec<&String> = sample_title_requests(&reqs);
+        assert_eq!(sampled.len(), 4, "<=5 requests pass through unchanged");
+    }
 
     use std::sync::atomic::{AtomicU64, Ordering};
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -778,6 +818,31 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_file(&self.0).ok();
         }
+    }
+
+    #[test]
+    fn update_jsonl_custom_title_appends_a_custom_title_row() {
+        let tmp = TempFile::new("ccsight_custom_title");
+        tmp.write_jsonl(&[serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "hello"}
+        })]);
+
+        update_jsonl_custom_title(tmp.path(), "sess-123", "セッションの要約").unwrap();
+
+        let lines: Vec<String> = std::fs::read_to_string(tmp.path())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // Append-only: the original user row is preserved, title row added last.
+        assert_eq!(lines.len(), 2, "append must not rewrite existing rows");
+        let row: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(row["type"], "custom-title");
+        assert_eq!(row["customTitle"], "セッションの要約");
+        assert_eq!(row["sessionId"], "sess-123");
+        // Exactly the 3-key shape Claude Code's /rename writes — no extra fields.
+        assert_eq!(row.as_object().unwrap().len(), 3);
     }
 
     #[test]

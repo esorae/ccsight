@@ -12,7 +12,7 @@ use crate::{ConversationMessage, pins, search};
 /// Canonical text-input field. `cursor` is a CHAR index translated via
 /// `char_indices`, so multi-byte input (CJK / emoji) won't panic on
 /// non-char-boundary slicing. Lint #15 enforces (no raw `.remove(cursor)`).
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct TextInput {
     pub text: String,
     pub cursor: usize,
@@ -103,6 +103,34 @@ impl TextInput {
     }
 }
 
+/// Which text field currently has focus. `active_text_input` resolves it once
+/// so typed and pasted text share one routing decision instead of two
+/// divergent `Event::Key` / `Event::Paste` branches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputKind {
+    Title,
+    Search,
+    Filter,
+    PaneSearch,
+}
+
+impl InputKind {
+    /// The per-field character policy, shared by typing and paste so they can't
+    /// diverge. Returns the char to insert, or None to drop it.
+    pub fn sanitize_input_char(self, c: char) -> Option<char> {
+        match self {
+            // Custom date range accepts only digits and the `YYYY-MM-DD` separators.
+            InputKind::Filter => (c.is_ascii_digit() || c == '-' || c == '.').then_some(c),
+            // Single-line title: fold control chars (newlines/tabs) to spaces so
+            // a multi-line paste stays one line.
+            InputKind::Title => Some(if c.is_control() { ' ' } else { c }),
+            // Search fields take text as-is but never a control char (typing
+            // can't produce one; a pasted newline would corrupt the query).
+            InputKind::Search | InputKind::PaneSearch => (!c.is_control()).then_some(c),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Dashboard,
@@ -112,6 +140,13 @@ pub enum Tab {
     /// Sourced from `~/.claude/sessions/<pid>.json` (active) and
     /// `~/.claude/projects/**/*.jsonl` mtime (recently paused).
     Live,
+}
+
+impl Tab {
+    /// Tab-order source of truth for anything that iterates tabs (cycling,
+    /// the render property test). `tab_all_lists_every_variant` fails to
+    /// compile when a variant is added without extending this.
+    pub const ALL: [Tab; 4] = [Tab::Dashboard, Tab::Daily, Tab::Insights, Tab::Live];
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,22 +159,88 @@ pub enum ConvListMode {
     Live,
 }
 
+/// Which Live-tab panes are shown. `v` cycles Split → ActiveOnly → PausedOnly.
+/// The full-screen modes let one list use the whole tab; the selection cursor
+/// is confined to the visible pane's range (see `live_selectable_range`).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum LivePaneMode {
+    #[default]
+    Split,
+    ActiveOnly,
+    PausedOnly,
+}
+
+/// Where closing the title editor lands. Not `Box<ActivePopup>`: only
+/// popups that offer `t` are valid return targets, and the closed set
+/// keeps restore trivially correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitleEditReturn {
+    #[default]
+    Root,
+    Detail,
+    Summary,
+}
+
+impl TitleEditReturn {
+    pub(crate) fn restore(self) -> ActivePopup {
+        match self {
+            TitleEditReturn::Root => ActivePopup::None,
+            TitleEditReturn::Detail => ActivePopup::Detail,
+            TitleEditReturn::Summary => ActivePopup::Summary { scroll: 0 },
+        }
+    }
+}
+
 /// The single modal overlay currently shown, or `None`. Exactly one popup
 /// at a time — "two open at once" is unrepresentable, and the dismiss /
-/// guard sites match exhaustively so a new variant forces a decision. Pane
-/// view / search / breakdown-focus are separate axes, not popups here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// guard sites match exhaustively so a new variant forces a decision.
+/// Per-open state (scroll / input / target) lives IN the variant (close
+/// resets it); cross-open caches and panel-shared state stay on `AppState`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ActivePopup {
     #[default]
     None,
-    Help,
-    ProjectDetail,
-    Summary,
+    /// Scroll offset lives in the variant so closing the popup resets it
+    /// by construction — the pattern every popup's satellite state
+    /// migrates toward.
+    Help {
+        scroll: u16,
+    },
+    ProjectDetail {
+        path: String,
+        scroll: usize,
+    },
+    /// Body scroll only — `summary_content` / `summary_type` stay on
+    /// AppState: they cache an AI generation (real API cost) that must
+    /// survive close/reopen.
+    Summary {
+        scroll: usize,
+    },
     Detail,
     DashboardDetail,
-    InsightsDetail,
-    FilterPopup,
-    ProjectPopup,
+    InsightsDetail {
+        scroll: usize,
+    },
+    FilterPopup {
+        selected: usize,
+        input_mode: bool,
+        input: TextInput,
+        input_error: bool,
+    },
+    ProjectPopup {
+        selected: usize,
+        scroll: usize,
+    },
+    /// Free-text editor for a session's custom title. Enter saves the
+    /// typed text as a `custom-title` row for `path`; empty Enter is
+    /// rejected and `Ctrl+R` AI-generates instead. Save / cancel / AI all
+    /// restore `return_to`, so an editor opened from a popup lands back
+    /// there instead of dropping the user to the root view.
+    TitleEdit {
+        input: TextInput,
+        path: std::path::PathBuf,
+        return_to: TitleEditReturn,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +370,35 @@ impl PeriodFilter {
 }
 
 #[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn tab_all_lists_every_variant() {
+        // The exhaustive match is the enforcement: a new variant stops
+        // compiling here instead of silently dropping out of `ALL` — and out
+        // of every consumer that iterates it, including the render property.
+        for tab in Tab::ALL {
+            match tab {
+                Tab::Dashboard | Tab::Daily | Tab::Insights | Tab::Live => {}
+            }
+        }
+        let mut seen: Vec<usize> = Tab::ALL
+            .iter()
+            .map(|t| match t {
+                Tab::Dashboard => 0,
+                Tab::Daily => 1,
+                Tab::Insights => 2,
+                Tab::Live => 3,
+            })
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), Tab::ALL.len(), "ALL repeats a variant");
+    }
+}
+
+#[cfg(test)]
 mod period_filter_tests {
     use super::*;
 
@@ -299,6 +429,58 @@ mod period_filter_tests {
         assert!(PeriodFilter::parse_custom("abc").is_none());
         assert!(PeriodFilter::parse_custom("2025-13").is_none());
         assert!(PeriodFilter::parse_custom("2025-02-30").is_none()); // lint-ok: date-literal
+    }
+}
+
+#[cfg(test)]
+mod resume_dir_tests {
+    use super::*;
+    use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+
+    #[test]
+    fn resume_dir_resolves_only_verified_existing_dirs() {
+        let real = std::env::temp_dir().join(format!("ccsight-vpp-{}", std::process::id()));
+        std::fs::create_dir_all(&real).unwrap();
+        let real_str = real.to_string_lossy().into_owned();
+        let slug = crate::infrastructure::live_sessions::official_project_slug(&real_str);
+
+        let mut session = make_session("p", None, None);
+        session.file_path = PathBuf::from(format!("/x/projects/{slug}/abc.jsonl"));
+        session.verified_cwd = Some(real_str.clone());
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let groups = vec![make_daily_group(date, vec![session])];
+
+        let map = build_verified_project_paths(&groups, vec!["/nonexistent/extra".to_string()]);
+        assert_eq!(map.get(&slug).map(PathBuf::as_path), Some(real.as_path()));
+
+        let mut state = make_test_app_state(Vec::new());
+        state.verified_project_paths = map;
+        // Verified witness + dir exists → resolves.
+        assert_eq!(
+            state.resume_dir(std::path::Path::new(&format!(
+                "/x/projects/{slug}/abc.jsonl"
+            ))),
+            Some(real.clone())
+        );
+        // Extra witnesses (claude.json keys) fill their slug, but a deleted
+        // dir still refuses at use time — cd would fail anyway.
+        let extra_slug =
+            crate::infrastructure::live_sessions::official_project_slug("/nonexistent/extra");
+        assert!(state.verified_project_paths.contains_key(&extra_slug));
+        assert!(
+            state
+                .resume_dir(std::path::Path::new(&format!(
+                    "/x/projects/{extra_slug}/z.jsonl"
+                )))
+                .is_none()
+        );
+        // No witness at all → None (never a guess).
+        assert!(
+            state
+                .resume_dir(std::path::Path::new("/x/projects/-unknown-dir/z.jsonl"))
+                .is_none()
+        );
+        std::fs::remove_dir_all(&real).ok();
     }
 }
 
@@ -398,33 +580,88 @@ pub const MIN_PANE_WIDTH: u16 = 40;
 pub const SESSION_LIST_WIDTH: u16 = 28;
 pub const SCROLL_LINES: usize = 5;
 
-#[derive(Default)]
 pub struct ConversationPane {
-    pub messages: Vec<ConversationMessage>,
+    /// `Arc` so the load channel and the parse cache hand the same buffer
+    /// around without deep-copying it; the pane only ever replaces it
+    /// wholesale (never mutates in place).
+    pub messages: std::sync::Arc<Vec<ConversationMessage>>,
     pub scroll: usize,
     pub message_lines: Vec<(usize, usize)>,
-    pub rendered: Option<(
-        Vec<Line<'static>>,
-        Vec<(usize, usize)>,
-        Vec<bool>,
-        Option<usize>,
-    )>,
+    pub rendered: Option<(Vec<Line<'static>>, Vec<(usize, usize)>, Vec<bool>)>,
     pub file_path: Option<PathBuf>,
     pub last_modified: Option<std::time::SystemTime>,
     pub reload_check: Option<std::time::Instant>,
     pub loading: bool,
-    pub load_task: Option<mpsc::Receiver<Vec<ConversationMessage>>>,
+    pub load_task: Option<mpsc::Receiver<std::sync::Arc<Vec<ConversationMessage>>>>,
     pub last_width: Option<u16>,
     pub selected_message: usize,
     pub focused_timestamp: Option<String>,
+    /// Compact mode: one summary line per message, expand individual messages
+    /// inline (accordion). Default for new panes; `c` toggles the whole pane
+    /// to the classic full-transcript reading view.
+    pub compact: bool,
+    /// Message indices expanded to full text while `compact`. Independent of
+    /// the cursor — several messages can be open at once.
+    pub expanded: std::collections::HashSet<usize>,
     pub search_mode: bool,
     pub search_input: TextInput,
-    pub search_matches: Vec<usize>,
+    /// `(message_idx, occurrence_idx)` per query occurrence, computed over
+    /// the LOGICAL message text — collapsed compact messages are searchable
+    /// without forcing the whole pane to full mode.
+    pub search_matches: Vec<(usize, usize)>,
     pub search_current: usize,
     pub search_saved_scroll: Option<(usize, usize)>,
+    /// Message auto-expanded because the current match sits inside it
+    /// (peek). Collapses back when the cursor moves on; user-expanded
+    /// messages are never tracked here, so they persist.
+    pub peek_expanded: Option<usize>,
+    /// Deferred jump: the draw fn (which knows line layout + viewport
+    /// height) centers the current match and clears this flag.
+    pub pending_search_scroll: bool,
+    /// Reopened bar carries the previous query "selected" — the first
+    /// typed char replaces it wholesale (VS Code find-widget behavior).
+    pub search_select_all: bool,
     // Last viewport height seen by the draw function. Used by j/k to scroll
     // inside a tall message when no next/prev message exists.
     pub last_visible_height: Option<usize>,
+    /// Hash of the inputs the last `rendered` cache was built from (mode,
+    /// expanded set, focused message). The draw re-renders when it changes.
+    pub rendered_sig: u64,
+}
+
+// Manual `Default` (not derived) solely so `compact` starts `true`: compact is
+// the intended default for every pane, and a derived bool would silently give
+// `false`. Listing all fields makes the compiler flag a new field here, so the
+// two construction paths (this and `load_from`) can't drift on the default.
+impl Default for ConversationPane {
+    fn default() -> Self {
+        Self {
+            messages: std::sync::Arc::new(Vec::new()),
+            scroll: 0,
+            message_lines: Vec::new(),
+            rendered: None,
+            file_path: None,
+            last_modified: None,
+            reload_check: None,
+            loading: false,
+            load_task: None,
+            last_width: None,
+            selected_message: 0,
+            focused_timestamp: None,
+            compact: true,
+            expanded: std::collections::HashSet::new(),
+            search_mode: false,
+            search_input: TextInput::default(),
+            search_matches: Vec::new(),
+            search_current: 0,
+            search_saved_scroll: None,
+            peek_expanded: None,
+            pending_search_scroll: false,
+            search_select_all: false,
+            last_visible_height: None,
+            rendered_sig: 0,
+        }
+    }
 }
 
 impl ConversationPane {
@@ -441,7 +678,7 @@ impl ConversationPane {
     }
 
     pub fn clear(&mut self) {
-        self.messages.clear();
+        self.messages = std::sync::Arc::new(Vec::new());
         self.scroll = 0;
         self.message_lines.clear();
         self.rendered = None;
@@ -459,6 +696,12 @@ impl ConversationPane {
         self.search_current = 0;
         self.last_visible_height = None;
         self.search_saved_scroll = None;
+        self.expanded.clear();
+        self.peek_expanded = None;
+        self.pending_search_scroll = false;
+        self.search_select_all = false;
+        // `compact` intentionally NOT reset — clear() reuses the pane for a
+        // new session and the user's view-mode preference should persist.
     }
 }
 
@@ -603,15 +846,22 @@ pub struct AppState {
     /// "(M/N)" position indicator in the past-day header. Refreshed
     /// alongside `live_past_sessions`.
     pub live_past_snapshot_total: usize,
-    /// Per-project drilldown popup. Opened from the Projects detail popup
-    /// (panel 1) via Enter on the focused row. `project_detail_path` is the
-    /// raw project_name (matching `SessionInfo::project_name` for lookup).
-    pub project_detail_path: String,
-    pub project_detail_scroll: usize,
-    pub help_scroll: u16,
+    /// Memoized lifetime cumulative per session, rebuilt only when
+    /// `original_daily_groups` changes (in `apply_loaded_data`). The Live tab
+    /// indexes this each frame instead of re-folding every slice (a pricing
+    /// lookup per slice) on every draw. Owned (a borrowed map can't be stored
+    /// alongside the groups it points into).
+    pub(crate) live_cumulative:
+        std::collections::HashMap<std::path::PathBuf, crate::aggregator::SessionCumulative>,
+    /// Live-tab pane layout: split, or one list full-screen. Cycled by `v`.
+    pub live_pane_mode: LivePaneMode,
+    /// Single source of truth for a session's displayed title, keyed by
+    /// `file_path`. Built from the newest-day slice at load; a `t` rename
+    /// updates the one entry so every surface (Live / Daily / detail / conv)
+    /// reflects it immediately instead of waiting for the next reload.
+    pub(crate) session_titles: std::collections::HashMap<std::path::PathBuf, String>,
     pub show_conversation: bool,
     pub summary_content: String,
-    pub summary_scroll: usize,
     pub summary_type: Option<SummaryType>,
     pub daily_breakdown_focus: bool,
     pub daily_breakdown_scroll: usize,
@@ -629,10 +879,14 @@ pub struct AppState {
     /// `dashboard_scroll`. Vim `scrolloff` pattern; mirrors MCP server detail.
     pub dashboard_viewport: [usize; 7],
     /// Daily Activity detail popup (panel 5) view toggle: `false` = per-day
-    /// bars (the historical default), `true` = ISO-week aggregation. Toggled
+    /// bars, `true` = ISO-week aggregation. Toggled
     /// by `w` inside the popup; persisted for the session so reopening keeps
     /// the chosen mode.
     pub activity_view_weekly: bool,
+    /// Costs / Daily-Activity detail popups: `false` (default) lists only active
+    /// days (`daily_costs`); `true` fills every calendar day from the oldest
+    /// active date through today so idle gaps show. Toggled by `z` in the popup.
+    pub show_empty_days: bool,
     /// Active section in Tools detail popup: 0=Tools (Built-in + MCP),
     /// 1=Skills, 2=Commands, 3=Subagents. Tools merges Built-in and MCP since
     /// both are tools the assistant calls; Subagents are dispatcher-tier meta-
@@ -652,6 +906,10 @@ pub struct AppState {
     pub mcp_selected_tool: Option<usize>,
     pub search_mode: bool,
     pub search_input: TextInput,
+    /// Restored query is "selected" (reverse video): the next typed char /
+    /// paste replaces it wholesale. Same semantics as the pane search's
+    /// per-pane flag.
+    pub search_select_all: bool,
     pub search_results: Vec<search::SearchResult>,
     pub search_selected: usize,
     pub search_task: Option<(mpsc::Receiver<Vec<search::SearchResult>>, String)>,
@@ -703,7 +961,6 @@ pub struct AppState {
     pub animation_frame: usize,
     pub retention_warning: Option<RetentionWarning>,
     pub retention_warning_dismissed: bool,
-    pub insights_detail_scroll: usize,
     /// Vertical scroll offset for the Session/Conv detail popup (`show_detail`).
     /// Reset to 0 each time the popup is (re)opened.
     pub session_detail_scroll: usize,
@@ -723,19 +980,20 @@ pub struct AppState {
     pub session_list_hidden: bool,
     pub layout: LayoutAreas,
     pub period_filter: PeriodFilter,
-    pub filter_popup_selected: usize,
-    pub filter_input_mode: bool,
-    pub filter_input: TextInput,
-    pub filter_input_error: bool,
+    /// Free-text buffer for the `TitleEdit` popup, and the target session's
+    /// JSONL path (the `custom-title` write is keyed by its filename stem).
     pub project_filter: Option<String>,
-    pub project_popup_selected: usize,
-    pub project_popup_scroll: usize,
     pub project_list: Vec<(String, u64, NaiveDate)>,
     /// Pre-computed disambiguated display labels keyed by full project_name.
     /// Built alongside `project_list` so render paths can append a `(parent)`
     /// suffix on basename collision without re-scanning `project_list` per call.
     pub project_labels: std::collections::HashMap<String, String>,
     pub original_daily_groups: Vec<DailyGroup>,
+    /// Storage-dir slug → verified real path: the only cd target `claude -r`
+    /// can resolve for sessions stored under that dir. Rebuilt on every data
+    /// load from transcript witnesses + `~/.claude.json` project keys; the
+    /// live poll adds pid-file cwds as further witnesses.
+    pub verified_project_paths: std::collections::HashMap<String, PathBuf>,
     pub original_daily_costs: Vec<(NaiveDate, f64)>,
     pub original_stats: Stats,
     pub original_total_cost: f64,
@@ -758,7 +1016,45 @@ pub struct AppState {
     pub dashboard_languages_sort: RankSort,
 }
 
+/// Fold every session's verified cwd into a storage-dir-slug → path map,
+/// then let `extra_paths` (`~/.claude.json` project keys) fill dirs whose
+/// own transcripts carry no matching cwd (e.g. summary-only files). Every
+/// candidate self-verifies: its official slug IS the map key.
+pub(crate) fn build_verified_project_paths(
+    groups: &[DailyGroup],
+    extra_paths: Vec<String>,
+) -> std::collections::HashMap<String, PathBuf> {
+    let mut map = std::collections::HashMap::new();
+    for group in groups {
+        for s in &group.sessions {
+            if let (Some(cwd), Some(dir)) = (
+                &s.verified_cwd,
+                s.file_path.parent().and_then(|p| p.file_name()),
+            ) && let Some(dir) = dir.to_str()
+            {
+                map.entry(dir.to_string())
+                    .or_insert_with(|| PathBuf::from(cwd));
+            }
+        }
+    }
+    for path in extra_paths {
+        let slug = crate::infrastructure::live_sessions::official_project_slug(&path);
+        map.entry(slug).or_insert_with(|| PathBuf::from(path));
+    }
+    map
+}
+
 impl AppState {
+    /// The only cd target `claude -r <id>` can resolve for this transcript:
+    /// the real path whose official slug equals the parent dir name. `None`
+    /// when no witness verified or the dir is gone — callers say so honestly
+    /// instead of guessing (a wrong cd silently fails to find the session).
+    pub(crate) fn resume_dir(&self, jsonl_path: &std::path::Path) -> Option<PathBuf> {
+        let dir = jsonl_path.parent()?.file_name()?.to_str()?;
+        let path = self.verified_project_paths.get(dir)?;
+        path.is_dir().then(|| path.clone())
+    }
+
     /// Show a transient toast. Sets message and timestamp together so a caller
     /// can't leave `toast_time` unset (which would strand the toast on screen).
     pub fn toast(&mut self, msg: impl Into<String>) {
@@ -767,13 +1063,142 @@ impl AppState {
     }
 
     pub fn show_help(&self) -> bool {
-        self.active_popup == ActivePopup::Help
+        matches!(self.active_popup, ActivePopup::Help { .. })
+    }
+    pub(crate) fn help_scroll(&self) -> u16 {
+        match &self.active_popup {
+            ActivePopup::Help { scroll } => *scroll,
+            _ => 0,
+        }
+    }
+    pub(crate) fn project_detail_path(&self) -> &str {
+        match &self.active_popup {
+            ActivePopup::ProjectDetail { path, .. } => path,
+            _ => "",
+        }
+    }
+    pub(crate) fn project_detail_scroll(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::ProjectDetail { scroll, .. } => *scroll,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_project_detail_scroll(&mut self, scroll: usize) {
+        if let ActivePopup::ProjectDetail { scroll: s, .. } = &mut self.active_popup {
+            *s = scroll;
+        }
+    }
+    pub(crate) fn project_popup_selected(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::ProjectPopup { selected, .. } => *selected,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_project_popup_selected(&mut self, selected: usize) {
+        if let ActivePopup::ProjectPopup { selected: s, .. } = &mut self.active_popup {
+            *s = selected;
+        }
+    }
+    pub(crate) fn project_popup_scroll(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::ProjectPopup { scroll, .. } => *scroll,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_project_popup_scroll(&mut self, scroll: usize) {
+        if let ActivePopup::ProjectPopup { scroll: s, .. } = &mut self.active_popup {
+            *s = scroll;
+        }
+    }
+    pub(crate) fn summary_scroll(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::Summary { scroll } => *scroll,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_summary_scroll(&mut self, scroll: usize) {
+        if let ActivePopup::Summary { scroll: s } = &mut self.active_popup {
+            *s = scroll;
+        }
+    }
+    pub(crate) fn insights_detail_scroll(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::InsightsDetail { scroll } => *scroll,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_insights_detail_scroll(&mut self, scroll: usize) {
+        if let ActivePopup::InsightsDetail { scroll: s } = &mut self.active_popup {
+            *s = scroll;
+        }
+    }
+    pub(crate) fn filter_popup_selected(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::FilterPopup { selected, .. } => *selected,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_filter_popup_selected(&mut self, selected: usize) {
+        if let ActivePopup::FilterPopup { selected: s, .. } = &mut self.active_popup {
+            *s = selected;
+        }
+    }
+    pub(crate) fn filter_input_mode(&self) -> bool {
+        matches!(
+            self.active_popup,
+            ActivePopup::FilterPopup {
+                input_mode: true,
+                ..
+            }
+        )
+    }
+    pub(crate) fn set_filter_input_mode(&mut self, mode: bool) {
+        if let ActivePopup::FilterPopup { input_mode, .. } = &mut self.active_popup {
+            *input_mode = mode;
+        }
+    }
+    pub(crate) fn filter_input(&self) -> Option<&TextInput> {
+        match &self.active_popup {
+            ActivePopup::FilterPopup { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+    pub(crate) fn filter_input_mut(&mut self) -> Option<&mut TextInput> {
+        match &mut self.active_popup {
+            ActivePopup::FilterPopup { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+    pub(crate) fn filter_input_error(&self) -> bool {
+        matches!(
+            self.active_popup,
+            ActivePopup::FilterPopup {
+                input_error: true,
+                ..
+            }
+        )
+    }
+    pub(crate) fn set_filter_input_error(&mut self, error: bool) {
+        if let ActivePopup::FilterPopup { input_error, .. } = &mut self.active_popup {
+            *input_error = error;
+        }
+    }
+    pub(crate) fn title_input(&self) -> Option<&TextInput> {
+        match &self.active_popup {
+            ActivePopup::TitleEdit { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+    pub(crate) fn set_help_scroll(&mut self, scroll: u16) {
+        if let ActivePopup::Help { scroll: s } = &mut self.active_popup {
+            *s = scroll;
+        }
     }
     pub fn show_project_detail(&self) -> bool {
-        self.active_popup == ActivePopup::ProjectDetail
+        matches!(self.active_popup, ActivePopup::ProjectDetail { .. })
     }
     pub fn show_summary(&self) -> bool {
-        self.active_popup == ActivePopup::Summary
+        matches!(self.active_popup, ActivePopup::Summary { .. })
     }
     pub fn show_detail(&self) -> bool {
         self.active_popup == ActivePopup::Detail
@@ -782,13 +1207,61 @@ impl AppState {
         self.active_popup == ActivePopup::DashboardDetail
     }
     pub fn show_insights_detail(&self) -> bool {
-        self.active_popup == ActivePopup::InsightsDetail
+        matches!(self.active_popup, ActivePopup::InsightsDetail { .. })
     }
     pub fn show_filter_popup(&self) -> bool {
-        self.active_popup == ActivePopup::FilterPopup
+        matches!(self.active_popup, ActivePopup::FilterPopup { .. })
     }
+
+    pub fn show_title_edit(&self) -> bool {
+        matches!(self.active_popup, ActivePopup::TitleEdit { .. })
+    }
+
+    /// Update the one cached title so a rename shows on every surface at once.
+    pub(crate) fn set_session_title(&mut self, path: &std::path::Path, title: &str) {
+        self.session_titles
+            .insert(path.to_path_buf(), title.to_string());
+    }
+
+    /// Single focus-resolution point for text entry: the field receiving typed/
+    /// pasted chars plus its kind. Priority mirrors key dispatch — blocking
+    /// popup over inline search over pane search. A new text field needs one arm
+    /// here, else paste routing (which reads this) silently drops it.
+    pub(crate) fn active_text_input(&mut self) -> Option<(&mut TextInput, InputKind)> {
+        // Two phases (decide the kind read-only, then borrow the one field)
+        // because two popup variants own their inputs — chained `if let
+        // &mut` arms would hold overlapping mutable borrows.
+        let kind = if matches!(self.active_popup, ActivePopup::TitleEdit { .. }) {
+            InputKind::Title
+        } else if self.search_mode {
+            InputKind::Search
+        } else if self.filter_input_mode() {
+            InputKind::Filter
+        } else if let Some(idx) = self.active_pane_index
+            && self.panes.get(idx).is_some_and(|p| p.search_mode)
+        {
+            InputKind::PaneSearch
+        } else {
+            return None;
+        };
+        match kind {
+            InputKind::Title => match &mut self.active_popup {
+                ActivePopup::TitleEdit { input, .. } => Some((input, InputKind::Title)),
+                _ => None,
+            },
+            InputKind::Search => Some((&mut self.search_input, InputKind::Search)),
+            InputKind::Filter => self.filter_input_mut().map(|i| (i, InputKind::Filter)),
+            InputKind::PaneSearch => {
+                let idx = self.active_pane_index?;
+                self.panes
+                    .get_mut(idx)
+                    .map(|p| (&mut p.search_input, InputKind::PaneSearch))
+            }
+        }
+    }
+
     pub fn show_project_popup(&self) -> bool {
-        self.active_popup == ActivePopup::ProjectPopup
+        matches!(self.active_popup, ActivePopup::ProjectPopup { .. })
     }
 
     /// Single source of truth for "active days" — calendar days with at
@@ -972,7 +1445,6 @@ impl AppState {
             active_popup: ActivePopup::None,
             session_detail_override: None,
             session_detail_live_extra: None,
-            help_scroll: 0,
             live_active: Vec::new(),
             live_paused: Vec::new(),
             live_selected: 0,
@@ -986,11 +1458,11 @@ impl AppState {
             live_past_sessions: Vec::new(),
             live_past_snapshot_meta: None,
             live_past_snapshot_total: 0,
-            project_detail_path: String::new(),
-            project_detail_scroll: 0,
+            live_cumulative: std::collections::HashMap::new(),
+            live_pane_mode: LivePaneMode::Split,
+            session_titles: std::collections::HashMap::new(),
             show_conversation: false,
             summary_content: String::new(),
-            summary_scroll: 0,
             summary_type: None,
             daily_breakdown_focus: false,
             daily_breakdown_scroll: 0,
@@ -1005,12 +1477,14 @@ impl AppState {
             dashboard_scroll: [0; 7],
             dashboard_viewport: [0; 7],
             activity_view_weekly: false,
+            show_empty_days: false,
             tools_detail_section: 0,
             mcp_expanded_servers: std::collections::HashSet::new(),
             mcp_selected_server: 0,
             mcp_selected_tool: None,
             search_mode: false,
             search_input: TextInput::default(),
+            search_select_all: false,
             search_results: Vec::new(),
             search_selected: 0,
             search_task: None,
@@ -1040,7 +1514,6 @@ impl AppState {
             animation_frame: 0,
             retention_warning: crate::infrastructure::check_cleanup_period(),
             retention_warning_dismissed: false,
-            insights_detail_scroll: 0,
             session_detail_scroll: 0,
             session_detail_recent: None,
             session_detail_recent_task: None,
@@ -1053,16 +1526,11 @@ impl AppState {
             session_list_hidden: false,
             layout: LayoutAreas::default(),
             period_filter: PeriodFilter::All,
-            filter_popup_selected: 0,
-            filter_input_mode: false,
-            filter_input: TextInput::default(),
-            filter_input_error: false,
             project_filter: None,
-            project_popup_selected: 0,
-            project_popup_scroll: 0,
             project_list: Vec::new(),
             project_labels: std::collections::HashMap::new(),
             original_daily_groups: Vec::new(),
+            verified_project_paths: std::collections::HashMap::new(),
             original_daily_costs: Vec::new(),
             original_stats: crate::aggregator::Stats::default(),
             original_total_cost: 0.0,
@@ -1080,7 +1548,6 @@ impl AppState {
         self.generating_summary = false;
         self.summary_task = None;
         self.summary_content.clear();
-        self.summary_scroll = 0;
         self.summary_type = None;
     }
 
@@ -1091,6 +1558,21 @@ impl AppState {
         self.original_aggregated_model_tokens = data.aggregated_model_tokens.clone();
         self.original_daily_groups = data.daily_groups.clone();
         self.original_daily_costs = data.daily_costs.clone();
+        // Rebuild the Live tab's cumulative cache once here (the only place the
+        // groups change) so per-frame draws never re-fold every slice.
+        self.live_cumulative =
+            crate::aggregator::cumulative_owned_by_path(&self.original_daily_groups);
+        // Resolve each session's display title from its newest-day slice once —
+        // the single source every surface reads (a rename updates just the one
+        // entry, so it shows everywhere without a reload).
+        self.session_titles = crate::aggregator::meta_by_path(&self.original_daily_groups)
+            .into_iter()
+            .filter_map(|(p, m)| m.display_title().map(|t| (p.to_path_buf(), t.to_string())))
+            .collect();
+        self.verified_project_paths = build_verified_project_paths(
+            &self.original_daily_groups,
+            crate::infrastructure::live_sessions::claude_json_project_paths(),
+        );
 
         self.stats = data.stats;
         self.total_cost = data.cost;
@@ -1232,7 +1714,7 @@ impl AppState {
             self.rebuild_filtered_stats();
         }
 
-        // Compute against unfiltered groups so "stale (>30d)" stays a
+        // Compute against unfiltered groups so "stale (≥30d)" stays a
         // wall-clock predicate regardless of the active period filter.
         self.mcp_status = crate::infrastructure::compute_mcp_status(&self.original_daily_groups);
 
@@ -1250,6 +1732,12 @@ impl AppState {
     fn rebuild_filtered_stats(&mut self) {
         use chrono::Datelike;
         let mut stats = Stats::default();
+        // `daily_groups` repeats a session once per active day. `total_sessions_count`
+        // is a distinct-session count (matching the unfiltered StatsAggregator), so
+        // dedup by path; `total_session_days` and tool adoption stay per-day (their
+        // denominators are session-days).
+        let mut seen_paths: std::collections::HashSet<&std::path::PathBuf> =
+            std::collections::HashSet::new();
 
         for group in &self.daily_groups {
             for session in &group.sessions {
@@ -1258,10 +1746,9 @@ impl AppState {
                 // project / tool / language are subagent-inclusive so
                 // filtered totals reconcile with subagent-inclusive cost.
                 if !session.is_subagent {
-                    stats.total_sessions_count += 1;
                     stats.total_session_days += 1;
-                    if session.summary.is_some() {
-                        stats.sessions_with_summary += 1;
+                    if seen_paths.insert(&session.file_path) {
+                        stats.total_sessions_count += 1;
                     }
                     crate::aggregator::StatsAggregator::add_session_adoption(
                         &mut stats,
@@ -1328,11 +1815,11 @@ impl AppState {
             }
         }
 
-        // tool_error/success counts and branch_stats are file-level aggregates
-        // not available per-session, so we use unfiltered values as
-        // approximation. When the filter resolves to zero sessions, the
-        // unfiltered numbers would render against an empty view; zero them so
-        // the success-rate row stays consistent with the rest of the metrics.
+        // tool_error/success counts are file-level aggregates not available
+        // per-session, so we use unfiltered values as approximation. When the
+        // filter resolves to zero sessions, the unfiltered numbers would
+        // render against an empty view; zero them so the success-rate row
+        // stays consistent with the rest of the metrics.
         if self.daily_groups.is_empty() {
             stats.tool_error_count = 0;
             stats.tool_success_count = 0;
@@ -1340,7 +1827,6 @@ impl AppState {
             stats.tool_error_count = self.original_stats.tool_error_count;
             stats.tool_success_count = self.original_stats.tool_success_count;
         }
-        stats.branch_stats = self.original_stats.branch_stats.clone();
 
         self.stats = stats;
     }
@@ -1511,6 +1997,69 @@ mod filtered_stats_tests {
         assert_eq!(
             entries[0].0, "Rust",
             "tokens ranks the higher-count language first"
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_routing_tests {
+    use super::*;
+    use crate::test_helpers::helpers::make_test_app_state;
+
+    #[test]
+    fn filter_char_policy_keeps_only_date_shape() {
+        for c in ['0', '9', '-', '.'] {
+            assert_eq!(InputKind::Filter.sanitize_input_char(c), Some(c), "{c:?}");
+        }
+        for c in ['a', 'f', '/', ' ', '\n'] {
+            assert_eq!(InputKind::Filter.sanitize_input_char(c), None, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn title_char_policy_folds_control_to_space() {
+        assert_eq!(InputKind::Title.sanitize_input_char('\n'), Some(' '));
+        assert_eq!(InputKind::Title.sanitize_input_char('\t'), Some(' '));
+        assert_eq!(InputKind::Title.sanitize_input_char('x'), Some('x'));
+    }
+
+    #[test]
+    fn search_char_policy_drops_control_keeps_text() {
+        assert_eq!(InputKind::Search.sanitize_input_char('\n'), None);
+        assert_eq!(InputKind::Search.sanitize_input_char('a'), Some('a'));
+        assert_eq!(InputKind::PaneSearch.sanitize_input_char('\r'), None);
+    }
+
+    #[test]
+    fn active_text_input_priority_title_over_search() {
+        // A blocking popup outranks the inline search bar, so paste while the
+        // title editor is open must not leak into the search field.
+        let mut state = make_test_app_state(Vec::new());
+        state.search_mode = true;
+        state.active_popup = ActivePopup::TitleEdit {
+            input: TextInput::default(),
+            path: std::path::PathBuf::from("/tmp/x.jsonl"),
+            return_to: crate::TitleEditReturn::Root,
+        };
+        assert_eq!(
+            state.active_text_input().map(|(_, k)| k),
+            Some(InputKind::Title)
+        );
+    }
+
+    #[test]
+    fn active_text_input_none_when_no_field_focused() {
+        let mut state = make_test_app_state(Vec::new());
+        assert!(state.active_text_input().is_none());
+        state.active_popup = ActivePopup::FilterPopup {
+            selected: 0,
+            input_mode: true,
+            input: TextInput::default(),
+            input_error: false,
+        };
+        assert_eq!(
+            state.active_text_input().map(|(_, k)| k),
+            Some(InputKind::Filter)
         );
     }
 }

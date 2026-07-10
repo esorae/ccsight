@@ -58,8 +58,14 @@
 #   43  Display truncation via text::truncate_with_ellipsis
 #   44  No bare subtraction inside `.repeat()` (bar fills)
 #   45  Toasts route through state.toast() (not raw toast_message)
+#   48  Credential-shaped literals in tracked files
 
 set -e
+
+# Every file set below is a RELATIVE `find`, and each pipes through `sort`,
+# which masks find's exit code. Run from anywhere else and all rules match
+# zero files, then report "Lint: OK" — a green gate that checked nothing.
+cd "$(dirname "$0")/.."
 
 ERRORS=0
 
@@ -69,12 +75,25 @@ ALL_RUST_FILES=$(find src -name '*.rs' -type f 2>/dev/null | sort | tr '\n' ' ')
 UI_FILES=$(find src/ui -name '*.rs' -type f 2>/dev/null | sort | tr '\n' ' ')
 # Top-level docs that may also contain text we want to scrub for leaks.
 DOC_FILES=$(ls CLAUDE.md README.md 2>/dev/null | tr '\n' ' ')
+# Scripts carry prose too (demo vocabulary, tape captions) — same leak surface.
+SCRIPT_FILES=$(find scripts examples -type f \( -name '*.py' -o -name '*.sh' -o -name '*.tape' \) 2>/dev/null | sort | tr '\n' ' ')
 
 # Single-file targets kept by name because their role is structural (entry point,
 # CLI summary helpers). If these are renamed the lints simply skip — no false
 # negatives, but the hint comments here will need updating.
 MAIN_FILE="src/main.rs"
 SUMMARY_FILE="src/summary.rs"
+
+# A layout change that empties a set must fail loudly, not pass vacuously.
+for set_name in ALL_RUST_FILES UI_FILES DOC_FILES SCRIPT_FILES; do
+  if [ -z "$(eval "echo \$$set_name" | tr -d ' ')" ]; then
+    echo "FATAL: file set $set_name is empty — every rule over it would pass vacuously"
+    exit 1
+  fi
+done
+for f in "$MAIN_FILE" "$SUMMARY_FILE"; do
+  [ -f "$f" ] || { echo "FATAL: $f missing — rules keyed to it would silently skip"; exit 1; }
+done
 
 # 1. Plain string titles (should be Span::styled)
 PLAIN_TITLES=$(grep -n '\.title("' $UI_FILES 2>/dev/null || true)
@@ -129,10 +148,10 @@ if [ -n "$MISSING_BORDER" ]; then
     ERRORS=$((ERRORS + 1))
 fi
 
-# 3. Wrong date format (%y/ with 2-digit year, %m/%d instead of %m-%d, %b locale-dependent month).
-# Scan ALL_RUST_FILES so the rule is consistent regardless of where date strings
-# live (tests, helpers, MCP tool args). Previously only UI + main.rs were covered.
-WRONG_DATES=$(grep -n '%y/' $ALL_RUST_FILES 2>/dev/null || true)
+# 3. Wrong date format (2-digit year %y- or %y/, %m/%d instead of %m-%d,
+# %b locale-dependent month). Scans ALL_RUST_FILES so the rule holds
+# regardless of where date strings live (tests, helpers, MCP tool args).
+WRONG_DATES=$(grep -nE '%y[-/]' $ALL_RUST_FILES 2>/dev/null || true)
 WRONG_SLASH=$(grep -n '%m/%d' $ALL_RUST_FILES 2>/dev/null || true)
 WRONG_LOCALE=$(grep -n '%b' $ALL_RUST_FILES 2>/dev/null || true)
 if [ -n "$WRONG_DATES" ] || [ -n "$WRONG_SLASH" ] || [ -n "$WRONG_LOCALE" ]; then
@@ -435,17 +454,17 @@ if [ -f "$DENYLIST_FILE" ]; then
     DENY_TERMS=$(grep -vE '^\s*(#|$)' "$DENYLIST_FILE" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' | grep -v '^$' || true)
     if [ -n "$DENY_TERMS" ]; then
         # Build a single ERE alternation. Escape regex meta-characters per term, then
-        # wrap each with non-alphanumeric (or string-edge) boundaries so substrings of
-        # innocent words don't fire (e.g., `esa` should match `mcp__esa__action` but
-        # not `resampled`). Treats `-`, `_`, `:` etc. as word separators.
+        # wrap each with non-alphanumeric (or string-edge) boundaries so substrings
+        # of innocent words don't fire (a listed `abc` matches `mcp__abc__tool` but
+        # not `crabcake`). Treats `-`, `_`, `:` etc. as word separators.
         ESCAPED=$(printf '%s\n' "$DENY_TERMS" | sed -E 's/[][\\.|^$*+?(){}/-]/\\&/g')
         WRAPPED=$(printf '%s\n' "$ESCAPED" | sed -E 's/^(.*)$/(^|[^A-Za-z0-9])\1([^A-Za-z0-9]|$)/')
         DENY_PATTERN=$(printf '%s\n' "$WRAPPED" | tr '\n' '|' | sed 's/|$//')
         if [ -n "$DENY_PATTERN" ]; then
-            # Scan all Rust sources + top-level docs. ALL_RUST_FILES / DOC_FILES are
-            # discovered above so newly added files are automatically covered.
+            # Scan all Rust sources + top-level docs + scripts. The file lists
+            # are discovered above so newly added files are automatically covered.
             DENY_HITS=$(grep -nE "$DENY_PATTERN" \
-                $ALL_RUST_FILES $DOC_FILES 2>/dev/null \
+                $ALL_RUST_FILES $DOC_FILES $SCRIPT_FILES 2>/dev/null \
                 | grep -v '^Binary' || true)
             if [ -n "$DENY_HITS" ]; then
                 echo "ERROR: Forbidden term(s) from .lint-forbidden-terms found in committed files."
@@ -504,10 +523,11 @@ fi
 # The TUI takes over stdout AND stderr inside ratatui's alternate screen; any
 # stray write to stderr corrupts the rendering. Allowed: `cli.rs` (--daily mode
 # never enters TUI), `main.rs` panic-hook restoration (already disables raw
-# mode), and `mcp.rs` (stdio MCP server doesn't render TUI either).
+# mode), `mcp.rs` (stdio MCP server doesn't render TUI either), and
+# `wait_run.rs` (`--wait` is a non-TUI one-shot mode like cli.rs).
 STDERR_HITS=$(grep -nE 'eprintln!|writeln!\(\s*io::stderr|\.stderr\(\)' \
     $ALL_RUST_FILES 2>/dev/null \
-    | grep -vE '^src/cli\.rs:|^src/main\.rs:|^src/mcp\.rs:' \
+    | grep -vE '^src/cli\.rs:|^src/main\.rs:|^src/mcp\.rs:|^src/wait_run\.rs:' \
     | grep -v '^[^:]*:[^:]*:\s*//' || true)
 if [ -n "$STDERR_HITS" ]; then
     echo "ERROR: stderr write outside cli.rs / main.rs / mcp.rs (corrupts TUI):"
@@ -746,7 +766,7 @@ fi
 # 28. Shell command strings must route through `posix_shell_quote`.
 # Building a shell command via `format!("cd {} && ...")` from user-derived
 # data (cwd, session_id read from JSON on disk) is a clipboard injection
-# vector. The single quoting helper lives in `src/handlers/keyboard.rs`.
+# vector. The single quoting helper lives in `src/shell.rs`.
 SHELL_FORMAT=$(grep -rn 'format!("cd {' src/ 2>/dev/null | \
     grep -v 'posix_shell_quote' | grep -v 'lint-ok: shell-quote' | \
     grep -v 'src/shell.rs' || true)
@@ -1022,8 +1042,8 @@ fi
 # used X" / "previously the popup hid Y" / "was renamed from Z" force the
 # reader to know a prior state the file no longer reflects. Rephrase the
 # rule positively, in terms a reader can verify against current code. Past
-# context belongs in the commit message / PR description.
-# Test docstrings inside `mod tests` and `#[cfg(test)]` blocks are exempt.
+# context belongs in the commit message / PR description. Applies to test
+# blocks too (only the captured-value rule #23 exempts `mod tests`).
 PAST_STATE=$(python3 -c "
 import os, re
 # Phrases that almost always describe what the code USED to do.
@@ -1254,6 +1274,58 @@ TOAST_RAW=$(grep -rnE '\.toast_message\s*=([^=]|$)' src/ 2>/dev/null \
 if [ -n "$TOAST_RAW" ]; then
     echo "ERROR: raw \`toast_message = Some(...)\` — call \`state.toast(msg)\` so toast_time is set together (an unset toast_time strands the toast):"
     echo "$TOAST_RAW"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 46. Bar-gradient intensity must route through `theme::bar_intensity(ratio)`.
+# The floor/cap constants live in exactly one place; a re-inlined
+# `ratio * 0.7 + 0.3` silently drifts when the palette curve is tuned.
+INTENSITY_INLINE=$(grep -rnE '\*\s*0\.7\s*\+\s*0\.3' src/ 2>/dev/null \
+    | grep -v 'lint #46' || true)
+if [ -n "$INTENSITY_INLINE" ]; then
+    echo "ERROR: inline bar-intensity math — use theme::bar_intensity(ratio) (single source of the floor/cap curve):"
+    echo "$INTENSITY_INLINE"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 47. Raw `Color::Rgb(...)` outside the theme palette. Ad-hoc colors fork
+# the design system; new hues belong in `ui/mod.rs::theme` (const or ramp).
+# Sanctioned constructors carry `lint-ok: raw-rgb` on the same or next line.
+RAW_RGB=$(grep -rn 'Color::Rgb(' src/ 2>/dev/null \
+    | grep -v 'pub const' \
+    | grep -v 'lint-ok: raw-rgb' || true)
+if [ -n "$RAW_RGB" ]; then
+    # A multi-line construction may carry the marker on the following line;
+    # re-check each hit with one line of trailing context.
+    RAW_RGB=$(echo "$RAW_RGB" | while IFS=: read -r f l _; do
+        if ! sed -n "${l},$((l + 1))p" "$f" | grep -q 'lint-ok: raw-rgb'; then
+            echo "$f:$l"
+        fi
+    done)
+fi
+if [ -n "$RAW_RGB" ]; then
+    echo "ERROR: raw Color::Rgb outside the theme palette — add the color to ui/mod.rs::theme (const or ramp), or mark a genuine constructor with 'lint-ok: raw-rgb':"
+    echo "$RAW_RGB"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 48. Credential-shaped literals. Complements lint #17, which only matches
+# terms already in a git-ignored denylist and therefore never runs on CI.
+# These are provider token formats, so the length quantifiers keep a bare
+# prefix mentioned in prose from matching. Scans every tracked text file —
+# a key is as harmful in a workflow or a doc as it is in `src/`.
+SECRETS=$(git ls-files -z 2>/dev/null | xargs -0 grep -nIE \
+    -e 'AKIA[0-9A-Z]{16}' \
+    -e '(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}' \
+    -e 'sk-ant-[A-Za-z0-9_-]{20,}' \
+    -e 'xox[baprs]-[A-Za-z0-9-]{10,}' \
+    -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' \
+    -e 'AIza[0-9A-Za-z_-]{35}' \
+    -e '[a-z][a-z0-9+.-]+://[^/[:space:]:@]+:[^/[:space:]@]+@' \
+    2>/dev/null | grep -v 'lint-ok: credential-shape' || true)
+if [ -n "$SECRETS" ]; then
+    echo "ERROR: credential-shaped literal in a tracked file — rotate the value, then remove it from the file AND from history (this repo is public):"
+    echo "$SECRETS"
     ERRORS=$((ERRORS + 1))
 fi
 

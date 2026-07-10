@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{Local, NaiveDate};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 
 use crate::PeriodFilter;
@@ -16,8 +16,15 @@ use std::path::PathBuf;
 pub struct CcsightServer {
     limit: usize,
     fixed_groups: Option<Vec<DailyGroup>>,
+    /// Reload-on-change memoization: every tool call recomputes a cheap
+    /// on-disk signature (per-file mtime + size, same discovery as the
+    /// loader) and reuses the parsed data only while it matches. The server
+    /// lives as long as the MCP client session, so a once-only or TTL cache
+    /// would serve stale totals for hours. `Arc`: rmcp clones the server.
+    cached: std::sync::Arc<std::sync::Mutex<Option<(u64, std::sync::Arc<LoadedData>)>>>,
 }
 
+#[derive(Debug)]
 struct LoadedData {
     daily_groups: Vec<DailyGroup>,
     summary_cache: HashMap<PathBuf, Option<String>>,
@@ -94,6 +101,18 @@ struct LiveSessionsParams {
         description = "Filter by status tier: \"busy\" (process actively responding), \"today\" (alive, touched today in local calendar), \"older\" (alive but not touched today), \"paused\" (process gone, JSONL within 24h or in snapshot). Omit for all."
     )]
     status: Option<String>,
+    #[schemars(
+        description = "When true, return only sessions needing human intervention (state != \"active\"): awaiting_input / stalled / error / exited. Default false (all)."
+    )]
+    actionable_only: Option<bool>,
+    #[schemars(
+        description = "When true, drop heavy fields (ai_title, last_user_message, tokens, cost, model) and return a minimal row {session_id, project, cwd, status, state, age_secs, reason} — keeps the caller's context small. Default false."
+    )]
+    compact: Option<bool>,
+    #[schemars(
+        description = "Idle seconds (since last JSONL write) before a finished/owed-output session counts as awaiting_input / stalled. Default 600 (10 min)."
+    )]
+    idle_secs: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -116,7 +135,9 @@ struct SessionsParams {
     date_from: Option<String>,
     #[schemars(description = "End date for range filter (YYYY-MM-DD). Defaults to today.")]
     date_to: Option<String>,
-    #[schemars(description = "Sort order: \"date\" (default), \"cost\", \"tokens\"")]
+    #[schemars(
+        description = "Sort order: \"date\" (default), \"cost\", \"tokens\". \"cost\" ranks by an API-equivalent estimate (tokens × list price), NOT actual subscription spend."
+    )]
     sort: Option<String>,
     #[schemars(description = "Maximum number of results (default: 20)")]
     limit: Option<usize>,
@@ -143,6 +164,69 @@ fn period_to_filter(period: Option<&str>) -> PeriodFilter {
         Some("month") => PeriodFilter::Last30d,
         _ => PeriodFilter::All,
     }
+}
+
+/// Shape one `live_sessions` row. `state` and `reason` are always
+/// present; `reason` is omitted when empty (an `active` session). `total` is the
+/// session's lifetime (cost, work_tokens); `meta` is its newest-day metadata
+/// (model / titles). Compact mode drops both so the caller's context stays small.
+#[allow(clippy::too_many_arguments)]
+fn build_live_row(
+    s: &crate::infrastructure::live_sessions::LiveSession,
+    tier: &str,
+    age_secs: Option<i64>,
+    state: crate::session_state::SessionState,
+    reason: &str,
+    compact: bool,
+    total: Option<(f64, u64, bool)>,
+    meta: Option<&crate::aggregator::SessionInfo>,
+) -> serde_json::Value {
+    let project = s
+        .cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map_or_else(|| s.cwd.display().to_string(), str::to_string);
+    let mut row = if compact {
+        serde_json::json!({
+            "session_id": s.session_id,
+            "cwd": s.cwd.display().to_string(),
+            "project": project,
+            "status": tier,
+            "state": state.as_str(),
+            "age_secs": age_secs,
+        })
+    } else {
+        let (cost, tokens, _) = total.unwrap_or((0.0, 0, false));
+        let model_normalized = meta
+            .and_then(|i| i.model.as_ref())
+            .map(|m| crate::aggregator::normalize_model_name(m));
+        serde_json::json!({
+            "session_id": s.session_id,
+            "cwd": s.cwd.display().to_string(),
+            "project": project,
+            "status": tier,
+            "state": state.as_str(),
+            "age_secs": age_secs,
+            "pid": s.pid,
+            "was_recently_live": s.was_recently_live,
+            "tokens": tokens,
+            "cost": cost,
+            "model": model_normalized,
+            "ai_title": meta.and_then(|i| i.ai_title.clone()),
+            "last_user_message": meta.and_then(|i| i.last_user_message.clone()),
+        })
+    };
+    if !reason.is_empty() {
+        row["reason"] = serde_json::json!(reason);
+    }
+    // A contributing day used a model without pricing, so `cost` is a lower
+    // bound. The TUI marks this with `$N*`; emit a flag so MCP callers aren't
+    // misled by an understated total. Omitted (not false) when fully priced,
+    // and absent in compact mode where `cost` itself is dropped.
+    if !compact && total.is_some_and(|(_, _, unpriced)| unpriced) {
+        row["cost_is_lower_bound"] = serde_json::json!(true);
+    }
+    row
 }
 
 fn filter_groups_by_date_range(
@@ -174,6 +258,7 @@ impl CcsightServer {
         Self {
             limit,
             fixed_groups: None,
+            cached: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -182,19 +267,57 @@ impl CcsightServer {
         Self {
             limit: 0,
             fixed_groups: Some(daily_groups),
+            cached: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
-    fn load(&self) -> LoadedData {
-        if let Some(ref groups) = self.fixed_groups {
-            build_loaded_data(groups.clone())
-        } else {
-            load_fresh_data(self.limit)
+    /// Fold (mtime, size) of every discovered session JSONL into one value.
+    /// Appends bump mtime/size and created/deleted files change the fold, so
+    /// any on-disk change invalidates the memoized load on the next call.
+    fn disk_signature(&self) -> u64 {
+        if self.fixed_groups.is_some() {
+            return 0;
         }
+        let files = FileDiscovery::find_jsonl_files_with_limit(self.limit).unwrap_or_default();
+        let mut sig: u64 = files.len() as u64;
+        for f in &files {
+            if let Ok(meta) = std::fs::metadata(f) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                sig = sig
+                    .wrapping_mul(31)
+                    .wrapping_add(mtime)
+                    .wrapping_mul(31)
+                    .wrapping_add(meta.len());
+            }
+        }
+        sig
+    }
+
+    fn load(&self) -> std::sync::Arc<LoadedData> {
+        let sig = self.disk_signature();
+        let mut guard = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_sig, data)) = guard.as_ref()
+            && *cached_sig == sig
+        {
+            return data.clone();
+        }
+        let data = std::sync::Arc::new(match &self.fixed_groups {
+            Some(groups) => build_loaded_data(groups.clone()),
+            None => load_fresh_data(self.limit),
+        });
+        *guard = Some((sig, data.clone()));
+        data
     }
 
     #[tool(
-        description = "Get aggregated usage statistics: cost, tokens (input/output/cache), model breakdown, projects, hourly patterns, tool usage, languages. Use group_by=day for daily breakdown. All dates/times are in local timezone."
+        description = "Get aggregated usage statistics: cost, tokens (input/output/cache), model breakdown, projects, hourly patterns, tool usage, languages. Use group_by=day for daily breakdown. All dates/times are in local timezone. Cost (all `*_cost`/`cost_usd` fields) is an API-equivalent estimate (tokens × published list price), NOT actual subscription/plan spend — a Pro/Max subscriber's real outlay differs."
     )]
     fn stats(
         &self,
@@ -218,7 +341,15 @@ impl CcsightServer {
         let mut total_cost = 0.0;
         let mut total_input = 0u64;
         let mut total_output = 0u64;
-        let mut session_count = 0usize;
+        // Dedup by file_path: `filtered` holds one entry per (session, active
+        // day), so counting per entry would report session-days. Distinct paths
+        // give the true session count (matches search / Daily list).
+        let mut session_paths: std::collections::HashSet<&std::path::PathBuf> =
+            std::collections::HashSet::new();
+        // Separate from `session_paths`: project counts include subagents
+        // (matching the TUI's ProjectStats), the deduped total excludes them.
+        let mut project_files: std::collections::HashSet<&std::path::PathBuf> =
+            std::collections::HashSet::new();
         let mut model_agg: HashMap<String, (f64, u64)> = HashMap::new();
         let mut project_agg: HashMap<String, (usize, u64, f64)> = HashMap::new();
         let mut hourly_agg: HashMap<u8, u64> = HashMap::new();
@@ -270,7 +401,13 @@ impl CcsightServer {
                 }
 
                 let proj = project_agg.entry(session.project_name.clone()).or_default();
-                proj.0 += 1;
+                // A multi-day session appears once per active day; count the
+                // FILE once so `sum(projects[].sessions)` reconciles with the
+                // deduped `total_sessions`. Tokens/cost are per-day slices and
+                // still sum across every appearance.
+                if project_files.insert(&session.file_path) {
+                    proj.0 += 1;
+                }
                 proj.1 += session.work_tokens();
                 proj.2 += session_cost;
 
@@ -278,7 +415,7 @@ impl CcsightServer {
                     continue;
                 }
 
-                session_count += 1;
+                session_paths.insert(&session.file_path);
 
                 for (hour, tokens) in &session.day_hourly_work_tokens {
                     *hourly_agg.entry(*hour).or_default() += tokens;
@@ -449,7 +586,7 @@ impl CcsightServer {
             "total_cost_usd": round_cents(total_cost),
             "pricing_gap": pricing_gap_json,
             "mcp_servers": mcp_status_json,
-            "total_sessions": session_count,
+            "total_sessions": session_paths.len(),
             "tokens": {
                 "input": total_input,
                 "output": total_output,
@@ -482,7 +619,7 @@ impl CcsightServer {
             result["daily"] = serde_json::json!(daily);
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&result).unwrap_or_default(),
         )]))
     }
@@ -618,7 +755,7 @@ impl CcsightServer {
             results_json.push(serde_json::json!({
                 "date": group.date.to_string(),
                 "project": session.project_name,
-                "summary": session.ai_title.as_deref().or(session.custom_title.as_deref()).or(session.summary.as_deref()),
+                "summary": session.display_title(),
                 "snippet": result.snippet,
                 "match_type": match_type,
                 "tokens": session.work_tokens(),
@@ -634,13 +771,13 @@ impl CcsightServer {
             "results": results_json,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&output).unwrap_or_default(),
         )]))
     }
 
     #[tool(
-        description = "List currently running and recently disconnected Claude Code sessions. Sources: ~/.claude/sessions/<pid>.json (PID liveness verified), ~/.claude/projects/**/*.jsonl mtime (24h window), and ccsight's snapshot of previously-alive session IDs. Each row reports session_id, cwd, project, status tier (busy/today/older/paused), age (seconds since last update), pid (0 for paused), today's tokens/cost, model, ai_title, and last user-message preview. Use the `live` tab semantics to find what's open right now or what was running before a reboot. All timestamps local timezone."
+        description = "List currently running and recently disconnected Claude Code sessions. Sources: ~/.claude/sessions/<pid>.json (PID liveness verified), ~/.claude/projects/**/*.jsonl mtime (24h window), and ccsight's snapshot of previously-alive session IDs. Each row reports session_id, cwd, project, status tier (busy/today/older/paused), a `state` field = the human-intervention state derived from the JSONL turn tail (\"active\" | \"awaiting_input\" = finished/permission-pending and idle | \"stalled\" = owes output but idle | \"error\" | \"exited\" = died mid-task) plus a `reason` string for non-active states, age (seconds since last update), pid (0 for paused), the session's lifetime tokens/cost summed across every day it was active (NOT just today; cost = API-equivalent estimate from tokens × list price, NOT actual subscription spend), model, ai_title, and last user-message preview. Set actionable_only=true to return only sessions that need attention (state != active), and compact=true to drop the heavy fields and keep the response small — together they answer \"which sessions need me right now?\" without flooding context. idle_secs (default 600) tunes the awaiting/stalled threshold. Use the `live` tab semantics to find what's open right now or what was running before a reboot. All timestamps local timezone."
     )]
     fn live_sessions(
         &self,
@@ -669,19 +806,11 @@ impl CcsightServer {
         paused.extend(recovered);
         mark_was_recently_live(&mut paused, &prior_alive);
 
-        // Lookup table from `daily_groups` so we can enrich each live row
-        // with ai_title / last_user_message / tokens / cost / model. Build
-        // once per call (not per row) — this is the same memoization
-        // pattern the TUI Live tab needs.
+        // Lifetime cumulative per session (cost/tokens summed across EVERY day
+        // the file appears, metadata from the newest day) — the same build-once
+        // map the TUI Live tab indexes, so both surfaces report identical totals.
         let data = self.load();
-        let calculator = CostCalculator::global();
-        let mut by_path: HashMap<&std::path::Path, &crate::aggregator::SessionInfo> =
-            HashMap::new();
-        for g in &data.daily_groups {
-            for s in &g.sessions {
-                by_path.entry(s.file_path.as_path()).or_insert(s);
-            }
-        }
+        let cum_map = crate::aggregator::cumulative_by_path(&data.daily_groups);
 
         let now = chrono::Utc::now();
         let classify_tier = |s: &LiveSession| -> &'static str {
@@ -706,76 +835,66 @@ impl CcsightServer {
         let want_status = params.status.as_deref();
         let want_project = params.project.as_deref();
 
-        let project_label = |cwd: &std::path::Path| -> String {
-            cwd.file_name()
-                .and_then(|n| n.to_str())
-                .map_or_else(|| cwd.display().to_string(), str::to_string)
-        };
+        let idle_threshold = params.idle_secs.unwrap_or(600);
+        let actionable_only = params.actionable_only.unwrap_or(false);
+        let compact = params.compact.unwrap_or(false);
 
-        let to_row = |s: &LiveSession, tier: &'static str| -> serde_json::Value {
-            let info = s
-                .jsonl_path
-                .as_deref()
-                .and_then(|p| by_path.get(p).copied());
+        // Apply status/project filters, classify the session state (single source
+        // shared with `--wait`), drop non-actionable rows when requested, then
+        // shape the row (compact projection in `build_live_row`).
+        let make_row = |s: &LiveSession, tier: &'static str| -> Option<serde_json::Value> {
+            if let Some(want) = want_status
+                && want != tier
+            {
+                return None;
+            }
+            if let Some(proj) = want_project
+                && !s.cwd.to_string_lossy().contains(proj)
+            {
+                return None;
+            }
             let age_secs = s
                 .updated_at
                 .or(s.jsonl_mtime)
                 .or(s.started_at)
                 .map(|t| (now - t).num_seconds().max(0));
-            let tokens: u64 = info.map_or(0, |i| {
-                i.day_tokens_by_model
-                    .values()
-                    .map(crate::aggregator::TokenStats::work_tokens)
-                    .sum()
-            });
-            let cost: f64 = info.map_or(0.0, |i| i.cost(calculator));
-            let model_normalized = info
-                .and_then(|i| i.model.as_ref())
-                .map(|m| crate::aggregator::normalize_model_name(m));
-            serde_json::json!({
-                "session_id": s.session_id,
-                "cwd": s.cwd.display().to_string(),
-                "project": project_label(&s.cwd),
-                "status": tier,
-                "age_secs": age_secs,
-                "pid": s.pid,
-                "was_recently_live": s.was_recently_live,
-                "tokens": tokens,
-                "cost": cost,
-                "model": model_normalized,
-                "ai_title": info.and_then(|i| i.ai_title.clone()),
-                "last_user_message": info.and_then(|i| i.last_user_message.clone()),
-            })
+            // The session-state idle MUST come from jsonl_mtime (last conversation
+            // entry), matching `--wait`'s probe, so both surfaces classify
+            // awaiting_input / stalled identically. age_secs above stays
+            // updated_at-based — it's the row's display "age", not the turn idle.
+            let idle = s
+                .jsonl_mtime
+                .map_or(0, |m| (now - m).num_seconds().max(0) as u64);
+            let (state, tail) = crate::session_state::live_state(
+                s.is_live,
+                s.status.as_deref() == Some("busy"),
+                idle,
+                idle_threshold,
+                s.jsonl_path.as_deref(),
+            );
+            if actionable_only && state == crate::session_state::SessionState::Active {
+                return None;
+            }
+            let reason = crate::session_state::reason_for(state, tail, idle);
+            let entry = s.jsonl_path.as_deref().and_then(|p| cum_map.get(p));
+            let total = entry.map(|(c, _)| (c.cost, c.input_tokens + c.output_tokens, c.unpriced));
+            let meta = entry.map(|(_, m)| *m);
+            Some(build_live_row(
+                s, tier, age_secs, state, &reason, compact, total, meta,
+            ))
         };
 
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for s in &active {
             let tier = classify_tier(s);
-            if let Some(want) = want_status
-                && want != tier
-            {
-                continue;
+            if let Some(r) = make_row(s, tier) {
+                rows.push(r);
             }
-            if let Some(proj) = want_project
-                && !s.cwd.to_string_lossy().contains(proj)
-            {
-                continue;
-            }
-            rows.push(to_row(s, tier));
         }
         for s in &paused {
-            let tier = "paused";
-            if let Some(want) = want_status
-                && want != tier
-            {
-                continue;
+            if let Some(r) = make_row(s, "paused") {
+                rows.push(r);
             }
-            if let Some(proj) = want_project
-                && !s.cwd.to_string_lossy().contains(proj)
-            {
-                continue;
-            }
-            rows.push(to_row(s, tier));
         }
 
         let output = serde_json::json!({
@@ -783,7 +902,7 @@ impl CcsightServer {
             "paused_count": paused.len(),
             "sessions": rows,
         });
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&output).unwrap_or_default(),
         )]))
     }
@@ -929,7 +1048,7 @@ impl CcsightServer {
             "sessions": sessions_out,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&result).unwrap_or_default(),
         )]))
     }
@@ -959,7 +1078,7 @@ impl CcsightServer {
             });
 
         let Some((date, session)) = found else {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::json!({"error": "Session not found"}).to_string(),
             )]));
         };
@@ -1053,7 +1172,7 @@ impl CcsightServer {
             "files_touched": files_touched,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&result).unwrap_or_default(),
         )]))
     }
@@ -1277,10 +1396,10 @@ mod tests {
     }
 
     fn extract_json(result: &CallToolResult) -> serde_json::Value {
-        let text = match &result.content[0].raw {
-            rmcp::model::RawContent::Text(t) => &t.text,
-            _ => panic!("expected text content"),
-        };
+        let text = &result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text;
         serde_json::from_str(text).unwrap()
     }
 
@@ -1359,22 +1478,34 @@ mod tests {
         let yesterday = today - chrono::Duration::days(1);
         let last_week = today - chrono::Duration::days(8);
 
+        // Distinct file_path per session: total_sessions dedups by path, so the
+        // default shared `/tmp/test.jsonl` would collapse every session to one.
+        let with_path = |mut s: crate::aggregator::SessionInfo, path: &str| {
+            s.file_path = std::path::PathBuf::from(path);
+            s
+        };
         vec![
             make_daily_group(
                 today,
                 vec![
-                    make_session_with_tokens(
-                        "~/projects/app-a",
-                        100_000,
-                        50_000,
-                        "claude-sonnet-4-20250514",
+                    with_path(
+                        make_session_with_tokens(
+                            "~/projects/app-a",
+                            100_000,
+                            50_000,
+                            "claude-sonnet-4-20250514",
+                        ),
+                        "/tmp/app-a-today.jsonl",
                     ),
                     {
-                        let mut s = make_session_with_tokens(
-                            "~/projects/other",
-                            50_000,
-                            25_000,
-                            "claude-sonnet-4-20250514",
+                        let mut s = with_path(
+                            make_session_with_tokens(
+                                "~/projects/other",
+                                50_000,
+                                25_000,
+                                "claude-sonnet-4-20250514",
+                            ),
+                            "/tmp/other-today.jsonl",
                         );
                         s.summary = Some("Fix login bug".to_string());
                         s.git_branch = Some("fix/login".to_string());
@@ -1384,20 +1515,26 @@ mod tests {
             ),
             make_daily_group(
                 yesterday,
-                vec![make_session_with_tokens(
-                    "~/projects/app-a",
-                    80_000,
-                    40_000,
-                    "claude-opus-4-5-20251101",
+                vec![with_path(
+                    make_session_with_tokens(
+                        "~/projects/app-a",
+                        80_000,
+                        40_000,
+                        "claude-opus-4-5-20251101",
+                    ),
+                    "/tmp/app-a-yesterday.jsonl",
                 )],
             ),
             make_daily_group(
                 last_week,
-                vec![make_session_with_tokens(
-                    "~/projects/old-project",
-                    30_000,
-                    10_000,
-                    "claude-sonnet-4-20250514",
+                vec![with_path(
+                    make_session_with_tokens(
+                        "~/projects/old-project",
+                        30_000,
+                        10_000,
+                        "claude-sonnet-4-20250514",
+                    ),
+                    "/tmp/old-project.jsonl",
                 )],
             ),
         ]
@@ -1444,6 +1581,147 @@ mod tests {
         let future = Local::now().date_naive() + chrono::Duration::days(30);
         let filtered = filter_groups_by_date_range(&groups, Some(future), None);
         assert!(filtered.is_empty());
+    }
+
+    fn live_session(id: &str) -> crate::infrastructure::live_sessions::LiveSession {
+        crate::infrastructure::live_sessions::LiveSession {
+            session_id: id.to_string(),
+            jsonl_path: None,
+            cwd: std::path::PathBuf::from("/Users/me/proj"),
+            name: None,
+            status: None,
+            pid: 5,
+            started_at: None,
+            updated_at: None,
+            jsonl_mtime: None,
+            is_live: true,
+            was_recently_live: false,
+        }
+    }
+
+    #[test]
+    fn build_live_row_compact_keeps_state_drops_heavy_fields() {
+        let s = live_session("1f3a9c2e");
+        let row = build_live_row(
+            &s,
+            "today",
+            Some(120),
+            crate::session_state::SessionState::AwaitingInput,
+            "assistant turn finished; no input for 2m",
+            true,
+            None,
+            None,
+        );
+        assert_eq!(row["state"], "awaiting_input");
+        assert_eq!(row["age_secs"], 120);
+        assert_eq!(row["project"], "proj");
+        assert!(row.get("reason").is_some());
+        for k in ["tokens", "cost", "model", "ai_title", "last_user_message"] {
+            assert!(row.get(k).is_none(), "compact must drop {k}");
+        }
+    }
+
+    #[test]
+    fn build_live_row_full_has_state_and_heavy_fields_and_omits_empty_reason() {
+        let s = live_session("x");
+        let row = build_live_row(
+            &s,
+            "today",
+            Some(0),
+            crate::session_state::SessionState::Active,
+            "",
+            false,
+            None,
+            None,
+        );
+        assert_eq!(row["state"], "active");
+        assert!(row.get("tokens").is_some());
+        assert!(row.get("cost").is_some());
+        assert!(row.get("last_user_message").is_some());
+        // An active session has no reason → field omitted, not empty string.
+        assert!(row.get("reason").is_none());
+    }
+
+    #[test]
+    fn build_live_row_reports_cross_day_lifetime_total_not_a_single_day() {
+        // The MCP-side wiring: index the shared cumulative_by_path map and
+        // forward (cost, input+output) into the row. Pins that the row carries
+        // the cross-day SUM and the newest day's model — guarding the exact seam
+        // a per-day / single-day regression would silently revert.
+        let newer = Local::now().date_naive();
+        let older = newer - chrono::Duration::days(1);
+        // Same default file_path on both days, so cumulative_by_path folds them.
+        let groups = vec![
+            make_daily_group(
+                newer,
+                vec![make_session_with_tokens("p", 3000, 800, "claude-opus-4-8")],
+            ),
+            make_daily_group(
+                older,
+                vec![make_session_with_tokens(
+                    "p",
+                    1000,
+                    200,
+                    "claude-sonnet-4-6",
+                )],
+            ),
+        ];
+        let map = crate::aggregator::cumulative_by_path(&groups);
+        let path = std::path::Path::new("/tmp/test.jsonl");
+        let (cum, meta) = map.get(path).expect("folded session");
+        let total = Some((cum.cost, cum.input_tokens + cum.output_tokens, cum.unpriced));
+
+        let s = live_session("x");
+        let row = build_live_row(
+            &s,
+            "today",
+            Some(0),
+            crate::session_state::SessionState::Active,
+            "",
+            false,
+            total,
+            Some(meta),
+        );
+        // Lifetime total 3000+800+1000+200, NOT the newest day's 3800.
+        assert_eq!(row["tokens"], 5000);
+        assert_ne!(row["tokens"], 3800);
+        assert!(row["cost"].as_f64().unwrap() > 0.0);
+        // Representative model is the newest day's slice (Opus, not Sonnet).
+        assert_eq!(row["model"], "Opus 4.8");
+        // All models priced → no lower-bound flag (parity with the TUI's no-`*`).
+        assert!(row.get("cost_is_lower_bound").is_none());
+    }
+
+    #[test]
+    fn build_live_row_flags_cost_is_lower_bound_for_unpriced_model() {
+        // An unpriced model makes `cost` an undercount; the row must signal it
+        // (the MCP analogue of the TUI's `$N*`), and only in non-compact mode.
+        let s = live_session("x");
+        let unpriced_total = Some((0.0, 1234, true));
+        let row = build_live_row(
+            &s,
+            "today",
+            Some(0),
+            crate::session_state::SessionState::Active,
+            "",
+            false,
+            unpriced_total,
+            None,
+        );
+        assert_eq!(row["cost_is_lower_bound"], true);
+
+        // Compact mode drops cost entirely, so the flag must not appear there.
+        let compact = build_live_row(
+            &s,
+            "today",
+            Some(0),
+            crate::session_state::SessionState::Active,
+            "",
+            true,
+            unpriced_total,
+            None,
+        );
+        assert!(compact.get("cost_is_lower_bound").is_none());
     }
 
     #[test]
@@ -1505,6 +1783,50 @@ mod tests {
 
         assert_eq!(json["session_id"].as_str().unwrap().len(), 8);
         assert_eq!(json["session_id"], "abcdefgh");
+    }
+
+    #[test]
+    fn load_memoizes_on_matching_signature_and_reloads_on_change() {
+        let server = CcsightServer::from_groups(Vec::new());
+        // Same signature → the memoized Arc is reused, not rebuilt.
+        let a = server.load();
+        let b = server.load();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        // A signature mismatch (as if the on-disk state changed) → rebuild.
+        {
+            let mut guard = server.cached.lock().unwrap();
+            let (sig, _) = guard.as_mut().unwrap();
+            *sig = sig.wrapping_add(1);
+        }
+        let c = server.load();
+        assert!(!std::sync::Arc::ptr_eq(&a, &c));
+    }
+
+    #[test]
+    fn test_stats_total_sessions_dedups_multiday_session() {
+        // One session resumed across two days appears in both day groups; it is
+        // one session, not two. total_sessions must dedup by file_path.
+        let today = Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let mut day1 =
+            make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        day1.file_path = std::path::PathBuf::from("/tmp/resumed.jsonl");
+        let mut day2 =
+            make_session_with_tokens("~/projects/app", 2000, 1000, "claude-sonnet-4-20250514");
+        day2.file_path = std::path::PathBuf::from("/tmp/resumed.jsonl");
+        let server = CcsightServer::from_groups(vec![
+            make_daily_group(yesterday, vec![day1]),
+            make_daily_group(today, vec![day2]),
+        ]);
+        let json = call_stats(&server, None);
+        assert_eq!(
+            json["total_sessions"], 1,
+            "multi-day session counts once, not per active day"
+        );
+        // The per-project count must reconcile with the deduped total in the
+        // same response, while tokens still sum both day slices.
+        assert_eq!(json["projects"][0]["sessions"], 1);
+        assert_eq!(json["projects"][0]["work_tokens"], 4500);
     }
 
     #[test]
@@ -2190,25 +2512,15 @@ mod tests {
     fn test_stats_custom_date_range_overrides_period() {
         let today = Local::now().date_naive();
         let yesterday = today - chrono::Duration::days(1);
+        let mut sa =
+            make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514");
+        sa.file_path = std::path::PathBuf::from("/tmp/a.jsonl");
+        let mut sb =
+            make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514");
+        sb.file_path = std::path::PathBuf::from("/tmp/b.jsonl");
         let groups = vec![
-            make_daily_group(
-                today,
-                vec![make_session_with_tokens(
-                    "~/projects/a",
-                    1000,
-                    500,
-                    "claude-sonnet-4-20250514",
-                )],
-            ),
-            make_daily_group(
-                yesterday,
-                vec![make_session_with_tokens(
-                    "~/projects/b",
-                    2000,
-                    1000,
-                    "claude-sonnet-4-20250514",
-                )],
-            ),
+            make_daily_group(today, vec![sa]),
+            make_daily_group(yesterday, vec![sb]),
         ];
         let server = CcsightServer::from_groups(groups);
 

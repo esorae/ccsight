@@ -41,6 +41,31 @@ pub struct ConversationMessage {
     pub usage: Option<crate::aggregator::stats::TokenStats>,
 }
 
+impl ConversationMessage {
+    /// Text the pane search scans — the block contents the renderer shows
+    /// when the message is expanded. Blocks join with '\n' so an occurrence
+    /// can't span two blocks (the renderer never displays them joined).
+    pub fn search_text(&self) -> String {
+        let mut s = String::new();
+        for b in &self.blocks {
+            match b {
+                ConversationBlock::Text(t) | ConversationBlock::Thinking(t) => s.push_str(t),
+                ConversationBlock::ToolUse {
+                    name,
+                    input_summary,
+                } => {
+                    s.push_str(name);
+                    s.push(' ');
+                    s.push_str(input_summary);
+                }
+                ConversationBlock::ToolResult { content, .. } => s.push_str(content),
+            }
+            s.push('\n');
+        }
+        s
+    }
+}
+
 #[derive(Debug)]
 pub enum LoadError {
     Io(io::Error),
@@ -180,6 +205,10 @@ pub fn load_conversation(
                     cache_read_tokens: u.cache_read_input_tokens,
                     cache_creation_5m_tokens: m5,
                     cache_creation_1h_tokens: m1,
+                    non_standard_speed: u
+                        .speed
+                        .as_deref()
+                        .is_some_and(|s| s != crate::aggregator::stats::KNOWN_SPEED),
                 }
             });
 
@@ -200,8 +229,9 @@ pub fn load_conversation(
 
 /// Last `n` user/assistant messages that carry visible text, oldest-first,
 /// each collapsed to a single line `(role, text)`. Tool-only / thinking-only
-/// turns are skipped so the Session Detail "Recent conversation" preview reads
-/// as an actual exchange rather than a wall of `(tool use)`.
+/// turns and user-role wrapper injections (slash commands, hook and `!` bash
+/// output) are skipped so the Session Detail "Recent conversation" preview
+/// reads as an actual exchange rather than machinery.
 pub fn recent_message_previews(
     messages: &[ConversationMessage],
     n: usize,
@@ -214,8 +244,19 @@ pub fn recent_message_previews(
         }) else {
             continue;
         };
-        // Collapse newlines / runs of whitespace so each message is one line.
-        let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Slash commands, hook output and `!` bash results reach the transcript
+        // as user-role XML wrappers carrying no prose. Only user text is
+        // filtered — an assistant reply may legitimately quote a kebab tag.
+        let one_line = if msg.role == "user" {
+            let cleaned = crate::text::clean_user_message_preview(text);
+            if cleaned.is_empty() || crate::text::looks_like_system_injection(&cleaned) {
+                continue;
+            }
+            cleaned
+        } else {
+            // Collapse newlines / whitespace runs so each message is one line.
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
         out.push((msg.role.clone(), one_line));
         if out.len() == n {
             break;
@@ -620,6 +661,58 @@ mod tests {
                 ("user".to_string(), "third".to_string()),
                 ("assistant".to_string(), "fourth".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn recent_previews_drop_user_wrapper_noise_and_backfill_from_older_messages() {
+        use ConversationBlock::Text;
+        let messages = vec![
+            msg("user", vec![Text("real question".into())]),
+            msg("assistant", vec![Text("real answer".into())]),
+            // Known wrapper, stripped to nothing.
+            msg(
+                "user",
+                vec![Text("<command-name>/foo</command-name>".into())],
+            ),
+            // Unknown kebab wrapper — the heuristic drops the whole message.
+            msg(
+                "user",
+                vec![Text(
+                    "<bash-input>ls</bash-input>\n<bash-stdout>a</bash-stdout>".into(),
+                )],
+            ),
+            // Prose survives even when a known wrapper is appended to it.
+            msg(
+                "user",
+                vec![Text(
+                    "keep me <system-reminder>ignore</system-reminder>".into(),
+                )],
+            ),
+        ];
+        assert_eq!(
+            recent_message_previews(&messages, 3),
+            vec![
+                ("user".to_string(), "real question".to_string()),
+                ("assistant".to_string(), "real answer".to_string()),
+                ("user".to_string(), "keep me".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_previews_keep_assistant_text_containing_kebab_tags() {
+        use ConversationBlock::Text;
+        let messages = vec![msg(
+            "assistant",
+            vec![Text("use <my-element> in the template".into())],
+        )];
+        assert_eq!(
+            recent_message_previews(&messages, 3),
+            vec![(
+                "assistant".to_string(),
+                "use <my-element> in the template".to_string()
+            )]
         );
     }
 

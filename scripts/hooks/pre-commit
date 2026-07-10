@@ -10,6 +10,19 @@
 
 set -e
 
+# GUI git clients invoke hooks from a non-login shell, so the PATH that has
+# `~/.cargo/bin` is absent and every `cargo` step would fail as if the check
+# itself had failed. Restore it, then verify — a missing toolchain is a
+# different problem from a dirty tree and must not be reported as one.
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "[pre-commit] FAILED: cargo not on PATH. Install Rust or add ~/.cargo/bin to the PATH your git client uses."
+    exit 1
+fi
+
 # Locate repo root regardless of where git invokes the hook from.
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"

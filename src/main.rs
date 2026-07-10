@@ -1,16 +1,18 @@
+// Fire-and-forget `let _ = tx.send(...)` from worker threads (a dropped
+// receiver — main loop moved on — isn't an error to react to) and
+// best-effort terminal-mode restores on shutdown, both widespread enough
+// to warrant a crate-level allow over per-site ones.
 #![allow(clippy::let_underscore_must_use)]
 
 mod aggregator;
 mod cli;
 mod conversation;
-mod domain;
 mod handlers;
 mod infrastructure;
 mod mcp;
-mod parser;
-mod pins;
 mod search;
 mod search_history;
+mod session_state;
 mod shell;
 mod state;
 mod summary;
@@ -18,6 +20,12 @@ mod summary;
 mod test_helpers;
 mod text;
 mod ui;
+mod wait_run;
+
+// `domain`, `parser`, `pins` live in the library crate; re-export so
+// `crate::domain` / `crate::parser` / `crate::pins` resolve identically here.
+// Moving a module into the lib means adding the matching re-export.
+pub(crate) use ccsight::{domain, parser, pins};
 
 pub use state::*;
 
@@ -27,9 +35,9 @@ pub use conversation::{ConversationBlock, ConversationMessage};
 // `handlers::keyboard`) can keep using bare names.
 pub(crate) use handlers::mcp_popup::{adjust_mcp_scroll, collect_mcp_servers, mcp_tool_count};
 pub(crate) use handlers::pane::{
-    current_selected_session, current_selected_session_with_index,
-    extract_selected_text_from_buffer, get_conv_session_count, get_conv_session_file,
-    open_conversation_in_pane, preview_conversation_in_pane, spawn_load_conversation,
+    current_selected_session, extract_selected_text_from_buffer, get_conv_session_count,
+    get_conv_session_file, open_conversation_in_pane, preview_conversation_in_pane,
+    spawn_load_conversation,
 };
 // `join_conversation_lines` is referenced from `main_tests.rs` only.
 #[cfg(test)]
@@ -41,7 +49,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDate};
 use clap::Parser;
@@ -85,9 +93,21 @@ struct Args {
     #[arg(long)]
     monthly: bool,
 
+    /// With --daily / --weekly / --monthly: print JSON instead of a table
+    #[arg(long)]
+    json: bool,
+
     /// Run as MCP server (stdio transport)
     #[arg(long)]
     mcp: bool,
+
+    /// Wait for ONE session (id or unique prefix) to need attention — awaiting
+    /// input, stalled, error, exited mid-task — or to end, then print a single
+    /// line and exit 0. Composable: `ccsight --wait <id> && your-notifier`.
+    /// Conflicts with the report modes so a combined invocation errors loudly
+    /// instead of silently dropping the wait.
+    #[arg(long, value_name = "SESSION_ID", conflicts_with_all = ["daily", "weekly", "monthly", "json", "mcp"])]
+    wait: Option<String>,
 }
 
 pub fn cli_help_lines() -> Vec<(String, String)> {
@@ -141,22 +161,39 @@ fn main() -> io::Result<()> {
             && !args.weekly
             && !args.monthly
             && !args.mcp
+            && args.wait.is_none()
             && !std::io::IsTerminal::is_terminal(&std::io::stdout())
         {
             return Ok(());
         }
     }
 
+    if args.json && !args.daily && !args.weekly && !args.monthly {
+        eprintln!("--json requires --daily, --weekly, or --monthly");
+        std::process::exit(2);
+    }
     if args.daily {
-        cli::show_daily_costs(args.limit);
+        if args.json {
+            cli::show_costs_json("daily", args.limit);
+        } else {
+            cli::show_daily_costs(args.limit);
+        }
         return Ok(());
     }
     if args.weekly {
-        cli::show_weekly_costs(args.limit);
+        if args.json {
+            cli::show_costs_json("weekly", args.limit);
+        } else {
+            cli::show_weekly_costs(args.limit);
+        }
         return Ok(());
     }
     if args.monthly {
-        cli::show_monthly_costs(args.limit);
+        if args.json {
+            cli::show_costs_json("monthly", args.limit);
+        } else {
+            cli::show_monthly_costs(args.limit);
+        }
         return Ok(());
     }
 
@@ -165,6 +202,10 @@ fn main() -> io::Result<()> {
         rt.block_on(mcp::run_mcp_server(args.limit))
             .map_err(io::Error::other)?;
         return Ok(());
+    }
+
+    if let Some(prefix) = &args.wait {
+        return wait_run::run_wait(prefix);
     }
 
     let original_hook = std::panic::take_hook();
@@ -204,8 +245,32 @@ fn poll_live_sessions_task(state: &mut AppState) {
     if let Some(ref rx) = state.live_sessions_task {
         match rx.try_recv() {
             Ok((active, paused)) => {
+                // A live pid's cwd is a fresh resume witness: after an
+                // in-session relocation the transcript's early cwds no longer
+                // slug-match the storage dir, but the process cwd does.
+                for s in &active {
+                    if let Some(dir) = s
+                        .jsonl_path
+                        .as_deref()
+                        .and_then(|p| p.parent())
+                        .and_then(|p| p.file_name())
+                        .and_then(|n| n.to_str())
+                        && infrastructure::live_sessions::official_project_slug(
+                            &s.cwd.to_string_lossy(),
+                        ) == dir
+                    {
+                        state
+                            .verified_project_paths
+                            .entry(dir.to_string())
+                            .or_insert_with(|| s.cwd.clone());
+                    }
+                }
                 state.live_active = active;
                 state.live_paused = paused;
+                // The discovery thread sorts paused by jsonl_mtime, which
+                // clusters on bulk touches. Re-sort here, where the aggregation
+                // is available, by the real last-activity the age column shows.
+                crate::ui::sort_paused_by_recency(state);
                 state.live_last_update = Some(std::time::Instant::now());
                 // Refresh the time-travel-hint flag once per poll (the poll
                 // thread just ran `save_if_changed`) instead of re-scanning
@@ -232,7 +297,7 @@ fn poll_summary_task(state: &mut AppState) {
             Ok(content) => {
                 state.summary_content = content;
                 state.generating_summary = false;
-                state.summary_scroll = 0;
+                state.set_summary_scroll(0);
                 state.summary_task = None;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -240,7 +305,7 @@ fn poll_summary_task(state: &mut AppState) {
                 state.summary_task = None;
                 state.generating_summary = false;
                 state.summary_content = "❌ Summary generation failed".to_string();
-                state.summary_scroll = 0;
+                state.set_summary_scroll(0);
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -270,9 +335,12 @@ fn poll_index_build_task(state: &mut AppState) {
     if let Some(ref index_rx) = state.index_build_task {
         match index_rx.try_recv() {
             Ok(index) => {
+                // Keep polling after an early (head-chunk) handle: the
+                // builder replaces it with the full index, and the ensuing
+                // Disconnected clears the "building" indicator.
                 state.search_index = Some(index);
-                state.index_build_task = None;
                 state.last_index_build = Some(std::time::Instant::now());
+                state.needs_draw = true;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // Builder failed without sending; clear the flag so the
@@ -281,6 +349,7 @@ fn poll_index_build_task(state: &mut AppState) {
                 // next throttled rebuild (~60s).
                 state.index_build_task = None;
                 state.last_index_build = Some(std::time::Instant::now());
+                state.needs_draw = true;
                 if state.search_index.is_none() {
                     state.toast("Search index build failed; will retry".to_string());
                 }
@@ -508,7 +577,8 @@ fn poll_search_task(state: &mut AppState) {
 /// the failure. `Disconnected` clears the slot so a panicked regen thread
 /// doesn't block future regens.
 fn poll_updating_task(state: &mut AppState) {
-    if let Some((ref rx, ref file_path, day_idx, _session_idx, actual_idx)) = state.updating_task {
+    if let Some((ref rx, ref file_path, _day_idx, _session_idx, _actual_idx)) = state.updating_task
+    {
         let outcome = rx.try_recv();
         match outcome {
             Ok(result) => {
@@ -521,23 +591,32 @@ fn poll_updating_task(state: &mut AppState) {
                 // is still visible without stealing the user's context.
                 let report_error = |state: &mut AppState, msg: String| {
                     if state.active_popup == crate::ActivePopup::None {
-                        state.active_popup = crate::ActivePopup::Summary;
+                        state.active_popup = crate::ActivePopup::Summary { scroll: 0 };
                         state.summary_content = msg;
-                        state.summary_scroll = 0;
                     } else {
                         state.toast(msg);
                     }
                 };
                 match result {
-                    Ok(new_summary) => {
-                        if update_jsonl_summary(&file_path, &new_summary).is_ok() {
-                            if let Some(group) = state.daily_groups.get_mut(day_idx)
-                                && let Some(session) = group.sessions.get_mut(actual_idx)
-                            {
-                                session.summary = Some(new_summary);
+                    Ok(new_title) => {
+                        // custom-title rows are keyed by sessionId, which is the
+                        // transcript's filename stem (`<sessionId>.jsonl`).
+                        let session_id = file_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(std::string::ToString::to_string);
+                        if let Some(sid) = session_id {
+                            if update_jsonl_custom_title(&file_path, &sid, &new_title).is_ok() {
+                                // One cache entry drives every surface's title.
+                                state.set_session_title(&file_path, &new_title);
+                            } else {
+                                report_error(state, "❌ Failed to write JSONL file".to_string());
                             }
                         } else {
-                            report_error(state, "❌ Failed to write JSONL file".to_string());
+                            report_error(
+                                state,
+                                "❌ No session id — cannot write title".to_string(),
+                            );
                         }
                     }
                     Err(e) => {
@@ -647,6 +726,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
         let _ = tx.send(result);
     });
 
+    let mut last_render = Instant::now();
     loop {
         if state.tab == Tab::Dashboard && !state.show_dashboard_detail() {
             let today = Local::now().date_naive();
@@ -657,23 +737,32 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             }
         }
 
-        if state.needs_draw {
+        // Coalesce input floods: a trackpad scroll burst emits hundreds of
+        // events and a full redraw each would freeze the UI draining the
+        // queue. Skip a frame while input is still pending (O(1) handlers),
+        // but force one per frame budget so a sustained scroll still animates.
+        let render_due = last_render.elapsed() >= Duration::from_millis(16);
+        if state.needs_draw && (render_due || !event::poll(Duration::ZERO).unwrap_or(false)) {
             execute!(io::stdout(), BeginSynchronizedUpdate)?;
             let completed = terminal.draw(|f| ui::draw(f, &mut state))?;
             state.screen_buffer = Some(completed.buffer.clone());
             execute!(io::stdout(), EndSynchronizedUpdate)?;
             state.needs_draw = false;
+            last_render = Instant::now();
         }
 
-        let has_pending = state.loading
+        // Index building is excluded: it can run 10-30s and needs no
+        // animation, so it must neither spin redraws by itself nor —
+        // by gating the whole condition — freeze the OTHER spinners
+        // (summary generation, pane loads) that overlap with it.
+        let has_animated_pending = state.loading
             || state.generating_summary
             || state.toast_time.is_some()
             || state.data_reload_task.is_some()
             || state.summary_task.is_some()
             || state.search_task.is_some()
-            || state.index_build_task.is_some()
             || state.panes.iter().any(|p| p.loading);
-        if has_pending && state.index_build_task.is_none() {
+        if has_animated_pending {
             state.needs_draw = true;
         }
 
@@ -909,19 +998,43 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                 } else {
                                     None
                                 };
-                                let (wrap_flags, conv_scroll) = if state.show_conversation {
+                                // A popup drawn over the conversation (e.g. Detail
+                                // via `[i]`) owns `conv_area` above; its text is
+                                // not conversation message content, so the pane's
+                                // wrap-continuation flags must not be applied to
+                                // it — they'd garble the copied text.
+                                let (wrap_flags, conv_scroll) = if state
+                                    .layout
+                                    .active_popup_area
+                                    .is_none()
+                                    && state.show_conversation
+                                {
                                     let idx = state.active_pane_index.unwrap_or(0);
                                     state
                                         .panes
                                         .get(idx)
                                         .and_then(|p| {
-                                            p.rendered.as_ref().map(|(_, _, flags, _)| {
-                                                (flags.as_slice(), p.scroll)
-                                            })
+                                            p.rendered
+                                                .as_ref()
+                                                .map(|(_, _, flags)| (flags.as_slice(), p.scroll))
                                         })
                                         .map_or((None, 0), |(flags, scroll)| (Some(flags), scroll))
                                 } else {
                                     (None, 0)
+                                };
+                                // Compact mode prepends a 2-col hang-indent to
+                                // body lines; strip it from copied text. Full
+                                // mode / popups have no such indent (0).
+                                let body_indent = if state.layout.active_popup_area.is_none()
+                                    && state.show_conversation
+                                    && state
+                                        .active_pane_index
+                                        .and_then(|i| state.panes.get(i))
+                                        .is_some_and(|p| p.compact)
+                                {
+                                    2
+                                } else {
+                                    0
                                 };
                                 let text = extract_selected_text_from_buffer(
                                     sel,
@@ -929,6 +1042,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                     conv_area,
                                     wrap_flags,
                                     conv_scroll,
+                                    body_indent,
                                 );
                                 if !text.is_empty() {
                                     let len = text.chars().count();
@@ -962,42 +1076,8 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     _ => {}
                 },
                 Event::Paste(text) => {
-                    if state.search_mode {
-                        for c in text.chars() {
-                            state.search_input.insert_char(c);
-                        }
-                        let ctx_owned = build_search_filter_ctx(&state);
-                        state.search_results = search::perform_search(
-                            &state.daily_groups,
-                            &state.search_input.text,
-                            &ctx_owned.as_ref(),
-                        );
-                        state.search_selected = 0;
-                        start_content_search(&mut state);
-                    } else if state.filter_input_mode {
-                        for c in text.chars() {
-                            state.filter_input.insert_char(c);
-                        }
-                        state.filter_input_error = false;
-                    } else if let Some(idx) = state.active_pane_index
-                        && let Some(pane) = state.panes.get_mut(idx)
-                        && pane.search_mode
-                    {
-                        for c in text.chars() {
-                            pane.search_input.insert_char(c);
-                        }
-                        ui::update_pane_search_matches(pane);
-                        pane.search_current = 0;
-                        if let Some(&first) = pane.search_matches.first() {
-                            pane.scroll = first;
-                            if let Some(msg_idx) = pane
-                                .message_lines
-                                .iter()
-                                .rposition(|&(start, _)| start <= first)
-                            {
-                                pane.selected_message = msg_idx;
-                            }
-                        }
+                    if let Some(kind) = paste_into_active_input(&mut state, &text) {
+                        apply_text_input_side_effects(&mut state, kind);
                     }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -1023,6 +1103,8 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         handlers::keyboard::handle_project_detail_key(&mut state, key);
                     } else if state.show_filter_popup() {
                         handlers::keyboard::handle_filter_popup_key(&mut state, key);
+                    } else if state.show_title_edit() {
+                        handlers::keyboard::handle_title_edit_key(&mut state, key);
                     } else if state.show_project_popup() {
                         handlers::keyboard::handle_project_popup_key(&mut state, key);
                     } else if state.show_summary() {
@@ -1084,17 +1166,23 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
         // Drilled into from the Projects-list DashboardDetail popup; closing
         // returns there, not to the bare dashboard (two-level drill-back).
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.project_detail_scroll = 0;
-        state.project_detail_path.clear();
         return;
     }
     if state.show_filter_popup() {
-        if state.filter_input_mode {
-            state.filter_input_mode = false;
-            state.filter_input.clear();
-            state.filter_input_error = false;
+        if state.filter_input_mode() {
+            state.set_filter_input_mode(false);
+            if let Some(input) = state.filter_input_mut() {
+                input.clear();
+            }
+            state.set_filter_input_error(false);
         } else {
             state.active_popup = crate::ActivePopup::None;
+        }
+        return;
+    }
+    if state.show_title_edit() {
+        if let crate::ActivePopup::TitleEdit { return_to, .. } = &state.active_popup {
+            state.active_popup = return_to.restore();
         }
         return;
     }
@@ -1182,14 +1270,21 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
 pub(crate) fn has_blocking_popup(state: &AppState) -> bool {
     use crate::ActivePopup::{
         DashboardDetail, Detail, FilterPopup, Help, InsightsDetail, None, ProjectDetail,
-        ProjectPopup, Summary,
+        ProjectPopup, Summary, TitleEdit,
     };
     // Exhaustive so a new ActivePopup variant forces a blocking/non-blocking
     // decision here. FilterPopup / ProjectPopup are non-blocking (clicks fall
-    // through to the underlying tab); the six detail/help overlays block.
-    match state.active_popup {
-        Help | ProjectDetail | Summary | Detail | DashboardDetail | InsightsDetail => true,
-        None | FilterPopup | ProjectPopup => false,
+    // through to the underlying tab); the detail/help overlays and the modal
+    // title editor block.
+    match &state.active_popup {
+        Help { .. }
+        | ProjectDetail { .. }
+        | Summary { .. }
+        | Detail
+        | DashboardDetail
+        | InsightsDetail { .. }
+        | TitleEdit { .. } => true,
+        None | FilterPopup { .. } | ProjectPopup { .. } => false,
     }
 }
 
@@ -1200,6 +1295,24 @@ pub(crate) fn live_visible_count(state: &AppState) -> usize {
         state.live_active.len() + state.live_paused.len()
     } else {
         state.live_past_sessions.len()
+    }
+}
+
+/// `[lo, hi)` range of `live_selected` values reachable in the current view.
+/// Full-screen pane modes confine the cursor to the visible list. The flat
+/// index is `0..active` for active rows, `active..active+paused` for paused, so
+/// the cursor-follow scroll (`live_selected < active_count`) keeps working
+/// unchanged. Past view is a single list independent of the pane mode.
+pub(crate) fn live_selectable_range(state: &AppState) -> (usize, usize) {
+    if state.live_view_snapshot_offset > 0 {
+        return (0, state.live_past_sessions.len());
+    }
+    let active = state.live_active.len();
+    let paused = state.live_paused.len();
+    match state.live_pane_mode {
+        LivePaneMode::Split => (0, active + paused),
+        LivePaneMode::ActiveOnly => (0, active),
+        LivePaneMode::PausedOnly => (active, active + paused),
     }
 }
 
@@ -1223,7 +1336,10 @@ pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
     match state.dashboard_panel {
         // Body = day rows + month dividers; the j/G key bounds must match the
         // popup's line-based scroll model so the oldest day is reachable.
-        0 => crate::ui::dashboard::active_days_body_line_count(state),
+        0 => crate::ui::dashboard::active_days_body_line_count(
+            state,
+            chrono::Local::now().date_naive(),
+        ),
         1 => state.stats.project_stats.len(),
         2 => state.model_costs.len(),
         3 => crate::ui::dashboard::tool_usage_line_count(state),
@@ -1248,7 +1364,10 @@ pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
             } else {
                 // Daily view renders active-day rows + month dividers, not every
                 // calendar group — match the popup's line-based total.
-                crate::ui::dashboard::active_days_body_line_count(state)
+                crate::ui::dashboard::active_days_body_line_count(
+                    state,
+                    chrono::Local::now().date_naive(),
+                )
             }
         }
         6 => 24,
@@ -1261,8 +1380,10 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
     let file_count = files.len();
     let cache = crate::infrastructure::Cache::load()
         .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
-    let mut cache_for_grouper = Some(cache.clone());
-    let (stats, cache_stats) = StatsAggregator::aggregate_with_shared_cache(&files, cache);
+    // Thread the stats-updated cache into the grouper: cold-start misses are
+    // parsed once (by stats) and become grouper cache hits.
+    let (stats, cache_stats, cache) = StatsAggregator::aggregate_with_shared_cache(&files, cache);
+    let mut cache_for_grouper = Some(cache);
     let daily_groups =
         DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache_for_grouper);
 
@@ -1312,6 +1433,67 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
         file_count,
         cache_stats,
     })
+}
+
+/// Route a paste to whichever field has focus, applying its char policy —
+/// one decision shared with the typing path, so a new field can't accept
+/// paste that typing would reject. A "selected" restored query is replaced
+/// by the paste, exactly like the first typed char.
+pub(crate) fn paste_into_active_input(
+    state: &mut AppState,
+    text: &str,
+) -> Option<crate::InputKind> {
+    let kind = state.active_text_input().map(|(_, kind)| kind)?;
+    match kind {
+        crate::InputKind::Search if state.search_select_all => {
+            state.search_select_all = false;
+            state.search_input.set(String::new());
+        }
+        crate::InputKind::PaneSearch => {
+            if let Some(idx) = state.active_pane_index
+                && let Some(pane) = state.panes.get_mut(idx)
+                && pane.search_select_all
+            {
+                pane.search_select_all = false;
+                pane.search_input.set(String::new());
+            }
+        }
+        _ => {}
+    }
+    let (input, kind) = state.active_text_input()?;
+    for c in text.chars() {
+        if let Some(c) = kind.sanitize_input_char(c) {
+            input.insert_char(c);
+        }
+    }
+    Some(kind)
+}
+
+/// Refresh derived state after text lands in an input field, once per paste
+/// (the typing path runs these per keystroke). Outside `AppState` because it
+/// drives main-crate helpers (`start_content_search`, pane match recompute).
+pub(crate) fn apply_text_input_side_effects(state: &mut AppState, kind: crate::InputKind) {
+    match kind {
+        crate::InputKind::Title => {}
+        crate::InputKind::Search => {
+            let ctx_owned = build_search_filter_ctx(state);
+            state.search_results = search::perform_search(
+                &state.daily_groups,
+                &state.search_input.text,
+                &ctx_owned.as_ref(),
+            );
+            state.search_selected = 0;
+            start_content_search(state);
+        }
+        crate::InputKind::Filter => state.set_filter_input_error(false),
+        crate::InputKind::PaneSearch => {
+            if let Some(idx) = state.active_pane_index
+                && let Some(pane) = state.panes.get_mut(idx)
+            {
+                ui::on_pane_search_edit(pane);
+            }
+        }
+    }
 }
 
 /// Snapshot the path sets a search-filter run needs from live/paused
@@ -1473,7 +1655,14 @@ fn start_index_build(state: &mut AppState) {
     state.index_build_task = Some(rx);
 
     std::thread::spawn(move || {
-        if let Ok(index) = infrastructure::SearchIndex::update_or_build(&groups) {
+        // First-run builds hand out an early head-chunk snapshot so search
+        // works while the tail indexes; the final send replaces it.
+        let early_tx = tx.clone();
+        let early = move |idx: infrastructure::SearchIndex| {
+            let _ = early_tx.send(Arc::new(idx));
+        };
+        if let Ok(index) = infrastructure::SearchIndex::update_or_build_with_early(&groups, &early)
+        {
             let _ = tx.send(Arc::new(index));
         }
     });
@@ -1481,7 +1670,7 @@ fn start_index_build(state: &mut AppState) {
 
 pub(crate) use text::format_number;
 
-pub(crate) use summary::update_jsonl_summary;
+pub(crate) use summary::update_jsonl_custom_title;
 
 #[cfg(test)]
 include!("main_tests.rs");

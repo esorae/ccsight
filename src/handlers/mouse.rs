@@ -21,7 +21,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         // letting it fall through would close the popup underneath while
         // leaving filter_input_mode orphaned. dismiss_overlay exits input
         // mode first (the popup stays open), matching Esc.
-        if state.filter_input_mode {
+        if state.filter_input_mode() {
             crate::dismiss_overlay(state);
             return;
         }
@@ -31,7 +31,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
             let relative_row = (row - area.y).saturating_sub(1) as usize;
             let total_items = PeriodFilter::ALL_VARIANTS.len() + 1;
             if relative_row < total_items {
-                state.filter_popup_selected = relative_row;
+                state.set_filter_popup_selected(relative_row);
             }
             return;
         }
@@ -44,10 +44,10 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
             && in_area(column, row, &area)
         {
             let relative_row = (row - area.y).saturating_sub(1) as usize;
-            let clicked_idx = state.project_popup_scroll + relative_row;
+            let clicked_idx = state.project_popup_scroll() + relative_row;
             let total = state.project_list.len() + 1;
             if clicked_idx < total {
-                state.project_popup_selected = clicked_idx;
+                state.set_project_popup_selected(clicked_idx);
             }
             return;
         }
@@ -147,8 +147,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     if let Some(area) = state.layout.help_trigger
         && in_area(column, row, &area)
     {
-        state.active_popup = crate::ActivePopup::Help;
-        state.help_scroll = 0;
+        state.active_popup = crate::ActivePopup::Help { scroll: 0 };
         return;
     }
 
@@ -157,17 +156,22 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         if let Some(area) = state.layout.filter_popup_area_trigger
             && in_area(column, row, &area)
         {
-            state.active_popup = crate::ActivePopup::FilterPopup;
-            state.filter_popup_selected = 0;
+            state.active_popup = crate::ActivePopup::FilterPopup {
+                selected: 0,
+                input_mode: false,
+                input: crate::TextInput::default(),
+                input_error: false,
+            };
             return;
         }
         if let Some(area) = state.layout.project_popup_area_trigger
             && in_area(column, row, &area)
         {
             state.rebuild_project_list();
-            state.active_popup = crate::ActivePopup::ProjectPopup;
-            state.project_popup_selected = 0;
-            state.project_popup_scroll = 0;
+            state.active_popup = crate::ActivePopup::ProjectPopup {
+                selected: 0,
+                scroll: 0,
+            };
             return;
         }
         if let Some(area) = state.layout.pin_view_trigger
@@ -487,16 +491,16 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
     if state.show_filter_popup() {
         // Same modal rule as single-click: never let a double-click fall
         // through to the UI underneath while date input is active.
-        if state.filter_input_mode {
+        if state.filter_input_mode() {
             crate::dismiss_overlay(state);
             return;
         }
-        if state.filter_popup_selected < PeriodFilter::ALL_VARIANTS.len() {
-            state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected];
+        if state.filter_popup_selected() < PeriodFilter::ALL_VARIANTS.len() {
+            state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected()];
             state.apply_filter();
             state.active_popup = crate::ActivePopup::None;
         } else {
-            state.filter_input_mode = true;
+            state.set_filter_input_mode(true);
             let text = match state.period_filter {
                 PeriodFilter::Custom(s, Some(e)) if s == e => s.format("%Y-%m-%d").to_string(),
                 PeriodFilter::Custom(s, Some(e)) => {
@@ -505,20 +509,29 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
                 PeriodFilter::Custom(s, None) => s.format("%Y-%m-%d").to_string(),
                 _ => String::new(),
             };
-            state.filter_input.set(text);
-            state.filter_input_error = false;
+            if let Some(input) = state.filter_input_mut() {
+                input.set(text);
+            }
+            state.set_filter_input_error(false);
         }
         return;
     }
 
+    if state.show_title_edit() {
+        // Modal text input: a double-click must never fall through to open a
+        // session underneath — absorb it (dismiss, matching Esc).
+        crate::dismiss_overlay(state);
+        return;
+    }
+
     if state.show_project_popup() {
-        if state.project_popup_selected == 0 {
+        if state.project_popup_selected() == 0 {
             state.project_filter = None;
         } else {
             // Selection indexes into the display-sorted view so the chosen
             // row matches whatever the user is looking at on screen.
             let sorted = state.project_list_sorted();
-            if let Some((name, _, _)) = sorted.get(state.project_popup_selected - 1).copied() {
+            if let Some((name, _, _)) = sorted.get(state.project_popup_selected() - 1).copied() {
                 state.project_filter = Some(name.clone());
             }
         }
@@ -547,9 +560,10 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
                 let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
                 state.sort_projects(&mut projects);
                 if let Some((name, _)) = projects.get(idx) {
-                    state.project_detail_path = (*name).clone();
-                    state.project_detail_scroll = 0;
-                    state.active_popup = crate::ActivePopup::ProjectDetail;
+                    state.active_popup = crate::ActivePopup::ProjectDetail {
+                        path: (*name).clone(),
+                        scroll: 0,
+                    };
                     state.dashboard_scroll[1] = idx;
                 }
                 return;
@@ -581,7 +595,10 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
         && let Some((area, scroll, item_height)) = state.layout.session_list_area
         && in_area(column, row, &area)
     {
-        let relative_y = (row - area.y) as usize;
+        // `session_list_area` is the OUTER bordered chunk, so the first row sits
+        // at `area.y + 1`; drop that border row before dividing (mirrors the
+        // single-click handler — without it line2 opens the next session).
+        let relative_y = (row - area.y).saturating_sub(1) as usize;
         let clicked_idx = scroll + relative_y / item_height;
         if let Some(group) = state.daily_groups.get(state.selected_day) {
             let session_count = group.user_sessions().count();
@@ -617,8 +634,7 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
         for (idx, area) in state.layout.insights_panel_areas.iter().enumerate() {
             if in_area(column, row, area) {
                 state.insights_panel = idx;
-                state.active_popup = crate::ActivePopup::InsightsDetail;
-                state.insights_detail_scroll = 0;
+                state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
                 return;
             }
         }
@@ -628,12 +644,20 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
 /// Handles a wheel scroll event — popup-aware, panel-aware. `up = true` means
 /// the user scrolled the wheel toward themselves (content moves down visually).
 pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, up: bool) {
+    // Text-entry modals capture everything: a wheel tick while typing a
+    // title or a custom date must not move state behind the input.
+    if state.show_title_edit() {
+        return;
+    }
     if state.show_filter_popup() {
+        if state.filter_input_mode() {
+            return;
+        }
         let max = PeriodFilter::ALL_VARIANTS.len();
         if up {
-            state.filter_popup_selected = state.filter_popup_selected.saturating_sub(1);
-        } else if state.filter_popup_selected < max {
-            state.filter_popup_selected += 1;
+            state.set_filter_popup_selected(state.filter_popup_selected().saturating_sub(1));
+        } else if state.filter_popup_selected() < max {
+            state.set_filter_popup_selected(state.filter_popup_selected() + 1);
         }
         return;
     }
@@ -641,27 +665,31 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
     if state.show_project_popup() {
         let max = state.project_list.len().saturating_sub(1);
         if up {
-            state.project_popup_selected = state.project_popup_selected.saturating_sub(1);
-        } else if state.project_popup_selected < max {
-            state.project_popup_selected += 1;
+            state.set_project_popup_selected(state.project_popup_selected().saturating_sub(1));
+        } else if state.project_popup_selected() < max {
+            state.set_project_popup_selected(state.project_popup_selected() + 1);
         }
         return;
     }
 
     if state.show_project_detail() {
         if up {
-            state.project_detail_scroll = state.project_detail_scroll.saturating_sub(SCROLL_LINES);
+            state.set_project_detail_scroll(
+                state.project_detail_scroll().saturating_sub(SCROLL_LINES),
+            );
         } else {
-            state.project_detail_scroll = state.project_detail_scroll.saturating_add(SCROLL_LINES);
+            state.set_project_detail_scroll(
+                state.project_detail_scroll().saturating_add(SCROLL_LINES),
+            );
         }
         return;
     }
 
     if state.show_summary() {
         if up {
-            state.summary_scroll = state.summary_scroll.saturating_sub(SCROLL_LINES);
+            state.set_summary_scroll(state.summary_scroll().saturating_sub(SCROLL_LINES));
         } else {
-            state.summary_scroll += SCROLL_LINES;
+            state.set_summary_scroll(state.summary_scroll() + SCROLL_LINES);
         }
         return;
     }
@@ -678,9 +706,9 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
 
     if state.show_help() {
         if up {
-            state.help_scroll = state.help_scroll.saturating_sub(1);
+            state.set_help_scroll(state.help_scroll().saturating_sub(1));
         } else {
-            state.help_scroll = state.help_scroll.saturating_add(1);
+            state.set_help_scroll(state.help_scroll().saturating_add(1));
         }
         return;
     }
@@ -696,11 +724,13 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
 
     if state.show_insights_detail() {
         if up {
-            state.insights_detail_scroll =
-                state.insights_detail_scroll.saturating_sub(SCROLL_LINES);
+            state.set_insights_detail_scroll(
+                state.insights_detail_scroll().saturating_sub(SCROLL_LINES),
+            );
         } else {
-            state.insights_detail_scroll =
-                state.insights_detail_scroll.saturating_add(SCROLL_LINES);
+            state.set_insights_detail_scroll(
+                state.insights_detail_scroll().saturating_add(SCROLL_LINES),
+            );
         }
         return;
     }
@@ -741,10 +771,8 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
                         // Clamp eagerly: a scroll burst would otherwise drive
                         // `selected_message` (computed before the next draw)
                         // onto the last message, not the visible row.
-                        let max_scroll = pane
-                            .rendered
-                            .as_ref()
-                            .map_or(usize::MAX, |(lines, _, _, _)| {
+                        let max_scroll =
+                            pane.rendered.as_ref().map_or(usize::MAX, |(lines, _, _)| {
                                 lines.len().saturating_sub(area.height as usize)
                             });
                         pane.scroll = pane.scroll.saturating_add(SCROLL_LINES).min(max_scroll);
@@ -1119,6 +1147,91 @@ mod tests {
         assert_eq!(
             state.panes[0].selected_message, 2,
             "info-header click must not change message selection"
+        );
+    }
+
+    #[test]
+    fn scroll_with_popup_open_never_falls_through_to_the_tab() {
+        // Every scrollable popup guard must consume the wheel event; the
+        // underlying tab state observing a change means a fall-through.
+        let popups: Vec<crate::ActivePopup> = vec![
+            crate::ActivePopup::Help { scroll: 0 },
+            crate::ActivePopup::InsightsDetail { scroll: 0 },
+            crate::ActivePopup::Summary { scroll: 0 },
+            crate::ActivePopup::ProjectDetail {
+                path: "proj".to_string(),
+                scroll: 0,
+            },
+            crate::ActivePopup::FilterPopup {
+                selected: 0,
+                input_mode: false,
+                input: crate::TextInput::default(),
+                input_error: false,
+            },
+            crate::ActivePopup::ProjectPopup {
+                selected: 0,
+                scroll: 0,
+            },
+        ];
+        for popup in popups {
+            let mut state = make_test_app_state(Vec::new());
+            let day_before = state.selected_day;
+            let dash_before = state.dashboard_scroll;
+            state.active_popup = popup.clone();
+            handle_mouse_scroll(&mut state, 5, 5, false);
+            assert_eq!(state.selected_day, day_before, "fall-through: {popup:?}");
+            assert_eq!(
+                state.dashboard_scroll, dash_before,
+                "fall-through: {popup:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_down_advances_the_open_popup_scroll() {
+        let mut state = make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::Help { scroll: 0 };
+        handle_mouse_scroll(&mut state, 5, 5, false);
+        assert_eq!(state.help_scroll(), 1);
+
+        state.active_popup = crate::ActivePopup::FilterPopup {
+            selected: 0,
+            input_mode: false,
+            input: crate::TextInput::default(),
+            input_error: false,
+        };
+        handle_mouse_scroll(&mut state, 5, 5, false);
+        assert_eq!(state.filter_popup_selected(), 1);
+        handle_mouse_scroll(&mut state, 5, 5, true);
+        handle_mouse_scroll(&mut state, 5, 5, true);
+        assert_eq!(
+            state.filter_popup_selected(),
+            0,
+            "scroll up saturates at the first row"
+        );
+    }
+
+    #[test]
+    fn click_during_filter_input_mode_exits_input_but_keeps_the_popup() {
+        // Date-input mode is modal: a click anywhere behaves like Esc (back
+        // to the preset list), never selecting rows or closing the popup.
+        let mut state = make_test_app_state(Vec::new());
+        let mut input = crate::TextInput::default();
+        input.set("2026".to_string());
+        state.active_popup = crate::ActivePopup::FilterPopup {
+            selected: 0,
+            input_mode: true,
+            input,
+            input_error: true,
+        };
+        handle_mouse_click(&mut state, 5, 5);
+        assert!(state.show_filter_popup(), "popup must stay open");
+        assert!(!state.filter_input_mode(), "input mode must exit");
+        assert!(!state.filter_input_error(), "error must clear");
+        assert_eq!(
+            state.filter_input().map(|i| i.text.as_str()),
+            Some(""),
+            "typed date must clear on exit"
         );
     }
 }

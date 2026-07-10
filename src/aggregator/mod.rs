@@ -14,6 +14,23 @@ pub use pricing::*;
 pub use stats::{CacheStats, ProjectStats, Stats, StatsAggregator, TokenStats};
 pub use tool_category::*;
 
+/// The first cwd whose official slug matches the transcript's parent dir
+/// name — i.e. a *verified* `cd` target for `claude -r`, which only resolves
+/// sessions from the directory its storage slug denotes. The first cwd
+/// (launch dir) usually qualifies; after a `/cd`-style relocation only a
+/// later cwd does, and a file may hold none at all (→ `None`, never guess).
+pub(crate) fn extract_verified_cwd(
+    entries: &[crate::domain::LogEntry],
+    file_path: &std::path::Path,
+) -> Option<String> {
+    let parent = file_path.parent()?.file_name()?.to_str()?;
+    entries
+        .iter()
+        .filter_map(|e| e.cwd.as_ref())
+        .find(|cwd| crate::infrastructure::live_sessions::official_project_slug(cwd) == parent)
+        .cloned()
+}
+
 pub(crate) fn extract_project_name(entries: &[crate::domain::LogEntry]) -> Option<String> {
     // FIRST cwd (not last): mid-session `cd` is navigation, not an
     // identity change — using `rev()` like model / branch would split one
@@ -110,7 +127,38 @@ mod tests {
             is_sidechain: false,
             user_type: None,
             request_id: None,
+            level: None,
         }
+    }
+
+    fn entry_with_cwd(cwd: &str) -> LogEntry {
+        let mut e = assistant_entry(None);
+        e.cwd = Some(cwd.to_string());
+        e
+    }
+
+    #[test]
+    fn extract_verified_cwd_picks_the_slug_matching_witness() {
+        let file = std::path::Path::new("/x/projects/-home-me-my-proj/abc.jsonl");
+        // First cwd matches the storage slug → picked.
+        let entries = vec![entry_with_cwd("/home/me/my-proj")];
+        assert_eq!(
+            extract_verified_cwd(&entries, file).as_deref(),
+            Some("/home/me/my-proj")
+        );
+        // Relocated session: only a later cwd matches — position must not
+        // matter, the slug check decides.
+        let entries = vec![
+            entry_with_cwd("/home/me/my-proj/sub/dir"),
+            entry_with_cwd("/home/me/my-proj"),
+        ];
+        assert_eq!(
+            extract_verified_cwd(&entries, file).as_deref(),
+            Some("/home/me/my-proj")
+        );
+        // No cwd slug-matches the storage dir → None, never a guess.
+        let entries = vec![entry_with_cwd("/somewhere/else")];
+        assert_eq!(extract_verified_cwd(&entries, file), None);
     }
 
     #[test]

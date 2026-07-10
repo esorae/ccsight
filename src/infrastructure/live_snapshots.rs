@@ -28,6 +28,10 @@ pub const MULTI_SNAPSHOT_DAYS: i64 = 3;
 /// removed entirely.
 pub const SNAPSHOT_RETENTION_DAYS: i64 = 7;
 
+/// Identity fields mirror `live_diagnostic::SnapshotEntry` (that struct
+/// adds `last_seen`) — not merged because each is serialized to a
+/// different on-disk shape read by existing files; add a new identity
+/// field to BOTH structs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSnapshotEntry {
     pub session_id: String,

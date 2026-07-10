@@ -8,9 +8,9 @@ mod tests {
     use std::time::Instant;
 
     /// Sum every session's per-model token fields (the DailyGrouper path) into
-    /// one `TokenStats` for comparison with the StatsAggregator total. Single
-    /// copy of the 6-field accumulation so a new `TokenStats` field can't be
-    /// silently omitted from one of the three agreement tests.
+    /// one `TokenStats` for comparison with the StatsAggregator total. Routes
+    /// through `TokenStats::merge` so a field added to the struct is folded
+    /// here without this helper knowing about it.
     fn sum_grouper_tokens(
         groups: &[crate::aggregator::DailyGroup],
     ) -> crate::aggregator::TokenStats {
@@ -18,12 +18,7 @@ mod tests {
         for group in groups {
             for session in &group.sessions {
                 for ts in session.day_tokens_by_model.values() {
-                    g.input_tokens += ts.input_tokens;
-                    g.output_tokens += ts.output_tokens;
-                    g.cache_creation_tokens += ts.cache_creation_tokens;
-                    g.cache_read_tokens += ts.cache_read_tokens;
-                    g.cache_creation_5m_tokens += ts.cache_creation_5m_tokens;
-                    g.cache_creation_1h_tokens += ts.cache_creation_1h_tokens;
+                    g.merge(ts);
                 }
             }
         }
@@ -103,9 +98,15 @@ mod tests {
         .ok();
 
         let start1 = Instant::now();
-        let result1 = load_data(20);
+        let result1 = load_data(20).unwrap();
         let duration1 = start1.elapsed();
-        let _cache1 = result1.unwrap().cache_stats;
+        // No ~/.claude data on this runner → nothing to cache or time; no-op
+        // like the other real-data #[ignore] tests so the release ignored-test
+        // job stays green on a clean runner.
+        if result1.file_count == 0 {
+            return;
+        }
+        let _cache1 = result1.cache_stats;
 
         let start2 = Instant::now();
         let result2 = load_data(20);
@@ -141,44 +142,134 @@ mod tests {
         }
     }
 
-    /// Real-data twin of `stats_and_grouper_agree_on_fixture`: the two
-    /// independent aggregation paths (StatsAggregator / DailyGrouper) must
-    /// agree on token totals across ALL `~/.claude` files. `#[ignore]` —
-    /// slow (~3min) and races a live ccsight session mutating JSONLs; run via
-    /// `cargo test -- --ignored`. The fixture twin guards the per-commit gate.
+    /// Real-data twin of `stats_and_grouper_agree_on_fixture`: both aggregation
+    /// paths must agree EXACTLY over `~/.claude`. Exact, not fuzzy — a tolerance
+    /// encodes one machine's data size and write rate and hides regressions.
+    /// Recently written files are excluded (live sessions) and the rest are
+    /// identity-checked afterwards; if any moved, the run is inconclusive.
     #[test]
-    #[ignore = "real-data agreement check — slow + live-drift; run via --ignored"]
+    #[ignore = "real-data agreement check — reads all of ~/.claude; run via --ignored"]
     fn test_stats_and_grouper_agree_on_token_totals() {
-        let result = load_data(0).unwrap();
-        if result.file_count == 0 {
+        use std::time::{Duration, SystemTime};
+        // A filter, not a tolerance: a file untouched this long is unlikely to
+        // be mid-write, and the post-run identity check catches any that was.
+        const QUIET: Duration = Duration::from_secs(600);
+
+        let all = crate::infrastructure::FileDiscovery::find_jsonl_files_with_limit(0).unwrap();
+        if all.is_empty() {
             return;
         }
+        let identity =
+            |p: &std::path::Path| std::fs::metadata(p).ok().map(|m| (m.modified().ok(), m.len()));
+        let now = SystemTime::now();
+        let (files, hot): (Vec<_>, Vec<_>) = all.into_iter().partition(|p| {
+            identity(p)
+                .and_then(|(m, _)| m)
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= QUIET)
+        });
+        let before: Vec<_> = files.iter().map(|p| identity(p)).collect();
 
-        let g = sum_grouper_tokens(&result.daily_groups);
+        let started = Instant::now();
+        let cache = crate::infrastructure::Cache::load()
+            .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
+        let (stats, _, cache) =
+            crate::aggregator::StatsAggregator::aggregate_with_shared_cache(&files, cache);
+        let mut cache = Some(cache);
+        let groups =
+            crate::aggregator::DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
+        let elapsed = started.elapsed();
 
-        // Two aggregators open JSONLs independently; in a dev env with a
-        // live ccsight session, kilotoken drift can leak between passes.
-        // Real regressions produced megatoken gaps, so 0.5% stays sharp.
-        let s = &result.stats.total_tokens;
-        let pairs: [(u64, u64, &str); 6] = [
-            (g.input_tokens, s.input_tokens, "input"),
-            (g.output_tokens, s.output_tokens, "output"),
-            (g.cache_creation_tokens, s.cache_creation_tokens, "cache_w"),
-            (g.cache_read_tokens, s.cache_read_tokens, "cache_r"),
-            (g.cache_creation_5m_tokens, s.cache_creation_5m_tokens, "cache_5m"),
-            (g.cache_creation_1h_tokens, s.cache_creation_1h_tokens, "cache_1h"),
-        ];
-        for (g, s, name) in pairs {
-            let max = g.max(s);
-            let diff = g.abs_diff(s);
-            // 0.5% + 1024-floor: tolerates inter-pass live-JSONL drift,
-            // still catches real regressions (multi-megatoken gaps).
-            let allowed = (max / 200).max(1024);
-            assert!(
-                diff <= allowed,
-                "{name}: grouper={g} stats={s} diff={diff} > allowed={allowed} \
-                 — the two aggregation paths diverged beyond mid-test drift."
-            );
+        let moved = files
+            .iter()
+            .zip(&before)
+            .filter(|(p, b)| identity(p) != **b)
+            .count();
+        // The premises the result rests on, so a run that excluded most of
+        // the data or ran far longer than usual is visibly weaker.
+        println!(
+            "real-data agreement: compared {} files, excluded {} written in the last {}s, \
+             {} moved mid-run, {:.0}s",
+            files.len(),
+            hot.len(),
+            QUIET.as_secs(),
+            moved,
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            moved == 0,
+            "inconclusive: {moved} file(s) changed while the passes ran, so the totals are \
+             not comparable — nothing is claimed either way. Re-run when no session is writing."
+        );
+        assert_eq!(
+            sum_grouper_tokens(&groups),
+            stats.total_tokens,
+            "aggregation paths diverged on a frozen input set"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf measurement — run via --ignored --nocapture"]
+    fn measure_per_tab_draw() {
+        let data = load_data(0).unwrap();
+        if data.file_count == 0 {
+            return;
+        }
+        let mut state = crate::AppState::new_initial(0);
+        state.apply_loaded_data(data);
+        let slices: usize = state
+            .original_daily_groups
+            .iter()
+            .map(|g| g.sessions.len())
+            .sum();
+
+        let render_once = |state: &mut crate::AppState| {
+            let backend = ratatui::backend::TestBackend::new(140, 45);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, state)).unwrap();
+        };
+
+        // Populate live_active from real session paths so the Live tab actually
+        // indexes cum_map — an empty list lets release DCE elide the build and
+        // underreport the Live draw cost.
+        let paths: Vec<std::path::PathBuf> = state
+            .original_daily_groups
+            .iter()
+            .flat_map(|g| g.sessions.iter().map(|s| s.file_path.clone()))
+            .take(20)
+            .collect();
+        state.live_active = paths
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| crate::infrastructure::live_sessions::LiveSession {
+                session_id: format!("s{i}"),
+                jsonl_path: Some(p.clone()),
+                cwd: p.parent().unwrap_or(&p).to_path_buf(),
+                name: None,
+                status: Some("busy".to_string()),
+                pid: 0,
+                started_at: None,
+                updated_at: Some(chrono::Utc::now()),
+                jsonl_mtime: Some(chrono::Utc::now()),
+                is_live: true,
+                was_recently_live: false,
+            })
+            .collect();
+
+        let iters = 30u32;
+        for (tab, name) in [
+            (crate::Tab::Dashboard, "Dashboard"),
+            (crate::Tab::Daily, "Daily"),
+            (crate::Tab::Insights, "Insights"),
+            (crate::Tab::Live, "Live"),
+        ] {
+            state.tab = tab;
+            render_once(&mut state); // warm
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                render_once(&mut state);
+            }
+            println!("draw {} ({} slices): {:?}/frame", name, slices, start.elapsed() / iters);
         }
     }
 
@@ -235,7 +326,7 @@ mod tests {
         .unwrap();
 
         let files = vec![file_a, file_b];
-        let (stats, _) = StatsAggregator::aggregate_with_shared_cache(
+        let (stats, _, _) = StatsAggregator::aggregate_with_shared_cache(
             &files,
             crate::infrastructure::Cache::new_empty(),
         );
@@ -270,6 +361,27 @@ mod tests {
         assert_eq!(s.cache_read_tokens, 200, "deduped cache_r total");
         assert_eq!(s.cache_creation_5m_tokens, 200, "5m split");
         assert_eq!(s.cache_creation_1h_tokens, 100, "1h split");
+
+        // Overview's total (priced once per model from StatsAggregator) and
+        // the Costs panel's sum (priced per session-day-model from
+        // DailyGrouper) are independent paths the token checks above don't
+        // cover — pin that they reconcile to the same total.
+        let calculator = CostCalculator::global();
+        let overview_cost: f64 = calculator
+            .calculate_costs_by_model(&stats.model_tokens)
+            .iter()
+            .map(|(_, c)| c)
+            .sum();
+        let daily_panel_cost: f64 = groups
+            .iter()
+            .flat_map(|g| &g.sessions)
+            .flat_map(|s| &s.day_tokens_by_model)
+            .filter_map(|(model, tokens)| calculator.calculate_cost(tokens, Some(model.as_str())))
+            .sum();
+        assert!(
+            (overview_cost - daily_panel_cost).abs() < 0.001,
+            "Overview cost {overview_cost} must match Costs-panel sum {daily_panel_cost}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -381,6 +493,39 @@ mod tests {
         sample
     }
 
+    #[test]
+    fn stats_pass_cache_satisfies_grouper_hit_precondition() {
+        // Cold-start single-parse invariant: after the stats pass, every
+        // file's cache entry must validate AND carry daily_stats — the two
+        // conditions the grouper's hit path checks. If either fails, the
+        // grouper silently re-parses everything the stats pass just parsed.
+        let dir = std::env::temp_dir().join(format!("ccsight-handoff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.jsonl");
+        std::fs::write(
+            &file,
+            r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T10:00:00Z","sessionId":"s","requestId":"r1","message":{"id":"m1","role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        )
+        .unwrap();
+        let files = vec![file.clone()];
+
+        let (_stats, cache_stats, cache) = StatsAggregator::aggregate_with_shared_cache(
+            &files,
+            crate::infrastructure::Cache::new_empty(),
+        );
+        assert_eq!(cache_stats.parsed_files, 1);
+        assert!(
+            cache.is_valid(&file),
+            "stats-written entry must validate for the grouper"
+        );
+        assert!(
+            !cache.get(&file).unwrap().daily_stats.is_empty(),
+            "daily_stats must be populated so the grouper hit path engages"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Real-data agreement check kept in the per-commit gate by running the two
     /// aggregators over a SAMPLE of real files (not `load_data`-ing everything).
     /// Catches shapes the hand-built fixture can't anticipate; no-ops on CI.
@@ -394,7 +539,7 @@ mod tests {
         if sample.is_empty() {
             return;
         }
-        let (stats, _) = StatsAggregator::aggregate_with_shared_cache(
+        let (stats, _, _) = StatsAggregator::aggregate_with_shared_cache(
             &sample,
             crate::infrastructure::Cache::new_empty(),
         );
@@ -1002,7 +1147,7 @@ mod tests {
     fn test_extract_ascii_single_line() {
         let buf = make_buffer(20, 3, &["Hello, World!       ", "Second line         "]);
         let sel = (0, 0, 12, 0);
-        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0, 0);
         assert_eq!(text, "Hello, World!");
     }
 
@@ -1010,7 +1155,7 @@ mod tests {
     fn test_extract_ascii_multi_line() {
         let buf = make_buffer(20, 3, &["Hello               ", "World               "]);
         let sel = (0, 0, 19, 1);
-        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0, 0);
         assert_eq!(text, "Hello\nWorld");
     }
 
@@ -1018,7 +1163,7 @@ mod tests {
     fn test_extract_cjk_no_extra_spaces() {
         let buf = make_buffer(20, 2, &["自動スクロール      "]);
         let sel = (0, 0, 19, 0);
-        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0, 0);
         assert_eq!(text, "自動スクロール");
     }
 
@@ -1026,7 +1171,7 @@ mod tests {
     fn test_extract_cjk_mixed_with_ascii() {
         let buf = make_buffer(30, 2, &["Hello自動World      "]);
         let sel = (0, 0, 29, 0);
-        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0, 0);
         assert_eq!(text, "Hello自動World");
     }
 
@@ -1034,7 +1179,7 @@ mod tests {
     fn test_extract_cjk_partial_selection() {
         let buf = make_buffer(20, 2, &["あいうえお          "]);
         let sel = (2, 0, 7, 0);
-        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0, 0);
         assert_eq!(text, "いうえ");
     }
 
@@ -1051,7 +1196,7 @@ mod tests {
         );
         let conv_area = ratatui::layout::Rect::new(11, 0, 29, 3);
         let sel = (11, 0, 39, 2);
-        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), None, 0, 0);
         assert_eq!(text, "content line 1\ncontent line 2\ncontent line 3");
     }
 
@@ -1069,7 +1214,7 @@ mod tests {
         );
         let conv_area = ratatui::layout::Rect::new(0, 1, 30, 2);
         let sel = (0, 1, 29, 2);
-        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), None, 0, 0);
         assert_eq!(text, "content A\ncontent B");
     }
 
@@ -1085,7 +1230,7 @@ mod tests {
         );
         let conv_area = ratatui::layout::Rect::new(11, 0, 29, 2);
         let sel = (0, 0, 39, 1);
-        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), None, 0, 0);
         assert!(text.contains("sidebar"));
     }
 
@@ -1093,7 +1238,7 @@ mod tests {
     fn test_extract_reversed_selection() {
         let buf = make_buffer(20, 2, &["Hello World         "]);
         let sel = (10, 0, 0, 0);
-        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0, 0);
         assert_eq!(text, "Hello World");
     }
 
@@ -1101,7 +1246,7 @@ mod tests {
     fn test_extract_trailing_empty_lines_removed() {
         let buf = make_buffer(20, 5, &["Hello", "World", "   ", "   "]);
         let sel = (0, 0, 19, 3);
-        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, None, None, 0, 0);
         assert_eq!(text, "Hello\nWorld");
     }
 
@@ -1112,7 +1257,7 @@ mod tests {
             "  wrapped by the renderer".to_string(),
         ];
         let flags = vec![false, true];
-        let text = join_conversation_lines(&lines, &flags);
+        let text = join_conversation_lines(&lines, &flags, 0);
         assert_eq!(text, "This is a very long line that was word wrapped by the renderer");
     }
 
@@ -1123,7 +1268,7 @@ mod tests {
             "  Another line".to_string(),
         ];
         let flags = vec![false, false];
-        let text = join_conversation_lines(&lines, &flags);
+        let text = join_conversation_lines(&lines, &flags, 0);
         assert_eq!(text, "Short line\nAnother line");
     }
 
@@ -1134,8 +1279,26 @@ mod tests {
             "  continuation".to_string(),
         ];
         let flags = vec![false, false];
-        let text = join_conversation_lines(&lines, &flags);
+        let text = join_conversation_lines(&lines, &flags, 0);
         assert_eq!(text, "First message\ncontinuation");
+    }
+
+    #[test]
+    fn test_join_conversation_lines_strips_body_indent_keeps_content_indent() {
+        // Compact body line = marker(2) + hang-indent(2) + content. With
+        // body_indent=2 the hang-indent is dropped but the content's own
+        // leading whitespace (e.g. code indentation) survives.
+        let lines = vec!["    fn foo".to_string(), "        nested".to_string()];
+        let flags = vec![false, false];
+        assert_eq!(
+            join_conversation_lines(&lines, &flags, 2),
+            "fn foo\n    nested"
+        );
+        // body_indent=0 (full mode / popup) strips only the marker.
+        assert_eq!(
+            join_conversation_lines(&lines, &flags, 0),
+            "  fn foo\n      nested"
+        );
     }
 
     #[test]
@@ -1145,7 +1308,7 @@ mod tests {
             "  なにぬねの".to_string(),
         ];
         let flags = vec![false, true];
-        let text = join_conversation_lines(&lines, &flags);
+        let text = join_conversation_lines(&lines, &flags, 0);
         assert_eq!(
             text,
             "あいうえおかきくけこさしすせそたちつてと なにぬねの"
@@ -1156,7 +1319,7 @@ mod tests {
     fn test_join_conversation_lines_empty() {
         let lines: Vec<String> = vec![];
         let flags: Vec<bool> = vec![];
-        let text = join_conversation_lines(&lines, &flags);
+        let text = join_conversation_lines(&lines, &flags, 0);
         assert_eq!(text, "");
     }
 
@@ -1168,7 +1331,7 @@ mod tests {
             "  Paragraph two".to_string(),
         ];
         let flags = vec![false, false, false];
-        let text = join_conversation_lines(&lines, &flags);
+        let text = join_conversation_lines(&lines, &flags, 0);
         assert_eq!(text, "Paragraph one end that fills the width\n\nParagraph two");
     }
 
@@ -1181,7 +1344,7 @@ mod tests {
         let conv_area = ratatui::layout::Rect::new(0, 0, 20, 2);
         let flags = vec![false, true];
         let sel = (0, 0, 19, 1);
-        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), Some(&flags), 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), Some(&flags), 0, 0);
         assert_eq!(text, "hello world this is a test");
     }
 
@@ -1194,7 +1357,7 @@ mod tests {
         let conv_area = ratatui::layout::Rect::new(0, 0, 20, 2);
         let flags = vec![false, false];
         let sel = (0, 0, 19, 1);
-        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), Some(&flags), 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), Some(&flags), 0, 0);
         assert_eq!(text, "line one\nline two");
     }
 
@@ -1209,7 +1372,7 @@ mod tests {
             .chain(vec![false, true])
             .collect();
         let sel = (0, 0, 19, 1);
-        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), Some(&flags), 5);
+        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), Some(&flags), 5, 0);
         assert_eq!(text, "wrapped line continuation");
     }
 
@@ -1222,7 +1385,86 @@ mod tests {
         let conv_area = ratatui::layout::Rect::new(0, 0, 24, 2);
         let flags = vec![false, true];
         let sel = (0, 0, 23, 1);
-        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), Some(&flags), 0);
+        let text = extract_selected_text_from_buffer(&sel, &buf, Some(conv_area), Some(&flags), 0, 0);
         assert_eq!(text, "あいうえおかきくけこ さしすせそ");
+    }
+
+    // ── Property tests: aggregation totals ─────────────────────────────────────
+    // A third, independent oracle alongside the StatsAggregator↔DailyGrouper
+    // differential: both share one entry-walk, so a bug there moves them in
+    // lockstep.
+    mod agg_prop {
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            // Independent per-entry re-sum (computed here, via neither
+            // aggregator) equals StatsAggregator's total. Unique request/message
+            // ids prevent dedup so every usage bills once; the cache_creation
+            // breakdown is always present so 5m/1h take the structured branch
+            // (input/output/cw/cr/e5/e1 are then independent and sum exactly).
+            #[test]
+            fn stats_total_equals_independent_resum(
+                rows in proptest::collection::vec(
+                    (
+                        0u64..1_000_000,
+                        0u64..1_000_000,
+                        0u64..1_000_000,
+                        0u64..1_000_000,
+                        0u64..1_000_000,
+                        0u64..1_000_000,
+                    ),
+                    0..16,
+                ),
+            ) {
+                use std::io::Write;
+                let dir = std::env::temp_dir()
+                    .join(format!("ccsight-prop-agg-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let file = dir.join("proj.jsonl");
+                let mut f = std::fs::File::create(&file).unwrap();
+                let (mut ni, mut no, mut ncw, mut ncr, mut n5, mut n1) =
+                    (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+                for (i, (inp, out, cw, cr, e5, e1)) in rows.iter().enumerate() {
+                    ni += inp;
+                    no += out;
+                    ncw += cw;
+                    ncr += cr;
+                    n5 += e5;
+                    n1 += e1;
+                    writeln!(
+                        f,
+                        r#"{{"type":"assistant","uuid":"u{i}","timestamp":"2026-01-01T10:00:00Z","sessionId":"s","requestId":"req-{i}","message":{{"id":"msg-{i}","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"x"}}],"usage":{{"input_tokens":{inp},"output_tokens":{out},"cache_creation_input_tokens":{cw},"cache_read_input_tokens":{cr},"cache_creation":{{"ephemeral_5m_input_tokens":{e5},"ephemeral_1h_input_tokens":{e1}}}}}}}}}"#
+                    )
+                    .unwrap();
+                }
+                drop(f);
+                let files = vec![file];
+                let (stats, _, _) = crate::aggregator::StatsAggregator::aggregate_with_shared_cache(
+                    &files,
+                    crate::infrastructure::Cache::new_empty(),
+                );
+                let (stats2, _, _) = crate::aggregator::StatsAggregator::aggregate_with_shared_cache(
+                    &files,
+                    crate::infrastructure::Cache::new_empty(),
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                let t = &stats.total_tokens;
+                prop_assert_eq!(t.input_tokens, ni, "input");
+                prop_assert_eq!(t.output_tokens, no, "output");
+                prop_assert_eq!(t.cache_creation_tokens, ncw, "cache_creation");
+                prop_assert_eq!(t.cache_read_tokens, ncr, "cache_read");
+                prop_assert_eq!(t.cache_creation_5m_tokens, n5, "5m");
+                prop_assert_eq!(t.cache_creation_1h_tokens, n1, "1h");
+                // Determinism: re-aggregating identical input yields identical totals.
+                prop_assert_eq!(stats2.total_tokens.input_tokens, t.input_tokens);
+                prop_assert_eq!(
+                    stats2.total_tokens.cache_creation_tokens,
+                    t.cache_creation_tokens
+                );
+            }
+        }
     }
 }

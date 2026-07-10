@@ -17,7 +17,6 @@ struct InsightsMetrics {
     cache_hit_rate: f64,
     cache_5m_share: f64,
     tool_success_rate: f64,
-    completion_rate: f64,
     tokens_per_session: u64,
     tokens_per_day: u64,
 }
@@ -52,12 +51,6 @@ fn insights_metrics(
         0.0
     };
 
-    let completion_rate = if state.stats.total_sessions_count > 0 {
-        state.stats.sessions_with_summary as f64 / state.stats.total_sessions_count as f64 * 100.0
-    } else {
-        0.0
-    };
-
     let total_work_tokens = state.stats.total_tokens.work_tokens();
     let tokens_per_session = if total_sessions > 0 {
         total_work_tokens / total_sessions as u64
@@ -70,7 +63,6 @@ fn insights_metrics(
         cache_hit_rate,
         cache_5m_share,
         tool_success_rate,
-        completion_rate,
         tokens_per_session,
         tokens_per_day,
     }
@@ -359,7 +351,7 @@ fn draw_insights_weekly(
         } else {
             0
         };
-        let intensity = (ratio * 0.7 + 0.3).min(1.0);
+        let intensity = theme::bar_intensity(ratio);
         let bar_color = theme::primary_with_intensity(intensity);
         let marker = if *weekday == today_weekday {
             "▶"
@@ -465,7 +457,7 @@ fn draw_insights_monthly(frame: &mut Frame, area: Rect, state: &AppState) {
         let mut row_spans: Vec<Span> = vec![Span::raw(" ")];
         for (_, cost) in &months_view {
             let ratio = **cost / max_monthly;
-            let intensity = (ratio * 0.7 + 0.3).min(1.0);
+            let intensity = theme::bar_intensity(ratio);
             let color = theme::primary_with_intensity(intensity);
             // Fractional fill of THIS row: how much of the bar reaches into it.
             let frac = (ratio * bar_height as f64) - row as f64;
@@ -641,7 +633,6 @@ fn draw_insights_metrics(
         cache_hit_rate,
         cache_5m_share,
         tool_success_rate,
-        completion_rate,
         tokens_per_session,
         tokens_per_day,
     } = insights_metrics(state, total_sessions, calendar_days);
@@ -657,10 +648,9 @@ fn draw_insights_metrics(
         .collect();
     let row_chunks = Layout::vertical(row_constraints).split(metrics_inner);
     let row1_chunks = Layout::horizontal([
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
     ])
     .split(row_chunks[0]);
     let row2_chunks = Layout::horizontal([
@@ -671,24 +661,12 @@ fn draw_insights_metrics(
     ])
     .split(row_chunks[1]);
 
-    let row1_items: [(String, &str, ratatui::style::Color); 4] = [
+    let row1_items: [(String, &str, ratatui::style::Color); 3] = [
         (format!("{cache_hit_rate:.1}%"), "cache", theme::SUCCESS),
         (
             format!("{tool_success_rate:.1}%"),
             "success",
             if tool_success_rate >= 90.0 {
-                theme::SUCCESS
-            } else {
-                theme::WARNING
-            },
-        ),
-        (
-            // Match the cache / success neighbours and the popup body — all
-            // three rate metrics print with one decimal so the row reads as
-            // a uniform set rather than mixing `:.0` and `:.1` precisions.
-            format!("{completion_rate:.1}%"),
-            "summary",
-            if completion_rate >= 80.0 {
                 theme::SUCCESS
             } else {
                 theme::WARNING
@@ -899,11 +877,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
     ])
     .split(area);
 
-    let total_sessions: usize = state
-        .daily_groups
-        .iter()
-        .map(|g| g.user_sessions().count())
-        .sum();
+    let total_sessions = crate::aggregator::distinct_user_session_count(&state.daily_groups);
     let today = chrono::Local::now().date_naive();
     let first_date = state.daily_groups.iter().map(|g| g.date).min();
     let calendar_days = match first_date {
@@ -941,11 +915,12 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
     // Weekly activity (all-time average by weekday)
     draw_insights_weekly(frame, bottom_chunks[0], state, today, calendar_days);
 
+    // No ↑↓ entry: the Insights main view has nothing to scroll — reading
+    // depth lives in the detail popup (Enter), which has full scroll keys.
     let help_line = Paragraph::new(super::help_bar(&[
         ("?", "help"),
         ("q", "quit"),
         ("←→", "panel"),
-        ("↑↓", "scroll"),
         ("Enter", "detail"),
         ("/", "search"),
         ("m", "pins"),
@@ -958,17 +933,17 @@ fn insights_detail_metrics(
     calendar_days: usize,
     inner_width: usize,
 ) -> Vec<Line<'static>> {
-    let total_sessions: usize = state
-        .daily_groups
-        .iter()
-        .map(|g| g.user_sessions().count())
-        .sum();
-    let subagent_sessions: usize = state
+    let total_sessions = crate::aggregator::distinct_user_session_count(&state.daily_groups);
+    // Distinct subagent sessions (dedup by file_path), paired with the distinct
+    // user total above — a plain count would be subagent session-days.
+    let subagent_sessions = state
         .daily_groups
         .iter()
         .flat_map(|g| g.sessions.iter())
         .filter(|s| s.is_subagent)
-        .count();
+        .map(|s| &s.file_path)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     // Tokens + cost attributable to subagents. Used to surface the
     // breakdown next to Overview-style totals (which include subagents)
     // since `project_stats` excludes them — without this, sum-of-projects
@@ -989,7 +964,6 @@ fn insights_detail_metrics(
         cache_hit_rate,
         cache_5m_share,
         tool_success_rate,
-        completion_rate,
         tokens_per_session,
         tokens_per_day,
     } = insights_metrics(state, total_sessions, calendar_days);
@@ -1028,6 +1002,7 @@ fn insights_detail_metrics(
             Style::default().fg(theme::DIM),
         ),
     ]));
+
     let total_duration_mins: i64 = state
         .daily_groups
         .iter()
@@ -1074,10 +1049,21 @@ fn insights_detail_metrics(
             Style::default().fg(theme::DIM),
         ),
     ]));
+    // Without this the reader cannot tell a per-calendar-day average from a
+    // per-active-day one, and the two differ by the idle-day share. Silent
+    // when every day was active, since then there is nothing to disambiguate.
+    if active_days < calendar_days {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " /day figures divide by all {calendar_days} days, not the {active_days} active ones."
+            ),
+            Style::default().fg(theme::DIM),
+        )));
+    }
     lines.push(sep.clone());
 
     // Rates with descriptive labels
-    let rates: [(f64, &str, ratatui::style::Color); 4] = [
+    let rates: [(f64, &str, ratatui::style::Color); 3] = [
         (cache_hit_rate, "Cache Hit Rate   ", theme::SUCCESS),
         // Formula label, not prose: numerator and denominator are
         // both explicit so neither "which TTL" nor "vs reads or only
@@ -1088,15 +1074,6 @@ fn insights_detail_metrics(
             tool_success_rate,
             "Tool Success Rate",
             if tool_success_rate >= 90.0 {
-                theme::SUCCESS
-            } else {
-                theme::WARNING
-            },
-        ),
-        (
-            completion_rate,
-            "Has Summary      ",
-            if completion_rate >= 80.0 {
                 theme::SUCCESS
             } else {
                 theme::WARNING
@@ -1187,10 +1164,11 @@ fn insights_detail_metrics(
             today: chrono::NaiveDate,
             days: usize,
             label: &'static str,
+            missing: super::MissingDay,
             sampler: fn(&crate::aggregator::DailyGroup) -> super::DailyTrendValue,
             fmt: fn(f64) -> String,
         ) -> Tr {
-            let series = super::metric_per_day(state, today, days, sampler);
+            let series = super::metric_per_day(state, today, days, missing, sampler);
             let (recent, baseline) = super::summarise_series(&series);
             let spark = super::dashboard::render_spark_line(today, days, |d| {
                 series
@@ -1216,6 +1194,7 @@ fn insights_detail_metrics(
                 trend_today,
                 trend_days,
                 "$/day       ",
+                super::MissingDay::Zero,
                 |g| super::DailyTrendValue {
                     num: g
                         .sessions
@@ -1232,6 +1211,7 @@ fn insights_detail_metrics(
                 trend_today,
                 trend_days,
                 "Tokens/ses  ",
+                super::MissingDay::Skip,
                 super::tokens_per_session_value,
                 |v| crate::format_number(v as u64),
             ),
@@ -1240,6 +1220,7 @@ fn insights_detail_metrics(
                 trend_today,
                 trend_days,
                 "Sessions/day",
+                super::MissingDay::Zero,
                 super::sessions_per_day_value,
                 |v| format!("{v:.1}"),
             ),
@@ -1282,12 +1263,8 @@ fn insights_detail_metrics(
                 (total_cost * 1_000_000.0) as u64,
             );
             let filled = (ratio * bar_max as f64).round() as usize;
-            let intensity = (ratio * 0.7 + 0.3).min(1.0);
-            let bar_color = ratatui::style::Color::Rgb(
-                (100.0 + 118.0 * intensity) as u8,
-                (140.0 + 78.0 * intensity) as u8,
-                (200.0 + 55.0 * intensity) as u8,
-            );
+            let intensity = theme::bar_intensity(ratio);
+            let bar_color = theme::ramp_color(theme::RAMP_BLUE, intensity);
             let name: String = model.chars().take(name_w).collect();
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1324,12 +1301,8 @@ fn insights_detail_metrics(
             let display: String = short.chars().take(name_w).collect();
             let ratio = ps.work_tokens as f64 / max_tokens as f64;
             let filled = (ratio * bar_max as f64).round() as usize;
-            let intensity = (ratio * 0.7 + 0.3).min(1.0);
-            let bar_color = ratatui::style::Color::Rgb(
-                (140.0 + 78.0 * intensity) as u8,
-                (100.0 + 68.0 * intensity) as u8,
-                (180.0 + 75.0 * intensity) as u8,
-            );
+            let intensity = theme::bar_intensity(ratio);
+            let bar_color = theme::ramp_color(theme::RAMP_PURPLE, intensity);
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {display:<name_w$}"),
@@ -1411,12 +1384,8 @@ fn insights_detail_metrics(
                 0
             };
             let filled = (ratio * bar_max as f64).round() as usize;
-            let intensity = (ratio * 0.7 + 0.3).min(1.0);
-            let bar_color = ratatui::style::Color::Rgb(
-                (150.0 + 68.0 * intensity) as u8,
-                (180.0 + 38.0 * intensity) as u8,
-                (100.0 + 55.0 * intensity) as u8,
-            );
+            let intensity = theme::bar_intensity(ratio);
+            let bar_color = theme::ramp_color(theme::RAMP_OLIVE, intensity);
             let name = super::truncate_with_ellipsis(&tool_name, name_w);
             lines.push(Line::from(vec![
                 Span::styled(format!(" {name:<name_w$}"), Style::default().fg(color)),
@@ -1666,12 +1635,8 @@ fn insights_detail_metrics(
                 0
             };
             let filled = (ratio * bar_max as f64).round() as usize;
-            let intensity = (ratio * 0.7 + 0.3).min(1.0);
-            let bar_color = ratatui::style::Color::Rgb(
-                (40.0 + 46.0 * intensity) as u8,
-                (80.0 + 85.0 * intensity) as u8,
-                (90.0 + 90.0 * intensity) as u8,
-            );
+            let intensity = theme::bar_intensity(ratio);
+            let bar_color = theme::ramp_color(theme::RAMP_DEEP_TEAL, intensity);
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(
@@ -1937,7 +1902,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 };
                 let is_today = *wd == today_weekday;
                 let marker = if is_today { "▶" } else { " " };
-                let intensity = (ratio * 0.7 + 0.3).min(1.0);
+                let intensity = theme::bar_intensity(ratio);
                 let bar_color = theme::primary_with_intensity(intensity);
 
                 lines.push(Line::from(vec![
@@ -2020,12 +1985,12 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             };
             let visible_months = (avail / col_width).max(1);
             let max_scroll = total_months.saturating_sub(visible_months);
-            if state.insights_detail_scroll > max_scroll {
-                state.insights_detail_scroll = max_scroll;
+            if state.insights_detail_scroll() > max_scroll {
+                state.set_insights_detail_scroll(max_scroll);
             }
             let skip = total_months
                 .saturating_sub(visible_months)
-                .saturating_sub(state.insights_detail_scroll);
+                .saturating_sub(state.insights_detail_scroll());
             let months: Vec<_> = all_months
                 .into_iter()
                 .rev()
@@ -2052,7 +2017,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 let mut row_spans: Vec<Span> = vec![Span::raw("  ")];
                 for (_, cost) in &months {
                     let ratio = **cost / max_monthly;
-                    let intensity = (ratio * 0.7 + 0.3).min(1.0);
+                    let intensity = theme::bar_intensity(ratio);
                     let color = theme::primary_with_intensity(intensity);
                     let bar = if ratio >= threshold { "██" } else { "  " };
                     row_spans.push(Span::styled(
@@ -2209,25 +2174,21 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
         lines = padded;
     }
     let max_scroll = lines.len().saturating_sub(visible_height);
-    state.insights_detail_scroll = state.insights_detail_scroll.min(max_scroll);
+    state.set_insights_detail_scroll(state.insights_detail_scroll().min(max_scroll));
 
     let popup = Paragraph::new(lines)
-        .scroll((state.insights_detail_scroll as u16, 0))
+        .scroll((state.insights_detail_scroll() as u16, 0))
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::PRIMARY))
-                .title(Span::styled(
-                    format!(" {panel_label} "),
-                    Style::default().fg(theme::PRIMARY).bold(),
-                ))
-                .title_bottom(Line::from(vec![
-                    Span::styled(" ←→: switch  i/q: close ", Style::default().fg(theme::DIM)),
-                    Span::styled(
-                        format!("[{}/4] {} ", current_panel + 1, panel_label),
-                        Style::default().fg(theme::PRIMARY),
-                    ),
-                ])),
+            super::popup_block(&format!(" {panel_label} ")).title_bottom(Line::from(vec![
+                Span::styled(
+                    " ←→: switch  Enter/i/q: close ",
+                    Style::default().fg(theme::DIM),
+                ),
+                Span::styled(
+                    format!("[{}/4] {} ", current_panel + 1, panel_label),
+                    Style::default().fg(theme::PRIMARY),
+                ),
+            ])),
         );
 
     frame.render_widget(popup, popup_area);
