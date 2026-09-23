@@ -38,6 +38,7 @@ pub mod helpers {
             model: None,
             is_subagent: false,
             is_continued: false,
+            line_churn: Default::default(),
         }
     }
 

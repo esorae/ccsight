@@ -346,11 +346,7 @@ fn draw_insights_weekly(
         let avg_tokens = weekday_avg.get(weekday).copied().unwrap_or(0);
         let ratio = avg_tokens as f64 / max_weekly as f64;
         let filled = (ratio * bar_width as f64).round() as usize;
-        let pct = if total_weekly > 0 {
-            (avg_tokens as f64 / total_weekly as f64 * 100.0) as u32
-        } else {
-            0
-        };
+        let pct = crate::text::format_pct(avg_tokens, total_weekly);
         let intensity = theme::bar_intensity(ratio);
         let bar_color = theme::primary_with_intensity(intensity);
         let marker = if *weekday == today_weekday {
@@ -380,7 +376,7 @@ fn draw_insights_weekly(
                 format!(" {:>5}", crate::format_number(avg_tokens)),
                 Style::default().fg(theme::PRIMARY),
             ),
-            Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
         ]));
     }
 
@@ -696,7 +692,9 @@ fn draw_insights_metrics(
         ),
         (
             format!("{}", state.stats.tool_usage.len()),
-            "tools",
+            // Counts every invoked entry across Tools / Skills / Commands /
+            // Subagents / MCP, so `tools` named a subset of what it totals.
+            "entries",
             theme::SECONDARY,
         ),
         (format!("{total_sessions}"), "sessions", theme::PRIMARY),
@@ -747,76 +745,20 @@ fn draw_insights_metrics(
         .iter()
         .filter(|s| s.is_underutilized(now, 30))
         .count();
-    // At narrow widths the full Ecosystem line overflows on the right, hiding
-    // the Subagent count. Below ~80 cols we drop label words ("active", "stale",
-    // "Used:", category names) and keep just the numbers + minimal markers, which
-    // stays scannable while fitting in 60 cols.
     let row_width = row_chunks[2].width as usize;
-    let mut eco_spans = vec![
-        Span::styled(
-            format!("{active_count}/{configured_count}"),
-            Style::default().fg(theme::PRIMARY).bold(),
-        ),
-        Span::styled(
-            if row_width >= 80 {
-                " MCP active"
-            } else {
-                " MCP"
-            },
-            Style::default().fg(theme::DIM),
-        ),
-    ];
-    if stale_count > 0 {
-        eco_spans.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
-        eco_spans.push(Span::styled(
-            if row_width >= 80 {
-                format!("{stale_count} stale")
-            } else {
-                format!("{stale_count}⚠")
-            },
-            Style::default().fg(theme::WARNING),
-        ));
-    }
-    // Numbers here are session counts (`sessions_using_*`). The Dashboard
-    // Ecosystem panel shows call counts under similar labels, so spell the
-    // unit out to keep the two views distinguishable.
-    let used_prefix = if row_width >= 80 {
-        "    Sessions using:  "
-    } else {
-        "  ses: "
+    let counts = EcoRowCounts {
+        active: active_count,
+        configured: configured_count,
+        stale: stale_count,
+        mcp: state.stats.sessions_using_mcp,
+        skills: state.stats.sessions_using_skills,
+        commands: state.stats.sessions_using_commands,
+        subagents: state.stats.sessions_using_subagents,
     };
-    let mcp_label = if row_width >= 80 { "MCP " } else { "M" };
-    let skill_label = if row_width >= 80 { "Skills " } else { "Sk" };
-    let command_label = if row_width >= 80 { "Commands " } else { "Cm" };
-    let agent_label = if row_width >= 80 { "Subagents " } else { "Sb" };
-    let sep = " · ";
-    // Order matches the popup tabs: MCP → Skills → Commands → Subagents.
-    eco_spans.extend([
-        Span::styled(used_prefix, Style::default().fg(theme::DIM)),
-        Span::styled(mcp_label, Style::default().fg(theme::CAT_MCP)),
-        Span::styled(
-            format!("{}", state.stats.sessions_using_mcp),
-            Style::default().fg(theme::CAT_MCP).bold(),
-        ),
-        Span::styled(sep, Style::default().fg(theme::DIM)),
-        Span::styled(skill_label, Style::default().fg(theme::CAT_SKILLS)),
-        Span::styled(
-            format!("{}", state.stats.sessions_using_skills),
-            Style::default().fg(theme::CAT_SKILLS).bold(),
-        ),
-        Span::styled(sep, Style::default().fg(theme::DIM)),
-        Span::styled(command_label, Style::default().fg(theme::CAT_COMMANDS)),
-        Span::styled(
-            format!("{}", state.stats.sessions_using_commands),
-            Style::default().fg(theme::CAT_COMMANDS).bold(),
-        ),
-        Span::styled(sep, Style::default().fg(theme::DIM)),
-        Span::styled(agent_label, Style::default().fg(theme::CAT_SUBAGENTS)),
-        Span::styled(
-            format!("{}", state.stats.sessions_using_subagents),
-            Style::default().fg(theme::CAT_SUBAGENTS).bold(),
-        ),
-    ]);
+    let mut eco_spans = eco_row_spans(&counts, true);
+    if super::spans_width(&eco_spans) > row_width {
+        eco_spans = eco_row_spans(&counts, false);
+    }
     frame.render_widget(
         Paragraph::new(Line::from(eco_spans)).centered(),
         row_chunks[2],
@@ -857,6 +799,82 @@ fn draw_insights_metrics(
         ];
         frame.render_widget(Paragraph::new(Line::from(gap_spans)).centered(), *gap_row);
     }
+}
+
+/// Counts behind the Insights Ecosystem row.
+pub(super) struct EcoRowCounts {
+    pub active: usize,
+    pub configured: usize,
+    pub stale: usize,
+    pub mcp: usize,
+    pub skills: usize,
+    pub commands: usize,
+    pub subagents: usize,
+}
+
+/// Ecosystem summary row. The short form drops label words but keeps every
+/// number, so a narrow terminal shows the Subagent count instead of clipping
+/// it. Composed apart from drawing so the caller measures these spans, not a
+/// second copy of the labels. Numbers are session counts — the Dashboard
+/// Ecosystem panel counts calls under similar labels.
+pub(super) fn eco_row_spans(c: &EcoRowCounts, long: bool) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme::DIM);
+    let mut spans = vec![
+        Span::styled(
+            format!("{}/{}", c.active, c.configured),
+            Style::default().fg(theme::PRIMARY).bold(),
+        ),
+        Span::styled(if long { " MCP active" } else { " MCP" }, dim),
+    ];
+    if c.stale > 0 {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            if long {
+                format!("{} stale", c.stale)
+            } else {
+                format!("{}⚠", c.stale)
+            },
+            Style::default().fg(theme::WARNING),
+        ));
+    }
+    spans.push(Span::styled(
+        if long {
+            "    Sessions using:  "
+        } else {
+            "  ses: "
+        },
+        dim,
+    ));
+    // Order matches the popup tabs: MCP → Skills → Commands → Subagents.
+    let cats = [
+        (if long { "MCP " } else { "M" }, c.mcp, theme::CAT_MCP),
+        (
+            if long { "Skills " } else { "Sk" },
+            c.skills,
+            theme::CAT_SKILLS,
+        ),
+        (
+            if long { "Commands " } else { "Cm" },
+            c.commands,
+            theme::CAT_COMMANDS,
+        ),
+        (
+            if long { "Subagents " } else { "Sb" },
+            c.subagents,
+            theme::CAT_SUBAGENTS,
+        ),
+    ];
+    for (i, (label, n, color)) in cats.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(Span::styled(*label, Style::default().fg(*color)));
+        spans.push(Span::styled(
+            format!("{n}"),
+            Style::default().fg(*color).bold(),
+        ));
+    }
+    spans
 }
 
 pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -917,14 +935,17 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
 
     // No ↑↓ entry: the Insights main view has nothing to scroll — reading
     // depth lives in the detail popup (Enter), which has full scroll keys.
-    let help_line = Paragraph::new(super::help_bar(&[
-        ("?", "help"),
-        ("q", "quit"),
-        ("←→", "panel"),
-        ("Enter", "detail"),
-        ("/", "search"),
-        ("m", "pins"),
-    ]));
+    let help_line = Paragraph::new(super::tab_help_bar(
+        state,
+        &[
+            ("?", "help"),
+            ("q", "quit"),
+            ("←→", "panel"),
+            ("Enter", "detail"),
+            ("/", "search"),
+            ("m", "pins"),
+        ],
+    ));
     frame.render_widget(help_line, chunks[3]);
 }
 
@@ -1049,6 +1070,11 @@ fn insights_detail_metrics(
             Style::default().fg(theme::DIM),
         ),
     ]));
+    lines.push(super::churn_line(
+        " Edits       ",
+        state.stats.line_churn,
+        Style::default().fg(theme::DIM),
+    ));
     // Without this the reader cannot tell a per-calendar-day average from a
     // per-active-day one, and the two differ by the idle-day share. Silent
     // when every day was active, since then there is nothing to disambiguate.
@@ -1378,11 +1404,7 @@ fn insights_detail_metrics(
                       color: ratatui::style::Color,
                       lines: &mut Vec<Line>| {
             let ratio = count as f64 / max as f64;
-            let pct = if category_total > 0 {
-                (count as f64 / category_total as f64 * 100.0) as u32
-            } else {
-                0
-            };
+            let pct = crate::text::format_pct(count as u64, category_total as u64);
             let filled = (ratio * bar_max as f64).round() as usize;
             let intensity = theme::bar_intensity(ratio);
             let bar_color = theme::ramp_color(theme::RAMP_OLIVE, intensity);
@@ -1401,7 +1423,7 @@ fn insights_detail_metrics(
                     format!(" {count:>5}"),
                     Style::default().fg(theme::LABEL_MUTED),
                 ),
-                Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
             ]));
         };
 
@@ -1629,11 +1651,7 @@ fn insights_detail_metrics(
         let bar_max = w.saturating_sub(name_w + 12);
         for (lang, count) in langs.iter().take(6) {
             let ratio = **count as f64 / max_lang as f64;
-            let pct = if total_lang > 0 {
-                (**count as f64 / total_lang as f64 * 100.0) as u32
-            } else {
-                0
-            };
+            let pct = crate::text::format_pct(**count as u64, total_lang as u64);
             let filled = (ratio * bar_max as f64).round() as usize;
             let intensity = theme::bar_intensity(ratio);
             let bar_color = theme::ramp_color(theme::RAMP_DEEP_TEAL, intensity);
@@ -1657,7 +1675,7 @@ fn insights_detail_metrics(
                     format!(" {count:>5}"),
                     Style::default().fg(theme::LABEL_MUTED),
                 ),
-                Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
             ]));
         }
     }
@@ -1895,11 +1913,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 let avg = weekday_avg.get(wd).copied().unwrap_or(0);
                 let ratio = avg as f64 / max_weekly as f64;
                 let filled = (ratio * bar_width as f64).round() as usize;
-                let pct = if total_weekly > 0 {
-                    (avg as f64 / total_weekly as f64 * 100.0) as u32
-                } else {
-                    0
-                };
+                let pct = crate::text::format_pct(avg, total_weekly);
                 let is_today = *wd == today_weekday;
                 let marker = if is_today { "▶" } else { " " };
                 let intensity = theme::bar_intensity(ratio);
@@ -1926,7 +1940,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                         format!(" {:>5}/day", crate::format_number(avg)),
                         Style::default().fg(theme::PRIMARY),
                     ),
-                    Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
+                    Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
                 ]));
             }
 
@@ -2197,6 +2211,145 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
 #[cfg(test)]
 mod tests {
     use super::trailing_n_months_at;
+    use super::{EcoRowCounts, eco_row_spans};
+    use crate::ui::spans_width;
+
+    fn counts(stale: usize, n: usize) -> EcoRowCounts {
+        EcoRowCounts {
+            active: n,
+            configured: n,
+            stale,
+            mcp: n,
+            skills: n,
+            commands: n,
+            subagents: n,
+        }
+    }
+
+    // The long form's width depends on the digit counts beside its labels, so
+    // the caller measures the composed spans. Rendering cannot check this:
+    // ratatui clips at draw time, and the centered row loses its right edge
+    // first — the Subagent count.
+    #[test]
+    fn eco_row_picks_a_form_that_fits() {
+        for stale in [0usize, 1, 42, 1_234] {
+            for n in [0usize, 1, 9, 10, 999, 123_456] {
+                let c = counts(stale, n);
+                let short_w = spans_width(&eco_row_spans(&c, false));
+                for row_width in 0..=240usize {
+                    let long = eco_row_spans(&c, true);
+                    let chosen = if spans_width(&long) > row_width {
+                        eco_row_spans(&c, false)
+                    } else {
+                        long
+                    };
+                    let chosen_w = spans_width(&chosen);
+                    assert!(
+                        chosen_w <= row_width || chosen_w == short_w,
+                        "stale={stale} n={n} row_width={row_width} → {chosen_w}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The `Sessions` row's four rate figures grow with the data, so the shared
+    // popup width is only correct as long as this holds. ratatui clips at draw
+    // time, so a render test cannot see the overflow — measure the composition.
+    #[test]
+    fn insights_detail_metrics_fit_the_popup_width() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        // Every field that lengthens the row at once: 4-digit session and
+        // subagent counts, a 6-digit daily cost, and an hours-long average
+        // duration. `format_number` abbreviates the token figures, so raising
+        // those alone leaves the row shorter than real data makes it.
+        let mut sessions = Vec::new();
+        for i in 0..6000u32 {
+            let mut sess = make_session_with_tokens("proj", 900_000, 800_000, "claude-opus-5");
+            sess.is_subagent = i % 4 != 0;
+            sess.file_path = std::path::PathBuf::from(format!("/s/{i}.jsonl"));
+            sess.day_first_timestamp = chrono::Utc::now() - chrono::Duration::minutes(1234);
+            sess.day_last_timestamp = chrono::Utc::now();
+            sessions.push(sess);
+        }
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(
+            date, sessions,
+        )]);
+        state.total_cost = 987_654.32;
+        // `format_number` abbreviates, so the widest token figure is a
+        // 3-significant-digit form like `1.23K`. Pick totals that land both
+        // rate columns there rather than on a 1-char `0`.
+        state.stats.total_tokens.input_tokens = 2_460_000;
+        state.stats.total_tokens.output_tokens = 2_460_000;
+
+        let popup = super::super::detail_popup_area(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 140,
+            height: 45,
+        });
+        let inner = popup.width.saturating_sub(2) as usize;
+        for line in super::insights_detail_metrics(&state, 4000, inner) {
+            let w = spans_width(&line.spans);
+            assert!(
+                w <= inner,
+                "line is {w} wide, popup inner is {inner}: {line:?}"
+            );
+        }
+    }
+
+    // Strictly narrower, not merely no wider: an equal short form makes the
+    // caller's fallback a no-op that `eco_row_picks_a_form_that_fits` would
+    // still accept, since nothing narrower exists to compare against.
+    #[test]
+    fn eco_row_short_form_is_strictly_narrower_than_long() {
+        for stale in [0usize, 1, 1_234] {
+            for n in [0usize, 9, 123_456] {
+                let c = counts(stale, n);
+                assert!(
+                    spans_width(&eco_row_spans(&c, false)) < spans_width(&eco_row_spans(&c, true)),
+                    "stale={stale} n={n}"
+                );
+            }
+        }
+    }
+
+    // The short form is the floor: no narrower variant exists, so it has to fit
+    // a conventional 80-column terminal at every count magnitude.
+    #[test]
+    fn eco_row_short_form_fits_eighty_columns() {
+        for stale in [0usize, 1, 42, 1_234] {
+            for n in [0usize, 9, 999, 123_456] {
+                let w = spans_width(&eco_row_spans(&counts(stale, n), false));
+                assert!(w <= 80, "stale={stale} n={n} → {w}");
+            }
+        }
+    }
+
+    // Every count has to survive the narrow form: dropping one is the failure
+    // the short form exists to prevent.
+    #[test]
+    fn eco_row_keeps_every_count_in_both_forms() {
+        let c = EcoRowCounts {
+            active: 3,
+            configured: 7,
+            stale: 2,
+            mcp: 11,
+            skills: 13,
+            commands: 17,
+            subagents: 19,
+        };
+        for long in [true, false] {
+            let text: String = eco_row_spans(&c, long)
+                .iter()
+                .map(|sp| sp.content.to_string())
+                .collect();
+            for n in ["3", "7", "2", "11", "13", "17", "19"] {
+                assert!(text.contains(n), "long={long} missing {n} in {text:?}");
+            }
+        }
+    }
     use chrono::NaiveDate;
     use std::collections::BTreeMap;
 

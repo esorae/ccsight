@@ -15,6 +15,8 @@ pub type ModelTokens = TokenStats;
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub file_path: PathBuf,
+    /// Lines added / removed by this session-day's edits.
+    pub line_churn: crate::domain::LineChurn,
     pub project_name: String,
     /// First cwd whose official slug matches the storage dir — the verified
     /// `claude -r` cd target for this transcript (see `extract_verified_cwd`).
@@ -109,6 +111,46 @@ impl DailyGroup {
     /// nested activity that's already attributed to the parent session.
     pub fn user_sessions(&self) -> impl Iterator<Item = &SessionInfo> + '_ {
         self.sessions.iter().filter(|s| !s.is_subagent)
+    }
+
+    /// Tokens Anthropic bills for on this day, subagents included. Zero means
+    /// the day holds only activity that costs nothing — an abandoned prompt,
+    /// system events, or `<synthetic>` assistant replies from failed calls.
+    /// One home so the cost surfaces that hide such a day and the Daily view
+    /// that labels it cannot disagree on which days those are.
+    pub fn billable_tokens(&self) -> u64 {
+        self.sessions
+            .iter()
+            .flat_map(|s| s.day_tokens_by_model.values())
+            .map(|t| {
+                t.input_tokens + t.output_tokens + t.cache_creation_tokens + t.cache_read_tokens
+            })
+            .sum()
+    }
+}
+
+/// Churn an entry contributes once cross-file dedup is applied. A fork or a
+/// continuation copies its parent session's tool results — same `uuid` —
+/// into its own file, so each copy would count its edits again. Keyed into
+/// the set the token hashes use, so the cache's `unique_hashes` restores it.
+pub(crate) fn credited_churn(
+    entry: &crate::domain::LogEntry,
+    global_seen: &mut std::collections::HashSet<String>,
+    credited: &mut Vec<String>,
+) -> crate::domain::LineChurn {
+    let churn = entry.line_churn();
+    if churn == crate::domain::LineChurn::default() {
+        return churn;
+    }
+    let Some(uuid) = entry.uuid.as_deref() else {
+        return churn;
+    };
+    let key = format!("churn:{uuid}");
+    if global_seen.insert(key.clone()) {
+        credited.push(key);
+        churn
+    } else {
+        crate::domain::LineChurn::default()
     }
 }
 
@@ -250,6 +292,7 @@ impl DailyGrouper {
                         session_first_timestamp: session_first,
                         day_first_timestamp: ds.first_timestamp.unwrap_or(session_first),
                         day_last_timestamp: ds.last_timestamp.unwrap_or(session_first),
+                        line_churn: ds.line_churn,
                         day_input_tokens: ds.input_tokens,
                         day_output_tokens: ds.output_tokens,
                         day_user_msgs: ds.user_msgs,
@@ -414,6 +457,9 @@ impl DailyGrouper {
                 if stats.last_timestamp.is_none() || Some(ts) > stats.last_timestamp {
                     stats.last_timestamp = Some(ts);
                 }
+                stats
+                    .line_churn
+                    .add(credited_churn(entry, global_seen, &mut file_unique_hashes));
 
                 if let Some(ref message) = entry.message {
                     use crate::domain::MessageContent;
@@ -597,6 +643,7 @@ impl DailyGrouper {
                         extension_usage: ds.extension_usage.clone(),
                         user_msgs: ds.user_msgs,
                         assistant_msgs: ds.assistant_msgs,
+                        line_churn: ds.line_churn,
                     },
                 );
             }
@@ -666,6 +713,7 @@ impl DailyGrouper {
                         session_first_timestamp: session_first,
                         day_first_timestamp: stats.first_timestamp.unwrap_or(session_first),
                         day_last_timestamp: stats.last_timestamp.unwrap_or(session_first),
+                        line_churn: stats.line_churn,
                         day_input_tokens: stats.input_tokens,
                         day_output_tokens: stats.output_tokens,
                         day_user_msgs: stats.user_msgs,
@@ -756,6 +804,7 @@ fn extract_last_user_message(entries: &[crate::domain::LogEntry]) -> Option<Stri
 #[derive(Default, Clone)]
 pub(crate) struct SessionCumulative {
     pub(crate) days: usize,
+    pub(crate) line_churn: crate::domain::LineChurn,
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) cache_creation: u64,
@@ -778,6 +827,7 @@ fn fold_session_day(
     calculator: &crate::aggregator::CostCalculator,
 ) {
     cum.days += 1;
+    cum.line_churn.add(s.line_churn);
     cum.input_tokens += s.day_input_tokens;
     cum.output_tokens += s.day_output_tokens;
     cum.user_msgs += s.day_user_msgs;
@@ -869,6 +919,29 @@ pub(crate) fn meta_by_path(groups: &[DailyGroup]) -> HashMap<&Path, &SessionInfo
 
 #[cfg(test)]
 mod tests {
+    // The cost surfaces hide a zero-billable day and the Daily view labels it;
+    // both read this one predicate, so a day cannot be hidden in one and
+    // unlabelled in the other.
+    #[test]
+    fn billable_tokens_counts_every_bucket_and_includes_subagents() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+
+        assert_eq!(make_daily_group(date, vec![]).billable_tokens(), 0);
+
+        let zero = make_session_with_tokens("proj", 0, 0, "claude-opus-5");
+        assert_eq!(make_daily_group(date, vec![zero]).billable_tokens(), 0);
+
+        let mut a = make_session_with_tokens("proj", 3, 5, "claude-opus-5");
+        for t in a.day_tokens_by_model.values_mut() {
+            t.cache_creation_tokens = 13;
+            t.cache_read_tokens = 17;
+        }
+        let mut sub = make_session_with_tokens("proj", 7, 11, "claude-opus-5");
+        sub.is_subagent = true;
+        assert_eq!(make_daily_group(date, vec![a, sub]).billable_tokens(), 56);
+    }
+
     use super::*;
     use crate::infrastructure::CachedTokenStats;
 
@@ -1063,9 +1136,11 @@ mod tests {
             git_branch: None,
             version: None,
             is_sidechain: false,
+            is_compact_summary: false,
             user_type: None,
             request_id: None,
             level: None,
+            tool_result_churn: Default::default(),
         }
     }
 
@@ -1272,9 +1347,11 @@ mod tests {
             git_branch: None,
             version: None,
             is_sidechain: false,
+            is_compact_summary: false,
             user_type: None,
             request_id: None,
             level: None,
+            tool_result_churn: Default::default(),
         }];
         let result = DailyGrouper::extract_project_name_from_entries(&entries);
         assert_eq!(result, Some("~/projects/myproject".to_string()));
@@ -1296,9 +1373,11 @@ mod tests {
             git_branch: None,
             version: None,
             is_sidechain: false,
+            is_compact_summary: false,
             user_type: None,
             request_id: None,
             level: None,
+            tool_result_churn: Default::default(),
         }];
         let result = DailyGrouper::extract_project_name_from_entries(&entries);
         assert_eq!(result, None);
@@ -1362,6 +1441,7 @@ mod tests {
             extension_usage: HashMap::new(),
             user_msgs: 0,
             assistant_msgs: 0,
+            line_churn: Default::default(),
         }
     }
 
@@ -1575,6 +1655,64 @@ mod tests {
         assert_eq!(entry.entry_count, 2);
     }
 
+    // A fork or continuation copies its parent session's tool results — same
+    // `uuid` — into its own file. Both aggregation paths, cold and from the
+    // cache, must count such an edit once, or Edits reads high by every copy.
+    #[test]
+    fn a_tool_result_copied_into_another_file_counts_its_churn_once() {
+        use crate::aggregator::StatsAggregator;
+        use crate::infrastructure::Cache;
+        let dir = std::env::temp_dir().join(format!("ccsight-churn-dup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let edit = |uuid: &str, ts: &str| {
+            serde_json::json!({
+                "type": "user", "uuid": uuid, "timestamp": ts,
+                "cwd": "/tmp/proj", "sessionId": "s",
+                "toolUseResult": {"type": "update",
+                    "structuredPatch": [{"lines": ["+a", "+b", "-c"]}]}
+            })
+            .to_string()
+        };
+        let original = dir.join("a.jsonl");
+        let fork = dir.join("b.jsonl");
+        std::fs::write(&original, edit("shared", "2026-02-25T10:00:00Z") + "\n").unwrap();
+        std::fs::write(
+            &fork,
+            edit("shared", "2026-02-25T10:00:00Z")
+                + "\n"
+                + &edit("own", "2026-02-25T11:00:00Z")
+                + "\n",
+        )
+        .unwrap();
+        let files = vec![original, fork];
+        let expected = crate::domain::LineChurn {
+            added: 4,
+            removed: 2,
+        };
+
+        let (stats, _, cache) =
+            StatsAggregator::aggregate_with_shared_cache(&files, Cache::new_empty());
+        assert_eq!(stats.line_churn, expected, "stats path, cold");
+
+        let grouped_churn = |groups: &[DailyGroup]| {
+            let mut c = crate::domain::LineChurn::default();
+            for s in groups.iter().flat_map(|g| g.sessions.iter()) {
+                c.add(s.line_churn);
+            }
+            c
+        };
+        let cold =
+            DailyGrouper::group_by_date_with_shared_cache(&files, &mut Some(Cache::new_empty()));
+        assert_eq!(grouped_churn(&cold), expected, "grouper path, cold");
+
+        // Warm: every file is a cache hit, restored from `unique_hashes`.
+        let (warm_stats, _, cache) = StatsAggregator::aggregate_with_shared_cache(&files, cache);
+        assert_eq!(warm_stats.line_churn, expected, "stats path, warm");
+        let warm = DailyGrouper::group_by_date_with_shared_cache(&files, &mut Some(cache));
+        assert_eq!(grouped_churn(&warm), expected, "grouper path, warm");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cache_round_trip_dailygrouper_to_stats_matches_fresh_parse() {
         use std::io::Write;
@@ -1620,6 +1758,17 @@ mod tests {
                     "content": "ok",
                     "is_error": false
                 }]}
+            }),
+            // Carries churn: whichever aggregator parses this file cold must
+            // write the same count, or the other one reads the loser's zero
+            // back out of the shared cache and trusts it.
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-02-25T10:04:00Z",
+                "toolUseResult": {
+                    "type": "update",
+                    "structuredPatch": [{"lines": [" ctx", "+add1", "+add2", "-del1"]}]
+                }
             }),
             serde_json::json!({
                 "type": "user",
@@ -1673,6 +1822,22 @@ mod tests {
         assert_eq!(entry_from_grouper.output_tokens, 50);
         assert_eq!(entry_from_grouper.cache_creation_tokens, 200);
         assert_eq!(entry_from_grouper.cache_read_tokens, 300);
+        // The grouper wrote this entry cold; the churn it persisted has to be
+        // the real count, not the default a forgotten accumulator leaves.
+        assert_eq!(
+            entry_from_grouper.daily_stats.values().fold(
+                crate::domain::LineChurn::default(),
+                |mut a, d| {
+                    a.add(d.line_churn);
+                    a
+                }
+            ),
+            crate::domain::LineChurn {
+                added: 2,
+                removed: 1
+            },
+            "DailyGrouper persisted churn"
+        );
         assert_eq!(entry_from_grouper.weekday_activity.len(), 1);
         assert!(
             entry_from_grouper

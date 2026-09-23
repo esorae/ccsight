@@ -347,6 +347,7 @@ mod tests {
                 model: None,
                 is_subagent: false,
                 is_continued: false,
+                line_churn: Default::default(),
             }
         };
         // Three servers all with 5 calls — tied.

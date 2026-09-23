@@ -142,7 +142,7 @@ pub fn format_pct(part: u64, total: u64) -> String {
     if part == 0 || total == 0 {
         return "0%".to_string();
     }
-    let pct = (part as f64 / total as f64 * 100.0) as u32;
+    let pct = (part as f64 / total as f64 * 100.0) as u32; // lint-ok: raw-pct
     if pct == 0 {
         "<1%".to_string()
     } else {

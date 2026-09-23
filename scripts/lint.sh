@@ -118,7 +118,7 @@ for fname in '$UI_FILES'.split():
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith('.title(') and 'Span::styled' not in stripped and 'Line::from' not in stripped:
-            content = stripped[7:].rstrip(')')  .rstrip(',')
+            content = stripped[7:].rstrip(';').rstrip(')').rstrip(',')
             # Variables whose name ends in _line are by convention pre-built
             # ratatui Lines (carrying their own per-span styling), so a bare
             # title(x_line) call is the right call. Skip them.
@@ -1326,6 +1326,64 @@ SECRETS=$(git ls-files -z 2>/dev/null | xargs -0 grep -nIE \
 if [ -n "$SECRETS" ]; then
     echo "ERROR: credential-shaped literal in a tracked file — rotate the value, then remove it from the file AND from history (this repo is public):"
     echo "$SECRETS"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 49. Space inside a bottom-bar action. `help_bar` joins pairs with a single
+# space, so `("y", "copy resume")` renders as `y:copy resume s:summary` and
+# reads as three hints instead of two. Hyphenate multi-word actions.
+BAR_ACTION_SPACE=$(grep -rn '("[^"]*", "[^"]* [^"]*")' src/ui/ 2>/dev/null \
+    | grep -v 'lint-ok: bar-action-space' || true)
+if [ -n "$BAR_ACTION_SPACE" ]; then
+    echo "ERROR: bottom-bar action contains a space — hyphenate it, the single-space separator makes it read as two hints:"
+    echo "$BAR_ACTION_SPACE"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 50. Percentage truncated to an integer instead of routed through
+# `text::format_pct`. A share under 1% floors to `0%`, which reads as "none"
+# beside a non-zero count. Signed month-over-month deltas use `as i32` and are
+# a different quantity, so only the unsigned share form is matched.
+RAW_PCT=$(grep -rn 'as f64 \* 100\.0) as u32\|as f64 / .* \* 100\.0) as u32' src/ 2>/dev/null \
+    | grep -v 'lint-ok: raw-pct' || true)
+if [ -n "$RAW_PCT" ]; then
+    echo "ERROR: integer-truncated percentage — use crate::text::format_pct so a sub-1% share reads '<1%' instead of '0%':"
+    echo "$RAW_PCT"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 51. Test that builds the search index through the real state dir.
+# `SearchIndex::build` / `update_or_build` resolve `~/.ccsight/index`, and
+# building there starts by deleting the directory — so a test that reaches for
+# them wipes the developer's own index and passes anyway. `build_in` takes the
+# directory, so tests point it at a temp dir. `// lint-ok: real-index` marks a
+# test that deliberately works on real data.
+REAL_INDEX_IN_TESTS=$(python3 -c "
+import re
+for fname in '$ALL_RUST_FILES'.split():
+    with open(fname) as f:
+        lines = f.read().split('\n')
+    in_tests = False
+    depth = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not in_tests and re.match(r'mod\s+tests\s*\{', stripped):
+            in_tests = True
+            depth = line.count('{') - line.count('}')
+            continue
+        if in_tests:
+            depth += line.count('{') - line.count('}')
+            if depth <= 0:
+                in_tests = False
+                continue
+            if 'lint-ok: real-index' in line:
+                continue
+            if re.search(r'SearchIndex::(build|clear_index)\(|update_or_build\(', line):
+                print(f'{fname}:{i+1}: {stripped}')
+" 2>/dev/null || true)
+if [ -n "$REAL_INDEX_IN_TESTS" ]; then
+    echo "ERROR: test builds the real ~/.ccsight index (it deletes the directory first) — use SearchIndex::build_in with a temp dir:"
+    echo "$REAL_INDEX_IN_TESTS"
     ERRORS=$((ERRORS + 1))
 fi
 

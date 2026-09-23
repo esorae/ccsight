@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -24,7 +24,12 @@ const DEFAULT_MAX_LINE_SIZE: usize = 50 * 1024 * 1024; // 50MB
 const MIN_MAX_LINE_SIZE: usize = 1024; // 1KB
 const MAX_MAX_LINE_SIZE: usize = 100 * 1024 * 1024; // 100MB
 
-const DEFAULT_MAX_ENTRIES: usize = 100_000;
+// A truncated parse drops the NEWEST entries (the loop breaks on its way
+// forward), so an over-cap session reports stale totals AND a stale
+// last-activity time. Matched to `MAX_MAX_ENTRIES` for the same reason
+// `DEFAULT_MAX_FILE_SIZE` is 2GB: real heavy-use transcripts reach these
+// sizes, and dropping their tail is worse than the memory it costs.
+const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 const MIN_MAX_ENTRIES: usize = 100;
 const MAX_MAX_ENTRIES: usize = 1_000_000;
 
@@ -69,10 +74,27 @@ impl Limits {
     }
 }
 
+/// Files whose entry cap stopped the walk this process. Counted only on the
+/// file path: the byte seam is also reached from property tests with tiny caps,
+/// and those are not user data. Read by the UI so an incomplete total is never
+/// presented as a complete one. A set, not a counter: a file is re-parsed on
+/// every reload and by the index, the conversation view and title generation.
+static TRUNCATED_FILES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Number of distinct files truncated by the entry cap so far.
+pub fn truncated_file_count() -> usize {
+    TRUNCATED_FILES.lock().map_or(0, |set| set.len())
+}
+
 pub struct JsonlParser;
 
 impl JsonlParser {
     pub fn parse_file(path: &Path) -> Result<Vec<LogEntry>> {
+        Self::parse_file_with(path, Limits::from_env())
+    }
+
+    fn parse_file_with(path: &Path, limits: Limits) -> Result<Vec<LogEntry>> {
         let file =
             File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
 
@@ -86,7 +108,11 @@ impl JsonlParser {
             );
         }
 
-        Ok(Self::parse_lines(BufReader::new(file), Limits::from_env()))
+        let (entries, truncated) = Self::parse_lines_reporting(BufReader::new(file), limits);
+        if truncated && let Ok(mut set) = TRUNCATED_FILES.lock() {
+            set.insert(path.to_path_buf());
+        }
+        Ok(entries)
     }
 
     /// Parse raw JSONL bytes into entries — the pure byte seam. Per-line
@@ -98,6 +124,13 @@ impl JsonlParser {
     }
 
     fn parse_lines<R: BufRead>(reader: R, limits: Limits) -> Vec<LogEntry> {
+        Self::parse_lines_reporting(reader, limits).0
+    }
+
+    /// `true` = the entry cap stopped the walk, so the tail of the file is
+    /// missing. Private: the public byte seam stays `-> Vec<LogEntry>`.
+    fn parse_lines_reporting<R: BufRead>(reader: R, limits: Limits) -> (Vec<LogEntry>, bool) {
+        let mut truncated = false;
         let mut entries = Vec::new();
         let mut hash_to_index: HashMap<String, usize> = HashMap::new();
         let entry_limit = limits.entries;
@@ -105,6 +138,7 @@ impl JsonlParser {
 
         for line_result in reader.lines() {
             if entries.len() >= entry_limit {
+                truncated = true;
                 break;
             }
 
@@ -148,7 +182,7 @@ impl JsonlParser {
             }
         }
 
-        entries
+        (entries, truncated)
     }
 
     pub fn entry_hash(entry: &LogEntry) -> Option<String> {
@@ -165,6 +199,24 @@ impl JsonlParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_reparsed_after_truncation_is_counted_once() {
+        let path = std::env::temp_dir().join(format!("ccsight-trunc-{}.jsonl", std::process::id()));
+        let line = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        std::fs::write(&path, line.repeat(5)).unwrap();
+        let limits = || Limits {
+            line_size: 1 << 20,
+            entries: 2,
+        };
+        let before = truncated_file_count();
+        // Every reload re-parses the same file; the warning counts files.
+        for _ in 0..3 {
+            JsonlParser::parse_file_with(&path, limits()).unwrap();
+        }
+        assert_eq!(truncated_file_count() - before, 1);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Byte blobs the parse seam must survive — a JSONL read mid-write, a line
     /// of terminal control bytes — each with the entry count it must yield.
@@ -188,6 +240,49 @@ mod tests {
             "control_and_invalid_utf8",
             b"\x00\x01\xff not json \x1b[31mANSI\x07",
             0,
+        ),
+        // A tool result is foreign JSON reaching the seam. Reading churn out
+        // of it must not cost the entry: a nested third-party payload takes
+        // the entry's tokens down with it if the reader has a depth ceiling.
+        (
+            "tool_result_edit",
+            b"{\"type\":\"user\",\"toolUseResult\":{\"structuredPatch\":[{\"lines\":[\" c\",\"-x\",\"+y\"]}]}}\n",
+            1,
+        ),
+        (
+            "tool_result_deeply_nested",
+            b"{\"type\":\"user\",\"toolUseResult\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}\n",
+            1,
+        ),
+        (
+            "tool_result_truncated_mid_write",
+            b"{\"type\":\"user\",\"toolUseResult\":{\"structuredPatch\":[{\"lines\":[\"+a\"",
+            0,
+        ),
+        // The compaction recap is a plain `user` row plus a flag. An entry that
+        // dropped over the unknown flag would take the recap — the only
+        // whole-session signal the title prompt has — with it.
+        (
+            "compact_summary_flag",
+            b"{\"type\":\"user\",\"isCompactSummary\":true,\"message\":{\"role\":\"user\",\"content\":\"recap text\"}}\n",
+            1,
+        ),
+        (
+            "compact_summary_flag_wrong_type",
+            b"{\"type\":\"user\",\"isCompactSummary\":\"yes\",\"message\":{\"role\":\"user\",\"content\":\"recap\"}}\n",
+            0,
+        ),
+        // An Agent / Task result carries `content` as an array of blocks; a
+        // value of an unexpected type must not cost the entry after it.
+        (
+            "tool_result_array_content",
+            b"{\"type\":\"user\",\"toolUseResult\":{\"content\":[{\"type\":\"text\",\"text\":\"x\"}]},\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+            1,
+        ),
+        (
+            "tool_result_patch_is_an_object",
+            b"{\"type\":\"user\",\"toolUseResult\":{\"structuredPatch\":{\"x\":1},\"filePath\":\"/a\"},\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+            1,
         ),
     ];
 
@@ -236,8 +331,28 @@ mod tests {
             line_size: DEFAULT_MAX_LINE_SIZE,
             entries: 2,
         };
-        let entries = JsonlParser::parse_lines(BufReader::new(body.as_bytes()), limits);
+        let (entries, truncated) =
+            JsonlParser::parse_lines_reporting(BufReader::new(body.as_bytes()), limits);
         assert_eq!(entries.len(), 2, "the cap must stop the walk, not the file");
+        // The dropped entries are the NEWEST ones, so a silent cap understates
+        // both the totals and the last-activity time.
+        assert!(truncated, "hitting the cap has to be reportable");
+
+        let under = Limits {
+            line_size: DEFAULT_MAX_LINE_SIZE,
+            entries: 99,
+        };
+        let (all, hit) = JsonlParser::parse_lines_reporting(BufReader::new(body.as_bytes()), under);
+        assert_eq!(all.len(), 5);
+        assert!(!hit, "a file inside the cap is not truncated");
+    }
+
+    // The cap defaults to its own ceiling for the same reason
+    // `DEFAULT_MAX_FILE_SIZE` is 2GB: real transcripts reach these sizes, and
+    // the walk breaks going forward, so a lower default eats the tail.
+    #[test]
+    fn the_entry_cap_default_does_not_sit_below_its_ceiling() {
+        assert_eq!(DEFAULT_MAX_ENTRIES, MAX_MAX_ENTRIES);
     }
 
     #[test]

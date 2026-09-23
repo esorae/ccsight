@@ -662,10 +662,20 @@ pub(crate) fn handle_conversation_key(
                 _ => unreachable!(),
             };
             if state.active_pane_index.is_none() {
-                if let Some(group) = state.daily_groups.get(state.selected_day) {
-                    let sessions: Vec<_> = group.user_sessions().collect();
-                    if let Some(session) = sessions.get(state.selected_session) {
-                        let new_pane = ConversationPane::load_from(&session.file_path);
+                // Resolve through the same mode-aware lookup the preview uses.
+                // Indexing `daily_groups` picks the day list's Nth session,
+                // which is a different session while Pinned / Live is showing.
+                if let Some(file_path) = get_conv_session_file(state, state.selected_session) {
+                    // The preview already holds the cursor's session, so loading
+                    // it again would put two identical panes side by side.
+                    if let Some(existing) = state
+                        .panes
+                        .iter()
+                        .position(|p| p.file_path.as_deref() == Some(file_path.as_path()))
+                    {
+                        state.active_pane_index = Some(existing);
+                    } else {
+                        let new_pane = ConversationPane::load_from(&file_path);
                         while state.panes.len() <= target_idx {
                             state.panes.push(ConversationPane::default());
                         }
@@ -741,17 +751,23 @@ pub(crate) fn handle_conversation_key(
                 }
                 state.search_mode = true;
                 state.search_preview_mode = false;
-            } else if state.active_pane_index.is_none() {
-                if !state.panes.is_empty() {
-                    state.active_pane_index = Some(0);
-                } else {
-                    state.show_conversation = false;
-                    if state.conv_list_mode == ConvListMode::Live {
-                        state.selected_session = 0;
-                    }
-                    state.conv_list_mode = ConvListMode::Day;
+            } else if state.active_pane_index.is_some() {
+                // Esc only ever backs out one level. Moving focus inward is
+                // `Tab` / `1-4`, opening a pane is `C`, closing one is `X`.
+                state.active_pane_index = None;
+            } else {
+                state.show_conversation = false;
+                if state.conv_list_mode == ConvListMode::Live {
+                    state.selected_session = 0;
                 }
-            } else if let Some(idx) = state.active_pane_index {
+                state.panes.clear();
+                state.conv_list_mode = ConvListMode::Day;
+            }
+        }
+        // Pairs with `C` (open a pane). Esc no longer removes panes, so this
+        // is the only way to drop one without closing the whole view.
+        KeyCode::Char('X') => {
+            if let Some(idx) = state.active_pane_index {
                 state.panes.remove(idx);
                 if state.panes.is_empty() {
                     state.show_conversation = false;
@@ -761,8 +777,7 @@ pub(crate) fn handle_conversation_key(
                     state.active_pane_index = None;
                     state.conv_list_mode = ConvListMode::Day;
                 } else {
-                    let new_idx = idx.min(state.panes.len() - 1);
-                    state.active_pane_index = Some(new_idx);
+                    state.active_pane_index = Some(idx.min(state.panes.len() - 1));
                 }
             }
         }
@@ -871,15 +886,12 @@ pub(crate) fn handle_conversation_key(
             let no_loading = state.panes.iter().all(|p| !p.loading);
             if no_loading
                 && state.panes.len() < MAX_PANES
-                && let Some(group) = state.daily_groups.get(state.selected_day)
+                // Mode-aware, like the digit keys: the day list's Nth session
+                // is a different one while Pinned / Live is showing.
+                && let Some(file_path) = get_conv_session_file(state, state.selected_session)
             {
-                let sessions: Vec<_> = group.user_sessions().collect();
-                if let Some(session) = sessions.get(state.selected_session) {
-                    state
-                        .panes
-                        .push(ConversationPane::load_from(&session.file_path));
-                    state.active_pane_index = Some(state.panes.len() - 1);
-                }
+                state.panes.push(ConversationPane::load_from(&file_path));
+                state.active_pane_index = Some(state.panes.len() - 1);
             }
         }
         KeyCode::BackTab if state.active_pane_index.is_none() => {
@@ -1215,6 +1227,15 @@ pub(crate) fn handle_default_key(
     preview_conversation_in_pane: fn(&mut AppState),
     open_conversation_in_pane: fn(&mut AppState),
 ) -> bool {
+    // Matching on `key.code` alone made Ctrl+F open the period filter, where
+    // every other application starts a text search. Shift is deliberately not
+    // listed: `J` / `X` / `C` / `Q` arrive carrying it.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
     match key.code {
         KeyCode::Char('q') => {
             if state.ctrl_c_pressed {
@@ -1670,12 +1691,9 @@ pub(crate) fn handle_default_key(
         }
         // Unbound printable key: name it instead of silently ignoring, so a
         // slip (wrong tab, key from another view) is distinguishable from a
-        // dead keyboard. Modified chords stay silent — terminals send many.
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
-        {
+        // dead keyboard. Modified chords never reach here — the guard above
+        // drops them, since terminals send many.
+        KeyCode::Char(c) => {
             state.toast(format!("'{c}': no action here — ? shows key bindings"));
             state.needs_draw = true;
         }
@@ -2155,6 +2173,42 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
 mod tests {
     use super::*;
 
+    fn press(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
+        handle_default_key(state, KeyEvent::new(code, mods), |_| {}, |_| {});
+    }
+
+    #[test]
+    fn ctrl_modified_letters_are_not_taken_as_their_bare_binding() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        press(&mut state, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(
+            !state.show_filter_popup(),
+            "Ctrl+F must not open the filter"
+        );
+        press(&mut state, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(
+            !state.show_project_popup(),
+            "Ctrl+P must not open the filter"
+        );
+
+        // The bare keys still bind.
+        press(&mut state, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(state.show_filter_popup());
+    }
+
+    #[test]
+    fn shift_stays_a_binding_since_uppercase_letters_carry_it() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        // A terminal sends Shift+F as the uppercase char plus the modifier.
+        // `F` is not bound here, so the unknown-key toast is the observable
+        // that dispatch was reached at all.
+        press(&mut state, KeyCode::Char('F'), KeyModifiers::SHIFT);
+        assert!(
+            state.toast_time.is_some(),
+            "SHIFT must still reach dispatch"
+        );
+    }
+
     #[test]
     fn title_editor_prefills_from_the_cache_over_the_stale_session_clone() {
         // Saving a title updates `session_titles` only; the SessionInfo in
@@ -2330,6 +2384,84 @@ mod tests {
             0
         }
         handle_conversation_key(state, KeyEvent::from(code), noop, noop, no_file, no_count);
+    }
+
+    // The pins / preview list already loads the cursor's session into pane 0,
+    // so a digit press there would open a byte-identical second pane.
+    #[test]
+    fn a_digit_focuses_the_pane_that_already_holds_that_session() {
+        // The resolver is the mode-aware lookup the preview also uses, so this
+        // covers the Pinned / Live lists too — indexing `daily_groups` there
+        // resolves a different session than the one on screen.
+        fn fixed_file(_: &AppState, _: usize) -> Option<std::path::PathBuf> {
+            Some(std::path::PathBuf::from("/s/0.jsonl"))
+        }
+        fn no_count(_: &AppState) -> usize {
+            0
+        }
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.show_conversation = true;
+        let mut preview = conv_test_pane(&["a"]);
+        preview.file_path = Some(std::path::PathBuf::from("/s/0.jsonl"));
+        state.panes = vec![preview];
+        state.active_pane_index = None;
+
+        handle_conversation_key(
+            &mut state,
+            KeyEvent::from(KeyCode::Char('2')),
+            noop,
+            noop,
+            fixed_file,
+            no_count,
+        );
+        assert_eq!(state.panes.len(), 1, "no duplicate pane");
+        assert_eq!(
+            state.active_pane_index,
+            Some(0),
+            "focus moved to the holder"
+        );
+    }
+
+    // Esc is the only key whose direction used to depend on focus: with the
+    // list focused it stepped INTO a pane. One key that sometimes advances and
+    // sometimes retreats is the thing a first-time user cannot recover from.
+    #[test]
+    fn esc_only_ever_steps_one_level_outward() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.show_conversation = true;
+        state.panes = vec![conv_test_pane(&["a"]), conv_test_pane(&["b"])];
+
+        state.active_pane_index = Some(1);
+        conv_key(&mut state, KeyCode::Esc);
+        assert_eq!(state.active_pane_index, None, "pane focus → list");
+        assert_eq!(state.panes.len(), 2, "Esc must not remove a pane");
+        assert!(state.show_conversation);
+
+        conv_key(&mut state, KeyCode::Esc);
+        assert!(!state.show_conversation, "list focus → leave the view");
+        assert!(state.panes.is_empty());
+    }
+
+    // Pairs with `C`. Esc no longer removes panes, so without this key a
+    // second pane could only be dropped by closing the whole view.
+    #[test]
+    fn capital_x_closes_only_the_focused_pane() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.show_conversation = true;
+        state.panes = vec![conv_test_pane(&["a"]), conv_test_pane(&["b"])];
+        state.active_pane_index = Some(0);
+
+        conv_key(&mut state, KeyCode::Char('X'));
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.active_pane_index, Some(0));
+        assert!(state.show_conversation);
+
+        conv_key(&mut state, KeyCode::Char('X'));
+        assert!(state.panes.is_empty());
+        assert!(
+            !state.show_conversation,
+            "last pane closed → leave the view"
+        );
     }
 
     #[test]

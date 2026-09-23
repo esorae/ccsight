@@ -11,7 +11,7 @@ pub(crate) use buckets::{
 
 pub use grouping::*;
 pub use pricing::*;
-pub use stats::{CacheStats, ProjectStats, Stats, StatsAggregator, TokenStats};
+pub use stats::{CacheStats, ProjectStats, Stats, StatsAggregator, TokenStats, load_progress};
 pub use tool_category::*;
 
 /// The first cwd whose official slug matches the transcript's parent dir
@@ -125,9 +125,11 @@ mod tests {
             git_branch: None,
             version: None,
             is_sidechain: false,
+            is_compact_summary: false,
             user_type: None,
             request_id: None,
             level: None,
+            tool_result_churn: Default::default(),
         }
     }
 

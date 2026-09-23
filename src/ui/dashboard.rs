@@ -71,6 +71,62 @@ fn render_sparkline(values: &[u64], global_max: u64, color: Color) -> Vec<Span<'
     ]
 }
 
+/// Single-line `Top: A 20K · B 17K` form of the Ecosystem tool list, for
+/// panels too short for one row per tool. A pair is appended only while the
+/// whole line still fits: a half-drawn pair reads as a truncated number rather
+/// than as "more". Composed apart from drawing so `max_width` is testable.
+pub(super) fn eco_top_row(top_tools: &[(&str, usize)], max_width: usize) -> String {
+    const NAME_WIDTH: usize = 10;
+    let width = |t: &str| unicode_width::UnicodeWidthStr::width(t);
+    let mut row = String::from(" Top:");
+    for (i, (name, count)) in top_tools.iter().enumerate() {
+        let short_name = crate::text::truncate_with_ellipsis(name, NAME_WIDTH);
+        let piece = format!(
+            "{} {short_name} {}",
+            if i > 0 { " ·" } else { "" },
+            crate::format_number(*count as u64)
+        );
+        if width(&row) + width(&piece) > max_width {
+            break;
+        }
+        row.push_str(&piece);
+    }
+    row
+}
+
+/// Caption under the total-cost card. The pricing-gap variant carries a `*`
+/// prefix and a digit count, so its width differs from the plain caption's by
+/// an amount the data decides — each form is measured rather than sharing one
+/// column threshold. The short form is the floor; below its width nothing fits.
+pub(super) fn cost_caption_spans(gap_count: usize, long: bool) -> Vec<Span<'static>> {
+    if gap_count == 0 {
+        return vec![Span::styled(
+            if long {
+                "total cost (API est.)"
+            } else {
+                "cost (est.)"
+            },
+            Style::default().fg(theme::DIM),
+        )];
+    }
+    vec![
+        Span::styled(
+            "* ",
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if long {
+                format!("{gap_count} models lack pricing")
+            } else {
+                format!("{gap_count} no-price")
+            },
+            Style::default().fg(theme::WARNING),
+        ),
+    ]
+}
+
 pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let chunks = Layout::vertical([
         Constraint::Length(4),  // Stats cards (with border)
@@ -158,16 +214,35 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
     // Footer: route through `help_bar` — keys/format live in one place.
     // Adding a global keybind still means listing it in each tab's bar,
     // but spacing/styling are centralised so sites can't drift.
-    let help_line = Paragraph::new(super::help_bar(&[
-        ("?", "help"),
-        ("q", "quit"),
-        ("←→", "panel"),
-        ("↑↓", "scroll"),
-        ("Enter", "detail"),
-        ("/", "search"),
-        ("m", "pins"),
-    ]));
+    let help_line = Paragraph::new(super::tab_help_bar(
+        state,
+        &[
+            ("?", "help"),
+            ("q", "quit"),
+            ("←→", "panel"),
+            ("↑↓", "scroll"),
+            ("Enter", "detail"),
+            ("/", "search"),
+            ("m", "pins"),
+        ],
+    ));
     frame.render_widget(help_line, chunks[3]);
+}
+
+/// Shown in place of the Overview cards when nothing was found. Two lines:
+/// the panel's inner height is fixed at two, so a third is silently clipped.
+/// Names the path so the reader can check it, and the command that fills it.
+pub(super) fn empty_dashboard_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "No Claude Code sessions found",
+            Style::default().fg(theme::WARNING).bold(),
+        )),
+        Line::from(Span::styled(
+            "Looked in ~/.claude/projects/**/*.jsonl — run `claude` once, then reopen",
+            Style::default().fg(theme::DIM),
+        )),
+    ]
 }
 
 fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -190,6 +265,19 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
     .split(inner);
 
     let session_count = crate::aggregator::distinct_user_session_count(&state.daily_groups);
+
+    // Four zeroes read the same whether the tool is broken or the machine has
+    // simply never run Claude Code. Only the empty case needs saying, so this
+    // returns before the cards rather than adding a caption to every launch.
+    // Judged on the unfiltered data: a filter that matches nothing is not a
+    // missing install, and its zero cards already say "none in this range".
+    let nothing_on_disk =
+        crate::aggregator::distinct_user_session_count(&state.original_daily_groups) == 0;
+    if session_count == 0 && nothing_on_disk && !state.loading {
+        frame.render_widget(Paragraph::new(empty_dashboard_lines()).centered(), inner);
+        return;
+    }
+
     let sessions_card = Paragraph::new(vec![
         Line::from(Span::styled(
             format!("{session_count}"),
@@ -240,37 +328,12 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         format!("{}*", super::format_cost(state.total_cost, 2))
     };
-    // Caption text picks a length that fits the per-card width. The card occupies
-    // roughly inner.width / 4 — at 60×20 that's ~14 chars, so "total cost (API est.)"
-    // (21 chars) gets clipped to "total cost (AP". Use a short label below 22.
     let card_width = (inner.width / 4) as usize;
-    let cost_caption = if card_width >= 22 {
-        "total cost (API est.)"
-    } else {
-        "cost (est.)"
-    };
-    let caption = if pricing_gap_count == 0 {
-        Line::from(Span::styled(cost_caption, Style::default().fg(theme::DIM)))
-            .alignment(Alignment::Center)
-    } else {
-        Line::from(vec![
-            Span::styled(
-                "* ",
-                Style::default()
-                    .fg(theme::WARNING)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                if card_width >= 22 {
-                    format!("{pricing_gap_count} models lack pricing")
-                } else {
-                    format!("{pricing_gap_count} no-price")
-                },
-                Style::default().fg(theme::WARNING),
-            ),
-        ])
-        .alignment(Alignment::Center)
-    };
+    let mut caption_spans = cost_caption_spans(pricing_gap_count, true);
+    if super::spans_width(&caption_spans) > card_width {
+        caption_spans = cost_caption_spans(pricing_gap_count, false);
+    }
+    let caption = Line::from(caption_spans).alignment(Alignment::Center);
     let cost_card = Paragraph::new(vec![
         Line::from(Span::styled(
             cost_text,
@@ -1068,20 +1131,8 @@ fn draw_tool_usage(
     if show_tier2 && !top_tools.is_empty() {
         lines.push(make_sep());
         if compress_tier2 {
-            // Single-line "Top: A 20K · B 17K · C 16K" form for tight panels.
-            let mut compact = String::from(" Top:");
-            for (i, (name, count)) in top_tools.iter().enumerate() {
-                if i > 0 {
-                    compact.push_str(" ·");
-                }
-                let short_name = (*name).chars().take(10).collect::<String>();
-                compact.push_str(&format!(
-                    " {short_name} {}",
-                    crate::format_number(*count as u64)
-                ));
-            }
             lines.push(Line::from(vec![Span::styled(
-                compact,
+                eco_top_row(&top_tools, inner_width as usize),
                 Style::default().fg(theme::LABEL_MUTED),
             )]));
         } else {
@@ -1857,14 +1908,37 @@ pub(crate) fn activity_header_lines(
             .sum();
         daily_tokens.insert(group.date, tokens);
     }
-    let spark = render_spark_line(today, 30, |d| {
-        daily_tokens.get(&d).copied().unwrap_or(0) as f64
-    });
-    let trend_line = vec![
-        Span::styled("  Daily tokens ", Style::default().fg(theme::DIM)),
-        Span::styled(spark, Style::default().fg(theme::PRIMARY)),
-        Span::styled("  past 30 days", Style::default().fg(theme::DIM)),
-    ];
+    // Follows the list below it: a daily sparkline under a `Weekly Activity`
+    // title reads as the same period the list is showing when it is not.
+    const TREND_WEEKS: usize = 12;
+    let trend_line = if state.activity_view_weekly {
+        // One cell per week: `render_spark_line` walks back one day per cell, so
+        // each of those dates stands in for that many weeks back.
+        let spark = render_spark_line(today, TREND_WEEKS, |d| {
+            let weeks_back = (today - d).num_days();
+            let ws = week_start(today) - chrono::Duration::weeks(weeks_back);
+            (0..7)
+                .filter_map(|i| daily_tokens.get(&(ws + chrono::Duration::days(i))))
+                .sum::<u64>() as f64
+        });
+        vec![
+            Span::styled("  Weekly tokens ", Style::default().fg(theme::DIM)),
+            Span::styled(spark, Style::default().fg(theme::PRIMARY)),
+            Span::styled(
+                format!("  past {TREND_WEEKS} weeks"),
+                Style::default().fg(theme::DIM),
+            ),
+        ]
+    } else {
+        let spark = render_spark_line(today, 30, |d| {
+            daily_tokens.get(&d).copied().unwrap_or(0) as f64
+        });
+        vec![
+            Span::styled("  Daily tokens ", Style::default().fg(theme::DIM)),
+            Span::styled(spark, Style::default().fg(theme::PRIMARY)),
+            Span::styled("  past 30 days", Style::default().fg(theme::DIM)),
+        ]
+    };
 
     // Top contributors this week: highest project by tokens and highest
     // tool by call count. Skips the row entirely when the current week has
@@ -2327,11 +2401,7 @@ fn detail_panel_projects(
             let bg = theme::FAINT;
             let sel_style = Style::default().bg(bg);
             for line in lines[row_start..row_end].iter_mut() {
-                let width: usize = line
-                    .spans
-                    .iter()
-                    .map(|sp| unicode_width::UnicodeWidthStr::width(sp.content.as_ref()))
-                    .sum();
+                let width = super::spans_width(&line.spans);
                 for span in &mut line.spans {
                     span.style = span.style.bg(bg);
                 }
@@ -2644,7 +2714,10 @@ fn detail_panel_ecosystem(
     // grand_total retained for the Total line; no cross-category % derived from it.
 
     lines.push(Line::from(vec![Span::styled(
-        format!("  Total: {grand_total} calls"),
+        format!(
+            "  Total: {} calls",
+            crate::format_number(grand_total as u64)
+        ),
         Style::default().fg(theme::LABEL_MUTED),
     )]));
 
@@ -3474,12 +3547,12 @@ fn detail_panel_languages(
                              current_line: &mut String,
                              wrote_any: &mut bool,
                              lines: &mut Vec<Line>| {
-                let needed = if current_line.len() == indent.len() {
-                    current_line.len() + part.len()
-                } else {
-                    current_line.len() + 2 + part.len()
-                };
-                if needed > max_line_width && current_line.len() > indent.len() {
+                // Display width, not byte length: a multi-byte extension name
+                // measures wider than it renders and wraps the line early.
+                let w = |t: &str| unicode_width::UnicodeWidthStr::width(t);
+                let at_start = w(current_line) == w(indent);
+                let needed = w(current_line) + if at_start { 0 } else { 2 } + w(&part);
+                if needed > max_line_width && !at_start {
                     lines.push(Line::from(Span::styled(
                         current_line.clone(),
                         Style::default().fg(theme::DIM),
@@ -3747,11 +3820,7 @@ fn detail_panel_hourly(
         let intensity = theme::bar_intensity(ratio);
         let bar_color = theme::primary_with_intensity(intensity);
         let bar = crate::text::hbar(filled, bar_width);
-        let pct = if total_avg > 0 {
-            tokens as f64 / total_avg as f64 * 100.0
-        } else {
-            0.0
-        };
+        let pct = crate::text::format_pct(tokens, total_avg);
 
         lines.push(Line::from(vec![
             Span::styled(
@@ -3763,7 +3832,7 @@ fn detail_panel_hourly(
                 format!(" {:>9}", crate::format_number(tokens)),
                 Style::default().fg(theme::PRIMARY),
             ),
-            Span::styled(format!(" {pct:>4.1}%"), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {pct:>4}"), Style::default().fg(theme::DIM)),
         ]));
     }
     (title, lines)
@@ -3980,7 +4049,194 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
 #[cfg(test)]
 mod tests {
     use super::push_month_divider_line;
+    use super::{cost_caption_spans, eco_top_row};
     use ratatui::text::Line;
+
+    fn w(t: &str) -> usize {
+        unicode_width::UnicodeWidthStr::width(t)
+    }
+
+    // Composition is a pure function of (data, max_width), so every width the
+    // TUI can be resized to is reachable from a unit test. Rendering cannot
+    // check this: ratatui clips at draw time, so an over-wide line and a
+    // correctly-fitted one leave the same buffer.
+
+    // The weekly sparkline reuses the daily renderer, so each cell's date has
+    // to be remapped to a week. Getting that wrong renders 84 mostly-empty
+    // cells instead of 12 filled ones, which still looks like a sparkline.
+    #[test]
+    fn activity_header_follows_the_list_period() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let today = chrono::Local::now().date_naive();
+        // 13 weeks so every one of the 12 trend cells has data; a shorter
+        // fixture leaves legitimate gaps and the emptiness check says nothing.
+        let groups: Vec<_> = (0..91)
+            .map(|i| {
+                let d = today - chrono::Duration::days(i);
+                make_daily_group(
+                    d,
+                    vec![make_session_with_tokens(
+                        "proj",
+                        1_000,
+                        1_000,
+                        "claude-opus-5",
+                    )],
+                )
+            })
+            .collect();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(groups);
+
+        // Per line: the header also carries a day-of-week row whose blocks
+        // would otherwise be mistaken for the trend sparkline.
+        let lines_of = |st: &crate::AppState| -> Vec<String> {
+            super::activity_header_lines(st, today)
+                .iter()
+                .map(|l| l.spans.iter().map(|sp| sp.content.to_string()).collect())
+                .collect()
+        };
+        let text_of = |st: &crate::AppState| -> String { lines_of(st).join("\n") };
+
+        state.activity_view_weekly = false;
+        let daily = text_of(&state);
+        assert!(daily.contains("Daily tokens"), "{daily:?}");
+        assert!(daily.contains("past 30 days"), "{daily:?}");
+
+        state.activity_view_weekly = true;
+        let weekly = text_of(&state);
+        assert!(weekly.contains("Weekly tokens"), "{weekly:?}");
+        assert!(weekly.contains("weeks"), "{weekly:?}");
+
+        // Every week in the fixture has activity, so no cell on the trend line
+        // may be empty — the symptom of mapping cells to days, not weeks.
+        let trend = lines_of(&state)
+            .into_iter()
+            .find(|l| l.contains("Weekly tokens"))
+            .expect("trend line");
+        let spark: String = trend.chars().filter(|c| "▁▂▃▄▅▆▇█·".contains(*c)).collect();
+        assert!(
+            !spark.is_empty() && !spark.contains('·'),
+            "a week with activity rendered as empty: {spark:?}"
+        );
+
+        // One active week, 8 weeks back, fills exactly one cell only if each
+        // cell maps to its own week. Mapping cells to days fills none.
+        // Anchored to the week start: seven days from an arbitrary weekday
+        // straddle two weeks and would legitimately fill two cells.
+        use chrono::Datelike;
+        let this_week =
+            today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+        let far = this_week - chrono::Duration::weeks(8);
+        let single: Vec<_> = (0..7)
+            .map(|i| {
+                make_daily_group(
+                    far + chrono::Duration::days(i),
+                    vec![make_session_with_tokens(
+                        "proj",
+                        1_000,
+                        1_000,
+                        "claude-opus-5",
+                    )],
+                )
+            })
+            .collect();
+        let mut lone = crate::test_helpers::helpers::make_test_app_state(single);
+        lone.activity_view_weekly = true;
+        let lone_trend = lines_of(&lone)
+            .into_iter()
+            .find(|l| l.contains("Weekly tokens"))
+            .expect("trend line");
+        let filled = lone_trend
+            .chars()
+            .filter(|c| "▁▂▃▄▅▆▇█".contains(*c))
+            .count();
+        assert_eq!(
+            filled, 1,
+            "one active week must fill exactly one cell: {lone_trend:?}"
+        );
+    }
+
+    #[test]
+    fn eco_top_row_never_exceeds_max_width() {
+        // Names span single-width, double-width, and over-long, since the row
+        // shortens by display width rather than by character count.
+        let names = ["Read", "Bash", "ツール名", "a-very-long-tool-name", "絵🎯"];
+        for max_width in 0..=240usize {
+            for n in 0..=names.len() {
+                for count in [0u64, 7, 999, 12_345, 9_876_543] {
+                    let tools: Vec<(&str, usize)> =
+                        names[..n].iter().map(|s| (*s, count as usize)).collect();
+                    let row = eco_top_row(&tools, max_width);
+                    assert!(
+                        w(&row) <= max_width.max(w(" Top:")),
+                        "max_width={max_width} n={n} count={count} → width {} : {row:?}",
+                        w(&row)
+                    );
+                }
+            }
+        }
+    }
+
+    // The row budgets each name in columns. Truncating by character count
+    // instead lets a double-width name take twice its share and squeeze the
+    // counts out of a line that still measures as fitting.
+    #[test]
+    fn eco_top_row_bounds_each_name_by_display_width() {
+        const NAME_WIDTH: usize = 10;
+        let bound = w(" Top:") + 1 + NAME_WIDTH + 1 + 1;
+        for name in [
+            "ツール名前が長い場合です",
+            "aaaaaaaaaaaaaaaaaaaaaa",
+            "🎯🎯🎯🎯🎯🎯🎯🎯",
+        ] {
+            let row = eco_top_row(&[(name, 1)], 200);
+            assert!(w(&row) <= bound, "{name}: {row:?} → width {}", w(&row));
+        }
+    }
+
+    #[test]
+    fn eco_top_row_adds_entries_as_width_grows() {
+        let tools = [("Read", 100usize), ("Bash", 90), ("Edit", 80)];
+        let mut prev = 0usize;
+        for max_width in 0..=80usize {
+            let n = eco_top_row(&tools, max_width).matches('·').count();
+            assert!(n >= prev, "entry count dropped at max_width={max_width}");
+            prev = n;
+        }
+        assert!(eco_top_row(&tools, 80).contains("Edit"));
+    }
+
+    // The gap variant's width depends on its digit count, so the two captions
+    // cannot share one column threshold.
+    #[test]
+    fn cost_caption_picks_a_form_that_fits() {
+        for gap_count in [0usize, 1, 9, 10, 99, 100, 12_345] {
+            for card_width in 0..=60usize {
+                let long = cost_caption_spans(gap_count, true);
+                let chosen = if super::super::spans_width(&long) > card_width {
+                    cost_caption_spans(gap_count, false)
+                } else {
+                    long
+                };
+                let short_w = super::super::spans_width(&cost_caption_spans(gap_count, false));
+                let chosen_w = super::super::spans_width(&chosen);
+                assert!(
+                    chosen_w <= card_width || chosen_w == short_w,
+                    "gap={gap_count} card_width={card_width} → {chosen_w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cost_caption_short_form_is_never_wider_than_long() {
+        for gap_count in [0usize, 1, 99, 100, 12_345] {
+            assert!(
+                super::super::spans_width(&cost_caption_spans(gap_count, false))
+                    <= super::super::spans_width(&cost_caption_spans(gap_count, true)),
+                "gap={gap_count}"
+            );
+        }
+    }
 
     fn line_text(line: &Line<'static>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()

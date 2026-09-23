@@ -93,10 +93,26 @@ fi
 # The one check CI cannot run: the EXHAUSTIVE aggregation-agreement pass over
 # ALL of `~/.claude` (the commit gate only samples it). No-ops without local
 # Claude data. Slow (minutes on a large history) by design.
-echo "[pre-push] cargo test -- --ignored (full real-data agreement) ..."
-if ! cargo test --quiet test_stats_and_grouper_agree_on_token_totals -- --ignored 2>&1; then
-    echo "[pre-push] FAILED: full real-data aggregation paths diverged."
-    exit 1
-fi
+# A file written during the minutes-long pass makes it inconclusive rather
+# than failed, and an active session makes that likely, so only that outcome
+# is retried. A divergence stops the push on the first run.
+agreement_log=$(mktemp)
+trap 'rm -f "$agreement_log"' EXIT
+for attempt in 1 2 3; do
+    echo "[pre-push] cargo test -- --ignored (full real-data agreement, attempt $attempt/3) ..."
+    if cargo test --quiet test_stats_and_grouper_agree_on_token_totals -- --ignored 2>&1 \
+        | tee "$agreement_log"; [ "${PIPESTATUS[0]}" -eq 0 ]; then
+        break
+    fi
+    if ! grep -q 'inconclusive:' "$agreement_log"; then
+        echo "[pre-push] FAILED: full real-data aggregation paths diverged."
+        exit 1
+    fi
+    if [ "$attempt" -eq 3 ]; then
+        echo "[pre-push] FAILED: real-data agreement inconclusive 3 times — a session kept writing during the pass. Nothing diverged; push again once sessions are idle."
+        exit 1
+    fi
+    echo "[pre-push] inconclusive (a session wrote mid-pass); retrying."
+done
 
 echo "[pre-push] OK"

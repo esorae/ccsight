@@ -73,7 +73,7 @@ use crate::infrastructure::FileDiscovery;
 #[command(name = "ccsight")]
 #[command(author, version, about = "Claude Code session analytics TUI", long_about = None)]
 struct Args {
-    /// Maximum number of session files to load (0 = all)
+    /// Load only the N most recently modified session files (0 = all)
     #[arg(short, long, default_value = "0")]
     limit: usize,
 
@@ -102,10 +102,10 @@ struct Args {
     mcp: bool,
 
     /// Wait for ONE session (id or unique prefix) to need attention — awaiting
-    /// input, stalled, error, exited mid-task — or to end, then print a single
-    /// line and exit 0. Composable: `ccsight --wait <id> && your-notifier`.
-    /// Conflicts with the report modes so a combined invocation errors loudly
-    /// instead of silently dropping the wait.
+    /// input, stalled, error, exited mid-task — or to end. Prints one
+    /// tab-separated line (state, session id, reason) and exits 0; an unknown
+    /// or ambiguous id exits 2 with candidates on stderr. Composable:
+    /// `ccsight --wait <id> && your-notifier`; conflicts with the report modes.
     #[arg(long, value_name = "SESSION_ID", conflicts_with_all = ["daily", "weekly", "monthly", "json", "mcp"])]
     wait: Option<String>,
 }
@@ -1226,39 +1226,27 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
         return;
     }
     if state.show_conversation {
-        if state.panes.len() > 1 {
-            if let Some(idx) = state.active_pane_index {
-                if state.panes.get(idx).is_some_and(|p| p.search_mode) {
-                    state.panes[idx].search_mode = false;
-                    return;
-                }
-                state.panes.remove(idx);
-                if state.panes.is_empty() {
-                    state.show_conversation = false;
-                    state.active_pane_index = None;
-                    state.conv_list_mode = ConvListMode::Day;
-                } else {
-                    state.active_pane_index = Some(idx.min(state.panes.len() - 1));
-                }
-            } else if !state.panes.is_empty() {
-                state.active_pane_index = Some(0);
-            }
-        } else {
-            let has_search = state.panes.first().is_some_and(|p| p.search_mode);
-            if has_search {
-                if let Some(pane) = state.panes.first_mut() {
-                    pane.search_mode = false;
-                }
+        // Same one-level-outward steps as the Esc key: an in-pane search bar
+        // first, then focus, then the view. Dismissing never removes a pane —
+        // that is `X` — so a click-away cannot silently drop a loaded pane.
+        if let Some(idx) = state.active_pane_index {
+            if state.panes.get(idx).is_some_and(|p| p.search_mode) {
+                state.panes[idx].search_mode = false;
                 return;
             }
-            state.show_conversation = false;
-            state.panes.clear();
             state.active_pane_index = None;
-            state.conv_list_mode = ConvListMode::Day;
+            return;
         }
-        if !state.show_conversation {
-            state.conv_list_mode = ConvListMode::Day;
+        if let Some(pane) = state.panes.first_mut()
+            && pane.search_mode
+        {
+            pane.search_mode = false;
+            return;
         }
+        state.show_conversation = false;
+        state.panes.clear();
+        state.active_pane_index = None;
+        state.conv_list_mode = ConvListMode::Day;
         return;
     }
     if state.daily_breakdown_focus {
@@ -1410,15 +1398,7 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
                     })
                 })
                 .sum();
-            let day_billable_tokens: u64 = group
-                .sessions
-                .iter()
-                .flat_map(|s| s.day_tokens_by_model.values())
-                .map(|t| {
-                    t.input_tokens + t.output_tokens + t.cache_creation_tokens + t.cache_read_tokens
-                })
-                .sum();
-            (day_billable_tokens > 0).then_some((group.date, day_cost))
+            (group.billable_tokens() > 0).then_some((group.date, day_cost))
         })
         .collect();
 

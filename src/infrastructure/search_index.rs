@@ -18,7 +18,7 @@ use crate::domain::{EntryType, Role};
 use crate::parser::JsonlParser;
 use crate::search::{SearchMatchType, SearchResult, extract_snippet};
 
-const INDEX_VERSION: u32 = 5;
+const INDEX_VERSION: u32 = 6;
 const TOKENIZER_NAME: &str = "ngram23";
 
 #[derive(Serialize, Deserialize)]
@@ -92,6 +92,14 @@ fn build_file_map(daily_groups: &[DailyGroup]) -> HashMap<String, u64> {
         .collect()
 }
 
+/// Sessions new or written to since indexing, whose messages the index lacks.
+fn changed_file_count(old: &HashMap<String, u64>, current: &HashMap<String, u64>) -> usize {
+    current
+        .iter()
+        .filter(|(path, mtime)| old.get(*path) != Some(*mtime))
+        .count()
+}
+
 fn parse_session(session_path: &Path, day_idx: usize, session_idx: usize) -> Vec<ParsedDoc> {
     let Ok(entries) = JsonlParser::parse_file(session_path) else {
         return Vec::new();
@@ -147,7 +155,12 @@ fn write_docs(writer: &IndexWriter, fields: &Fields, docs: &[ParsedDoc]) -> anyh
     Ok(())
 }
 
+/// One task per session file, at its newest day. A file appears in every day
+/// group it was active on, and each task parses the whole file, so a task per
+/// appearance indexes a long-running session once per active day — its copies
+/// then crowd every other session out of a result page.
 fn collect_tasks(daily_groups: &[DailyGroup]) -> Vec<(usize, usize, PathBuf)> {
+    let mut seen = std::collections::HashSet::new();
     daily_groups
         .iter()
         .enumerate()
@@ -159,6 +172,7 @@ fn collect_tasks(daily_groups: &[DailyGroup]) -> Vec<(usize, usize, PathBuf)> {
                 .enumerate()
                 .map(move |(session_idx, s)| (day_idx, session_idx, s.file_path.clone()))
         })
+        .filter(|(_, _, path)| seen.insert(path.clone()))
         .collect()
 }
 
@@ -166,6 +180,56 @@ fn collect_tasks(daily_groups: &[DailyGroup]) -> Vec<(usize, usize, PathBuf)> {
 /// so the head covers the most recent (most-searched) sessions and the
 /// early handle makes search usable within seconds of a cold start.
 const FIRST_COMMIT_SESSIONS: usize = 200;
+
+/// Transcript bytes parsed into `ParsedDoc`s before handing them to the
+/// writer. Budgeted in bytes, not sessions: session sizes span four orders of
+/// magnitude, so a session-count batch still holds most of the corpus whenever
+/// the large transcripts land in one batch. A single over-budget file forms its
+/// own batch — nothing smaller is available.
+const INDEX_PARSE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Parse `tasks` in bounded chunks, writing each chunk before parsing the
+/// next. Does not commit — the caller decides commit points, so bounding
+/// memory costs no extra segment flushes.
+fn index_in_chunks(
+    writer: &IndexWriter,
+    fields: &Fields,
+    tasks: &[(usize, usize, PathBuf)],
+) -> anyhow::Result<()> {
+    for chunk in byte_budget_chunks(tasks, INDEX_PARSE_BUDGET_BYTES) {
+        let parsed: Vec<ParsedDoc> = chunk
+            .par_iter()
+            .flat_map(|(day_idx, session_idx, path)| parse_session(path, *day_idx, *session_idx))
+            .collect();
+        write_docs(writer, fields, &parsed)?;
+    }
+    Ok(())
+}
+
+/// Split `tasks` into runs whose transcripts sum to at most `budget` bytes.
+/// An unreadable file counts as zero rather than ending the run: the budget is
+/// a memory guard, and a stat failure is not a reason to change batching.
+fn byte_budget_chunks(
+    tasks: &[(usize, usize, PathBuf)],
+    budget: u64,
+) -> Vec<&[(usize, usize, PathBuf)]> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0u64;
+    for (i, (_, _, path)) in tasks.iter().enumerate() {
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        if i > start && acc.saturating_add(size) > budget {
+            out.push(&tasks[start..i]);
+            start = i;
+            acc = 0;
+        }
+        acc = acc.saturating_add(size);
+    }
+    if start < tasks.len() {
+        out.push(&tasks[start..]);
+    }
+    out
+}
 
 impl SearchIndex {
     pub fn update_or_build(daily_groups: &[DailyGroup]) -> anyhow::Result<Self> {
@@ -212,6 +276,23 @@ impl SearchIndex {
         Self::update_incremental(daily_groups, &index_dir, &manifest, &current_files)
     }
 
+    /// Read-only: building walks every transcript and writing needs a lock
+    /// another ccsight process may hold, so either leaves a caller on a
+    /// request timeout with nothing. An out-of-date index is still returned —
+    /// callers remap hits by `session_path`, as the TUI does — with how many
+    /// sessions it has not caught up on.
+    pub(crate) fn open_for_read(daily_groups: &[DailyGroup]) -> Option<(Self, usize)> {
+        let index_dir = Self::index_path().ok()?;
+        let manifest: Manifest = fs::read_to_string(index_dir.join("manifest.json"))
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())?;
+        if manifest.version != INDEX_VERSION {
+            return None;
+        }
+        let behind = changed_file_count(&manifest.files, &build_file_map(daily_groups));
+        Self::open_existing(&index_dir).ok().map(|h| (h, behind))
+    }
+
     fn build(daily_groups: &[DailyGroup], early: &dyn Fn(Self)) -> anyhow::Result<Self> {
         let index_dir = Self::index_path()?;
         Self::build_in(&index_dir, daily_groups, early, FIRST_COMMIT_SESSIONS)
@@ -226,6 +307,17 @@ impl SearchIndex {
         first_chunk: usize,
     ) -> anyhow::Result<Self> {
         if index_dir.exists() {
+            // Another ccsight process holding the writer lock is mid-build or
+            // mid-update; deleting the directory under it corrupts its index.
+            // The probe is dropped before the delete, so no lock outlives it.
+            use tantivy::directory::Directory;
+            let busy = tantivy::directory::MmapDirectory::open(index_dir).is_ok_and(|d| {
+                d.acquire_lock(&tantivy::directory::INDEX_WRITER_LOCK)
+                    .is_err()
+            });
+            if busy {
+                anyhow::bail!("search index is being written by another process");
+            }
             let _ = fs::remove_dir_all(index_dir);
         }
         fs::create_dir_all(index_dir)?;
@@ -239,19 +331,8 @@ impl SearchIndex {
         install_merge_policy(&writer);
 
         let tasks = collect_tasks(daily_groups);
-        let index_chunk =
-            |writer: &IndexWriter, chunk: &[(usize, usize, PathBuf)]| -> anyhow::Result<()> {
-                let parsed: Vec<ParsedDoc> = chunk
-                    .par_iter()
-                    .flat_map(|(day_idx, session_idx, path)| {
-                        parse_session(path, *day_idx, *session_idx)
-                    })
-                    .collect();
-                write_docs(writer, &fields, &parsed)
-            };
-
         let (head, tail) = tasks.split_at(tasks.len().min(first_chunk));
-        index_chunk(&writer, head)?;
+        index_in_chunks(&writer, &fields, head)?;
         writer.commit()?;
         if !tail.is_empty() {
             // Early snapshot covers the head (newest sessions) while the
@@ -259,7 +340,7 @@ impl SearchIndex {
             if let Ok(handle) = Self::open_existing(index_dir) {
                 early(handle);
             }
-            index_chunk(&writer, tail)?;
+            index_in_chunks(&writer, &fields, tail)?;
             writer.commit()?;
         }
         // Block until merge threads finish; without this, writer drops
@@ -364,12 +445,7 @@ impl SearchIndex {
             })
             .collect();
 
-        let parsed: Vec<ParsedDoc> = add_tasks
-            .par_iter()
-            .flat_map(|(day_idx, session_idx, path)| parse_session(path, *day_idx, *session_idx))
-            .collect();
-
-        write_docs(&writer, &fields, &parsed)?;
+        index_in_chunks(&writer, &fields, &add_tasks)?;
         writer.commit()?;
         // Same merge-threads barrier as `build` — see the comment there.
         // This is the hot path (called every 30s on reload) so the win
@@ -507,6 +583,80 @@ impl SearchIndex {
 mod tests {
     use super::*;
 
+    fn file_map(entries: &[(&str, u64)]) -> HashMap<String, u64> {
+        entries
+            .iter()
+            .map(|(p, m)| ((*p).to_string(), *m))
+            .collect()
+    }
+
+    #[test]
+    fn a_moved_mtime_or_a_new_session_counts_as_behind() {
+        let old = file_map(&[("a.jsonl", 10), ("b.jsonl", 20)]);
+        let moved = file_map(&[("a.jsonl", 10), ("b.jsonl", 99)]);
+        assert_eq!(changed_file_count(&old, &moved), 1);
+        let added = file_map(&[("a.jsonl", 10), ("b.jsonl", 20), ("c.jsonl", 5)]);
+        assert_eq!(changed_file_count(&old, &added), 1);
+        // A removed session has nothing left to catch up on.
+        let removed = file_map(&[("a.jsonl", 10)]);
+        assert_eq!(changed_file_count(&old, &removed), 0);
+    }
+
+    #[test]
+    fn a_multi_day_session_is_indexed_once_at_its_newest_day() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let newer = chrono::Local::now().date_naive();
+        let older = newer - chrono::Duration::days(1);
+        let at = |p: &str| {
+            let mut s = make_session("proj", None, None);
+            s.file_path = PathBuf::from(p);
+            s
+        };
+        let groups = vec![
+            make_daily_group(newer, vec![at("/s/multi")]),
+            make_daily_group(older, vec![at("/s/old"), at("/s/multi")]),
+        ];
+        let tasks = collect_tasks(&groups);
+        let multi: Vec<_> = tasks
+            .iter()
+            .filter(|(_, _, p)| p == Path::new("/s/multi"))
+            .collect();
+        assert_eq!(multi.len(), 1, "indexed once per active day");
+        assert_eq!((multi[0].0, multi[0].1), (0, 0), "not at its newest day");
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn a_build_leaves_an_index_alone_while_another_writer_holds_it() {
+        let index_dir = std::env::temp_dir().join(format!("ccsight-locked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&index_dir);
+        SearchIndex::build_in(&index_dir, &[], &|_| {}, FIRST_COMMIT_SESSIONS).unwrap();
+
+        let (schema, _) = SearchIndex::create_schema();
+        let dir = tantivy::directory::MmapDirectory::open(&index_dir).unwrap();
+        let held = Index::open_or_create(dir, schema).unwrap();
+        let writer: IndexWriter = held.writer(15_000_000).unwrap();
+
+        assert!(
+            SearchIndex::build_in(&index_dir, &[], &|_| {}, FIRST_COMMIT_SESSIONS).is_err(),
+            "a build must not start under another writer"
+        );
+        assert!(
+            index_dir.join("meta.json").exists(),
+            "the held index was deleted"
+        );
+
+        drop(writer);
+        assert!(SearchIndex::build_in(&index_dir, &[], &|_| {}, FIRST_COMMIT_SESSIONS).is_ok());
+        let _ = fs::remove_dir_all(&index_dir);
+    }
+
+    #[test]
+    fn an_identical_map_is_not_behind() {
+        let m = file_map(&[("a.jsonl", 10), ("b.jsonl", 20)]);
+        assert_eq!(changed_file_count(&m, &m), 0);
+    }
+
     #[test]
     fn test_index_path() {
         let path = SearchIndex::index_path().unwrap();
@@ -523,12 +673,116 @@ mod tests {
         assert!(schema.get_field("session_path").is_ok());
     }
 
+    // `build_in`, not `build`: the latter resolves the real user index, and
+    // building empty groups there replaces it with an index holding nothing.
     #[test]
     fn test_build_with_empty_groups() {
         let groups: Vec<DailyGroup> = vec![];
-        let index = SearchIndex::build(&groups, &|_| {}).unwrap();
+        let index_dir = std::env::temp_dir().join(format!("ccsight-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&index_dir);
+        let index =
+            SearchIndex::build_in(&index_dir, &groups, &|_| {}, FIRST_COMMIT_SESSIONS).unwrap();
         let results = index.search("test", 10, 50);
         assert!(results.is_empty());
+        let _ = fs::remove_dir_all(&index_dir);
+    }
+
+    // Session sizes span orders of magnitude, so the guard has to be a byte
+    // budget: a session-count batch still holds most of the corpus whenever the
+    // large transcripts happen to fall in one batch.
+    #[test]
+    fn byte_budget_chunks_bound_each_batch_and_keep_every_task() {
+        let dir = std::env::temp_dir().join(format!("ccsight-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, bytes: usize| -> PathBuf {
+            let p = dir.join(name);
+            std::fs::write(&p, vec![b'x'; bytes]).unwrap();
+            p
+        };
+        // The first entry is over budget on its own: without the "at least one
+        // task per batch" guard that produces an empty leading batch.
+        let sizes = [500usize, 100, 100, 100, 500, 100];
+        let tasks: Vec<(usize, usize, PathBuf)> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (0usize, i, make(&format!("f{i}"), *b)))
+            .collect();
+
+        let chunks = byte_budget_chunks(&tasks, 250);
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(total, tasks.len(), "a task went missing");
+        assert!(
+            chunks.iter().all(|c| !c.is_empty()),
+            "an empty batch would flush nothing"
+        );
+        for c in &chunks {
+            let bytes: u64 = c
+                .iter()
+                .map(|(_, _, p)| std::fs::metadata(p).map_or(0, |m| m.len()))
+                .sum();
+            assert!(
+                bytes <= 250 || c.len() == 1,
+                "only a single over-budget file may exceed the budget"
+            );
+        }
+        assert!(chunks.len() > 1, "the budget has to split this input");
+
+        assert!(
+            byte_budget_chunks(&[], 250).is_empty(),
+            "no tasks means no batches"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The indexer parses in bounded batches so a cold build does not hold the
+    // whole corpus of message text at once. Every session still has to reach
+    // the index — a dropped batch would be invisible except as a search miss.
+    #[test]
+    fn every_session_is_indexed_across_parse_chunk_boundaries() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+
+        let dir = std::env::temp_dir().join(format!("ccsight-chunkidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Enough sessions that the byte budget splits them several times over.
+        let count = 37usize;
+        let mut sessions = Vec::with_capacity(count);
+        for i in 0..count {
+            let p = dir.join(format!("s{i}.jsonl"));
+            std::fs::write(
+                &p,
+                format!(
+                    r#"{{"type":"user","uuid":"u{i}","timestamp":"2026-01-10T10:00:00Z","sessionId":"s{i}","message":{{"role":"user","content":"needle{i} shared"}}}}"#
+                ),
+            )
+            .unwrap();
+            let mut sess = make_session("p", None, None);
+            sess.file_path = p;
+            sessions.push(sess);
+        }
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(); // lint-ok: date-literal
+        let groups = vec![make_daily_group(date, sessions)];
+
+        let index_dir = dir.join("index");
+        let index =
+            SearchIndex::build_in(&index_dir, &groups, &|_| {}, FIRST_COMMIT_SESSIONS).unwrap();
+
+        assert_eq!(
+            index.search("shared", count + 10, 50).len(),
+            count,
+            "a parse batch went missing between chunks"
+        );
+        for i in [0, count / 2, count - 1] {
+            assert_eq!(
+                index.search(&format!("needle{i}"), 10, 50).len(),
+                1,
+                "session {i} is not searchable"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

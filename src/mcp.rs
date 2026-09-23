@@ -70,9 +70,13 @@ struct StatsParams {
     )]
     date_to: Option<String>,
     #[schemars(
-        description = "Group results by: \"day\" (returns daily breakdown). Omit for totals only. Projects are always included."
+        description = "Group results by: \"day\" (returns daily breakdown). Omit for totals only. The per-project list is returned only with compact=false."
     )]
     group_by: Option<String>,
+    #[schemars(
+        description = "Defaults to true: the per-entity lists (mcp_servers, projects, languages) are dropped and the totals, model breakdown, hourly pattern and top tools kept — those three lists are the bulk of the response. Set false to include them."
+    )]
+    compact: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -142,7 +146,7 @@ struct SessionsParams {
     #[schemars(description = "Maximum number of results (default: 20)")]
     limit: Option<usize>,
     #[schemars(
-        description = "Max conversation entries in session_detail. Default: all. Set 0 to omit conversation entirely."
+        description = "Max conversation entries in session_detail. Defaults to a bounded head+tail window with an omission marker naming the offset to resume from; raise it to widen, or set 0 to omit the conversation entirely."
     )]
     conversation_limit: Option<usize>,
     #[schemars(
@@ -153,6 +157,10 @@ struct SessionsParams {
         description = "Search within conversation. Returns only matching messages with 1 message of context before/after. Each message includes its offset. More useful than conversation_offset for finding specific content."
     )]
     conversation_query: Option<String>,
+    #[schemars(
+        description = "Return each conversation message's whole text instead of a short preview (with conversation_query: instead of a window around the match). Pair with conversation_offset + conversation_limit=1 to read one long message in full."
+    )]
+    full_text: Option<bool>,
     #[schemars(description = "Filter to pinned sessions only")]
     pinned: Option<bool>,
 }
@@ -603,6 +611,16 @@ impl CcsightServer {
             "languages": languages,
         });
 
+        // The three per-entity lists dominate the payload, and a caller asking
+        // for totals pays for them in context it cannot use.
+        if params.compact.unwrap_or(true)
+            && let Some(map) = result.as_object_mut()
+        {
+            for key in ["mcp_servers", "projects", "languages"] {
+                map.remove(key);
+            }
+        }
+
         if group_by == Some("day") {
             let mut daily: Vec<serde_json::Value> = daily_agg
                 .into_iter()
@@ -625,7 +643,7 @@ impl CcsightServer {
     }
 
     #[tool(
-        description = "Full-text search across all session conversations using tantivy index. Returns matching sessions with snippets. Also searches metadata (project, summary, branch, date). All dates/times are in local timezone."
+        description = "Full-text search over session conversations plus metadata (project, summary, branch, date). One row per session with a snippet and session_id; to read the matching messages, pass that id to `sessions` with the same term as conversation_query. `content_index` says whether message text was searched. Figures are per day as in `sessions`, with `session_total` for a multi-day session. All dates/times local."
     )]
     fn search(
         &self,
@@ -635,7 +653,18 @@ impl CcsightServer {
         let limit = params.limit.unwrap_or(20);
         let query = &params.query;
 
-        let fetch_limit = limit * 5;
+        // Floored, not just scaled: the index returns one hit per matching
+        // message, and a session that mentions the term throughout collapses
+        // dozens of hits into one result — so a small `limit` would starve on
+        // its own over-fetch while other sessions never get looked at.
+        let fetch_limit =
+            if params.date_from.is_some() || params.date_to.is_some() || params.project.is_some() {
+                // Those filters run after the index answers, so a narrow one
+                // would otherwise starve on the unfiltered fetch.
+                FILTERED_INDEX_FETCH
+            } else {
+                (limit * 5).max(MIN_INDEX_FETCH)
+            };
         // MCP server has no UI live-session state; the `filter:live` /
         // `filter:busy` / `filter:paused` predicates resolve to "nothing
         // matches" via empty path sets. Period and property filters still
@@ -649,20 +678,53 @@ impl CcsightServer {
         };
         let mut meta_results = crate::search::perform_search(&data.daily_groups, query, &ctx);
 
-        // The tantivy index only knows message content — `filter:` / `project:`
-        // etc. tokens would be matched literally and return nothing, so search
-        // the free text only (perform_search above already applied the filters
-        // to the metadata pass).
+        let date_from = params
+            .date_from
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok());
+        let date_to = params
+            .date_to
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok());
+        let in_range =
+            |d: NaiveDate| date_from.is_none_or(|f| d >= f) && date_to.is_none_or(|t| d <= t);
+        let day_in_range = |day_idx: usize| {
+            data.daily_groups
+                .get(day_idx)
+                .is_some_and(|g| in_range(g.date))
+        };
+
+        // `filter:` / `project:` tokens would match literally in the content
+        // index, so only the free text goes to it (perform_search above already
+        // applied the filters). The index is only read here; building or
+        // catching it up happens off the request, since either can take longer
+        // than a caller's tool timeout.
         let (_, free_text) = crate::search::parse_search_query(query);
-        if !free_text.is_empty()
-            && let Ok(index) =
-                crate::infrastructure::SearchIndex::update_or_build(&data.daily_groups)
-        {
-            // Resolve a result to its session file_path (newest-first walk
-            // order matches the TUI). Used to dedupe a multi-day session,
-            // which lives in one DailyGroup per active day with the same
-            // path but a distinct day_idx — otherwise it returns once per day
-            // and starves other matches up to `limit`.
+        // The on-disk index describes the on-disk corpus. A server handed
+        // fixed groups must neither read it (its hits belong to other
+        // sessions) nor refresh it (that rewrites it to the fixed set).
+        let use_index = !free_text.is_empty() && self.fixed_groups.is_none();
+        let index = use_index
+            .then(|| crate::infrastructure::SearchIndex::open_for_read(&data.daily_groups))
+            .flatten();
+        // A missing index is built at once; an out-of-date one waits out the
+        // cool-down, since a session being worked in is written continuously
+        // and every call would otherwise re-parse it in full.
+        let refreshing = use_index
+            && match index {
+                Some((_, 0)) => false,
+                Some(_) => catch_up_cooled_down() && spawn_index_refresh(&data),
+                None => spawn_index_refresh(&data),
+            };
+        if let Some((index, _)) = &index {
+            // Index hits carry the positions captured when they were indexed,
+            // which drift as sessions and days are added; the stored path is
+            // the stable key.
+            let position_of = positions_by_path(&data.daily_groups);
+            // Resolve a result to its session file_path. Used to dedupe a
+            // multi-day session, which lives in one DailyGroup per active day
+            // with the same path — otherwise it returns once per day and
+            // starves other matches up to `limit`.
             let path_of = |r: &crate::search::SearchResult| -> Option<std::path::PathBuf> {
                 data.daily_groups.get(r.day_idx).and_then(|g| {
                     g.sessions
@@ -672,9 +734,28 @@ impl CcsightServer {
                         .map(|s| s.file_path.clone())
                 })
             };
-            let mut seen: std::collections::HashSet<std::path::PathBuf> =
-                meta_results.iter().filter_map(path_of).collect();
-            for result in index.search(&free_text, fetch_limit, 200) {
+            // Only in-range metadata hits may claim a session: one outside
+            // the range is dropped below and would take the session's content
+            // hit with it.
+            let mut seen: std::collections::HashSet<std::path::PathBuf> = meta_results
+                .iter()
+                .filter(|r| day_in_range(r.day_idx))
+                .filter_map(path_of)
+                .collect();
+            for mut result in index.search(&free_text, fetch_limit, 200) {
+                if let Some(stored) = result.session_path.as_deref() {
+                    // The newest active day inside the date range: a session
+                    // matches a range it was active in, not only its last day.
+                    // None — gone since indexing, or never active in range.
+                    let Some((d, i)) = position_of
+                        .get(std::path::Path::new(stored))
+                        .and_then(|days| newest_in_range(days, day_in_range))
+                    else {
+                        continue;
+                    };
+                    result.day_idx = d;
+                    result.session_idx = i;
+                }
                 match path_of(&result) {
                     Some(p) => {
                         if seen.insert(p) {
@@ -686,22 +767,15 @@ impl CcsightServer {
             }
         }
 
-        let date_from = params
-            .date_from
-            .as_deref()
-            .and_then(|d| d.parse::<NaiveDate>().ok());
-        let date_to = params
-            .date_to
-            .as_deref()
-            .and_then(|d| d.parse::<NaiveDate>().ok());
-
         let calculator = CostCalculator::global();
+        let totals = crate::aggregator::cumulative_by_path(&data.daily_groups);
         let mut results_json: Vec<serde_json::Value> = Vec::new();
+        // Counted past `limit` so the caller can tell a narrow page from an
+        // exhausted one. The walk continues but the per-result JSON, which is
+        // what costs anything here, stops at the limit.
+        let mut matched_total = 0usize;
 
         for result in &meta_results {
-            if results_json.len() >= limit {
-                break;
-            }
             let Some(group) = data.daily_groups.get(result.day_idx) else {
                 continue;
             };
@@ -732,6 +806,11 @@ impl CcsightServer {
                 continue;
             };
 
+            matched_total += 1;
+            if results_json.len() >= limit {
+                continue;
+            }
+
             let cost: f64 = session.cost(calculator);
 
             let session_id: String = session
@@ -752,24 +831,56 @@ impl CcsightServer {
                 crate::search::SearchMatchType::Content => "content",
             };
 
-            results_json.push(serde_json::json!({
+            let total = totals.get(session.file_path.as_path());
+            let titled = total.map_or(session, |(_, newest)| *newest);
+            let mut row = serde_json::json!({
                 "date": group.date.to_string(),
                 "project": session.project_name,
-                "summary": session.display_title(),
+                "summary": titled.display_title(),
                 "snippet": result.snippet,
                 "match_type": match_type,
                 "tokens": session.work_tokens(),
                 "cost_usd": round_cents(cost),
                 "session_id": session_id,
                 "git_branch": session.git_branch,
-            }));
+            });
+            if let Some(t) = total.and_then(session_total_json) {
+                row["session_total"] = t;
+            }
+            results_json.push(row);
         }
 
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "query": query,
             "total_results": results_json.len(),
+            "matched_total": matched_total,
             "results": results_json,
         });
+        // Without the index only session metadata is searched, so a thin
+        // result set means "content not searched", not "nothing matched".
+        // The caller cannot tell the two apart from the results alone.
+        if !free_text.is_empty()
+            && let Some(map) = output.as_object_mut()
+        {
+            let status = match &index {
+                Some((_, 0)) => "ready".to_string(),
+                Some((_, behind)) => format!(
+                    "ready; {behind} recently-written session(s) missing their newest messages{}",
+                    if refreshing {
+                        " (catching up in the background)"
+                    } else {
+                        ""
+                    }
+                ),
+                None if refreshing || index_refresh_running() => {
+                    "building: metadata-only results for now; content search is included \
+                     once the build finishes"
+                        .to_string()
+                }
+                None => "unavailable: metadata-only results".to_string(),
+            };
+            map.insert("content_index".into(), status.into());
+        }
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string(&output).unwrap_or_default(),
@@ -777,7 +888,7 @@ impl CcsightServer {
     }
 
     #[tool(
-        description = "List currently running and recently disconnected Claude Code sessions. Sources: ~/.claude/sessions/<pid>.json (PID liveness verified), ~/.claude/projects/**/*.jsonl mtime (24h window), and ccsight's snapshot of previously-alive session IDs. Each row reports session_id, cwd, project, status tier (busy/today/older/paused), a `state` field = the human-intervention state derived from the JSONL turn tail (\"active\" | \"awaiting_input\" = finished/permission-pending and idle | \"stalled\" = owes output but idle | \"error\" | \"exited\" = died mid-task) plus a `reason` string for non-active states, age (seconds since last update), pid (0 for paused), the session's lifetime tokens/cost summed across every day it was active (NOT just today; cost = API-equivalent estimate from tokens × list price, NOT actual subscription spend), model, ai_title, and last user-message preview. Set actionable_only=true to return only sessions that need attention (state != active), and compact=true to drop the heavy fields and keep the response small — together they answer \"which sessions need me right now?\" without flooding context. idle_secs (default 600) tunes the awaiting/stalled threshold. Use the `live` tab semantics to find what's open right now or what was running before a reboot. All timestamps local timezone."
+        description = "Currently running and recently disconnected Claude Code sessions, one row each, with a `state` (active | awaiting_input | stalled | error | exited) and a `reason` for the non-active ones. tokens/cost cover the session's whole lifetime; cost is an API list-price estimate, not subscription spend. actionable_only=true keeps only the sessions that need attention; compact=true drops the heavy fields. All times local."
     )]
     fn live_sessions(
         &self,
@@ -908,7 +1019,7 @@ impl CcsightServer {
     }
 
     #[tool(
-        description = "List sessions or get session detail. With session_id: returns conversation, tool usage, files touched. Without: lists sessions filtered by query (metadata only: project/summary/branch/date), project, date range, sort. For full-text content search, use 'search' tool instead. All dates/times are in local timezone."
+        description = "List sessions or get one session's detail. Rows describe one day of a session (`date`, `cost_usd`, `tokens`); a session active on several days also carries `session_total`. With session_id: conversation, tool usage and files touched over the whole session; conversation_query matches whole message text and returns a window around each match. Without: lists sessions filtered by query (metadata only: project/summary/branch/date), project, date range, sort; use `search` for content. All dates/times local."
     )]
     fn sessions(
         &self,
@@ -924,6 +1035,7 @@ impl CcsightServer {
                 params.conversation_limit,
                 params.conversation_offset,
                 params.conversation_query.as_deref(),
+                params.full_text.unwrap_or(false),
             );
         }
 
@@ -988,6 +1100,7 @@ impl CcsightServer {
                 true
             };
 
+        let totals = crate::aggregator::cumulative_by_path(&data.daily_groups);
         for group in &data.daily_groups {
             for session in &group.sessions {
                 if session.is_subagent {
@@ -996,20 +1109,35 @@ impl CcsightServer {
                 if !should_include(group, session) {
                     continue;
                 }
-                let mut json =
-                    build_session_json(group.date, session, calculator, &data.summary_cache);
-                let auto = json["summary"]
-                    .as_str()
+                let mut json = build_session_json(
+                    group.date,
+                    session,
+                    calculator,
+                    &data.summary_cache,
+                    totals.get(session.file_path.as_path()),
+                );
+                // Judged on the first prompt, not the title: a generated
+                // session keeps its tool prompt there even once titled.
+                let auto = session
+                    .summary
+                    .as_deref()
                     .is_some_and(|s| AUTO_PREFIXES.iter().any(|p| s.starts_with(p)));
                 if auto {
                     json["auto"] = serde_json::json!(true);
                 }
                 if let Some(ref query) = params.query {
                     let q = query.to_lowercase();
+                    // Both the title shown and the first prompt: a titled
+                    // session keeps its prompt's words searchable.
+                    let first_prompt = session
+                        .summary
+                        .as_deref()
+                        .or_else(|| data.summary_cache.get(&session.file_path)?.as_deref());
                     let meta_match = session.project_name.to_lowercase().contains(&q)
                         || json["summary"]
                             .as_str()
                             .is_some_and(|s| s.to_lowercase().contains(&q))
+                        || first_prompt.is_some_and(|s| s.to_lowercase().contains(&q))
                         || session
                             .git_branch
                             .as_deref()
@@ -1062,6 +1190,7 @@ impl CcsightServer {
         conv_limit: Option<usize>,
         conv_offset: Option<usize>,
         conv_query: Option<&str>,
+        full_text: bool,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let date_filter = date_str.and_then(|d| d.parse::<NaiveDate>().ok());
 
@@ -1084,24 +1213,42 @@ impl CcsightServer {
         };
 
         let calculator = CostCalculator::global();
-        let session_json = build_session_json(date, session, calculator, &data.summary_cache);
+        let totals = crate::aggregator::cumulative_by_path(&data.daily_groups);
+        let session_json = build_session_json(
+            date,
+            session,
+            calculator,
+            &data.summary_cache,
+            totals.get(session.file_path.as_path()),
+        );
+        // Summed over every day: the conversation and `files_touched` below
+        // cover the whole transcript, so a one-day tool count beside them
+        // would describe a different span.
+        let mut tool_usage: HashMap<&str, usize> = HashMap::new();
+        for s in data
+            .daily_groups
+            .iter()
+            .flat_map(|g| g.sessions.iter())
+            .filter(|s| s.file_path == session.file_path)
+        {
+            for (tool, n) in &s.day_tool_usage {
+                *tool_usage.entry(tool.as_str()).or_default() += n;
+            }
+        }
 
         let messages = load_conversation(&session.file_path).unwrap_or_default();
-        let files_touched = extract_files_touched(&messages);
+        let (files_touched, files_touched_total) = extract_files_touched(&messages);
 
-        let conversation_full = extract_conversation(&messages);
-        let total = conversation_full.len();
+        let entries = conversation_entries(&messages);
+        let total = entries.len();
+        let preview = |i: usize| entries[i].preview_json(full_text);
 
         let conversation = if let Some(q) = conv_query {
             let q_lower = q.to_lowercase();
-            let match_indices: Vec<usize> = conversation_full
+            let match_indices: Vec<usize> = entries
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| {
-                    c["text"]
-                        .as_str()
-                        .is_some_and(|t| t.to_lowercase().contains(&q_lower))
-                })
+                .filter(|(_, e)| e.text.to_lowercase().contains(&q_lower))
                 .map(|(i, _)| i)
                 .collect();
 
@@ -1131,9 +1278,14 @@ impl CcsightServer {
                         "text": format!("({} entries omitted)", idx - prev - 1),
                     }));
                 }
-                let mut entry = conversation_full[idx].clone();
+                let is_match = match_indices.binary_search(&idx).is_ok();
+                let mut entry = if is_match {
+                    entries[idx].match_json(&q_lower, full_text)
+                } else {
+                    preview(idx)
+                };
                 entry["offset"] = serde_json::json!(idx);
-                if match_indices.contains(&idx) {
+                if is_match {
                     entry["match"] = serde_json::json!(true);
                 }
                 result_conv.push(entry);
@@ -1141,25 +1293,25 @@ impl CcsightServer {
             }
             result_conv
         } else {
-            let max_conv = conv_limit.unwrap_or(usize::MAX);
+            let max_conv = conv_limit.unwrap_or(DEFAULT_CONVERSATION_ENTRIES);
             let offset = conv_offset.unwrap_or(0);
             if max_conv == 0 {
                 vec![]
             } else if offset > 0 {
                 let start = offset.min(total);
                 let end = (start + max_conv).min(total);
-                conversation_full[start..end].to_vec()
+                (start..end).map(preview).collect()
             } else if total <= max_conv {
-                conversation_full
+                (0..total).map(preview).collect()
             } else {
                 let head = max_conv * 2 / 3;
                 let tail = max_conv - head;
-                let mut v = conversation_full[..head].to_vec();
+                let mut v: Vec<serde_json::Value> = (0..head).map(preview).collect();
                 v.push(serde_json::json!({
                     "role": "...",
                     "text": format!("({} entries omitted. Use conversation_offset to paginate, e.g. offset={} limit={})", total - head - tail, head, max_conv),
                 }));
-                v.extend_from_slice(&conversation_full[total - tail..]);
+                v.extend((total - tail..total).map(preview));
                 v
             }
         };
@@ -1168,8 +1320,9 @@ impl CcsightServer {
             "session": session_json,
             "conversation": conversation,
             "conversation_total": total,
-            "tool_usage": session.day_tool_usage,
+            "tool_usage": tool_usage,
             "files_touched": files_touched,
+            "files_touched_total": files_touched_total,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1177,6 +1330,100 @@ impl CcsightServer {
         )]))
     }
 }
+
+/// Every `(day_idx, session_idx)` a user session occupies — the positions
+/// `search` results address — newest day first, since groups run newest-first.
+fn positions_by_path(groups: &[DailyGroup]) -> HashMap<&std::path::Path, Vec<(usize, usize)>> {
+    let mut out: HashMap<&std::path::Path, Vec<(usize, usize)>> = HashMap::new();
+    for (day_idx, group) in groups.iter().enumerate() {
+        for (session_idx, s) in group.user_sessions().enumerate() {
+            out.entry(s.file_path.as_path())
+                .or_default()
+                .push((day_idx, session_idx));
+        }
+    }
+    out
+}
+
+/// First position whose day passes `in_range`; `days` runs newest first.
+fn newest_in_range(
+    days: &[(usize, usize)],
+    in_range: impl Fn(usize) -> bool,
+) -> Option<(usize, usize)> {
+    days.iter().copied().find(|(d, _)| in_range(*d))
+}
+
+/// Index hits fetched when a date or project filter narrows the results.
+const FILTERED_INDEX_FETCH: usize = 2000;
+
+/// Set while a background index build or catch-up runs, so repeated `search`
+/// calls start at most one.
+static INDEX_REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Unix seconds at which the last background refresh finished; 0 = never.
+static LAST_REFRESH_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Seconds a finished refresh holds off the next catch-up. Each one re-parses
+/// every session written since the last, whole — seconds of CPU and hundreds
+/// of MB for one long transcript.
+const CATCH_UP_COOL_DOWN_SECS: u64 = 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn catch_up_cooled_down() -> bool {
+    cooled_down(
+        LAST_REFRESH_DONE.load(std::sync::atomic::Ordering::Acquire),
+        unix_now(),
+    )
+}
+
+fn cooled_down(last_done: u64, now: u64) -> bool {
+    now.saturating_sub(last_done) >= CATCH_UP_COOL_DOWN_SECS
+}
+
+fn index_refresh_running() -> bool {
+    INDEX_REFRESH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Build or catch up the content index off the request. Returns whether this
+/// call started the work. A writer lock held by another ccsight process makes
+/// the attempt fail harmlessly; the next `search` retries.
+fn spawn_index_refresh(data: &std::sync::Arc<LoadedData>) -> bool {
+    use std::sync::atomic::Ordering;
+    struct Reset;
+    impl Drop for Reset {
+        // Runs on unwind too, so a panicking build cannot wedge the flag on
+        // and block every later refresh.
+        fn drop(&mut self) {
+            LAST_REFRESH_DONE.store(unix_now(), Ordering::Release);
+            INDEX_REFRESH.store(false, Ordering::Release);
+        }
+    }
+    if INDEX_REFRESH.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let data = std::sync::Arc::clone(data);
+    std::thread::spawn(move || {
+        let _reset = Reset;
+        let _ = crate::infrastructure::SearchIndex::update_or_build(&data.daily_groups);
+    });
+    true
+}
+
+/// Index hits fetched before dedup, when `limit * 5` would be smaller. One hit
+/// is one matching message, so a session that mentions the term throughout
+/// collapses many hits into one result.
+const MIN_INDEX_FETCH: usize = 200;
+
+/// Conversation entries `sessions` returns for one session when the caller
+/// names no limit. An unbounded default hands a whole transcript to a caller
+/// that asked only "what happened here"; the omission marker in the middle
+/// names `conversation_offset` for the rest.
+const DEFAULT_CONVERSATION_ENTRIES: usize = 60;
 
 /// Round a dollar figure to whole cents for JSON `cost_usd` output. Clamps at
 /// 0 so a zero-token session can't emit `-0.0` (the TUI clamps via format_cost).
@@ -1209,7 +1456,27 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
-fn extract_conversation(messages: &[ConversationMessage]) -> Vec<serde_json::Value> {
+/// One conversation message with its whole text. Matching runs on this, and
+/// only the JSON built from it is shortened: searching the shortened copy
+/// misses every term past its cut, even where `search` located one.
+struct ConvEntry {
+    role: String,
+    time: Option<String>,
+    text: String,
+}
+
+/// Chars a preview keeps per message; user prompts carry the intent, so they
+/// get the larger share.
+fn preview_len(role: &str) -> usize {
+    if role == "user" { 300 } else { 200 }
+}
+
+/// Chars of a matched message returned around its first occurrence. A
+/// message can run to tens of thousands of chars, so the whole of it is
+/// returned only on request (`full_text`).
+const MATCH_WINDOW_CHARS: usize = 2000;
+
+fn conversation_entries(messages: &[ConversationMessage]) -> Vec<ConvEntry> {
     messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
@@ -1226,18 +1493,84 @@ fn extract_conversation(messages: &[ConversationMessage]) -> Vec<serde_json::Val
             if text.is_empty() {
                 return None;
             }
-            let max_len = if msg.role == "user" { 300 } else { 200 };
-            Some(serde_json::json!({
-                "role": msg.role,
-                "time": msg.timestamp,
-                "text": truncate(&text, max_len),
-            }))
+            // Dated: one transcript can span months, so a bare clock time
+            // cannot say which day a message belongs to.
+            let time = msg
+                .timestamp_utc
+                .map(|t| {
+                    t.with_timezone(&Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .or_else(|| msg.timestamp.clone());
+            Some(ConvEntry {
+                role: msg.role.clone(),
+                time,
+                text,
+            })
         })
         .collect()
 }
 
-fn extract_files_touched(messages: &[ConversationMessage]) -> Vec<String> {
-    let mut files = std::collections::HashSet::new();
+impl ConvEntry {
+    fn preview_json(&self, full_text: bool) -> serde_json::Value {
+        let text = if full_text {
+            self.text.clone()
+        } else {
+            truncate(&self.text, preview_len(&self.role))
+        };
+        serde_json::json!({ "role": self.role, "time": self.time, "text": text })
+    }
+
+    /// The matched message, cut to a window that is guaranteed to contain
+    /// the first occurrence of `q_lower` rather than the message's head.
+    fn match_json(&self, q_lower: &str, full_text: bool) -> serde_json::Value {
+        let chars: Vec<char> = self.text.chars().collect();
+        if full_text || chars.len() <= MATCH_WINDOW_CHARS {
+            return self.preview_json(true);
+        }
+        let lower = self.text.to_lowercase();
+        let hit = lower
+            .find(q_lower)
+            .map_or(0, |b| lower[..b].chars().count())
+            .min(chars.len());
+        let start = hit
+            .saturating_sub(MATCH_WINDOW_CHARS / 2)
+            .min(chars.len() - MATCH_WINDOW_CHARS);
+        let end = start + MATCH_WINDOW_CHARS;
+        let mut text: String = chars[start..end].iter().collect();
+        if start > 0 {
+            text.insert_str(0, "...");
+        }
+        if end < chars.len() {
+            text.push_str("...");
+        }
+        serde_json::json!({
+            "role": self.role,
+            "time": self.time,
+            "text": text,
+            "text_truncated": true,
+        })
+    }
+}
+
+/// Files `files_touched` lists, most-touched first. A long session touches
+/// hundreds, and the order is what lets a capped list still name the ones the
+/// session was about.
+const MAX_FILES_TOUCHED: usize = 40;
+
+/// Scratch locations: a session's working files, not what it changed.
+const SCRATCH_PREFIXES: &[&str] = &[
+    "/tmp/",
+    "/private/tmp/",
+    "/private/var/folders/",
+    "/var/folders/",
+];
+
+/// `(listed, total)`: the capped, most-touched-first list and how many
+/// distinct non-scratch files there were in all.
+fn extract_files_touched(messages: &[ConversationMessage]) -> (Vec<String>, usize) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
     for msg in messages {
         for block in &msg.blocks {
             if let ConversationBlock::ToolUse {
@@ -1246,14 +1579,23 @@ fn extract_files_touched(messages: &[ConversationMessage]) -> Vec<String> {
             } = block
                 && matches!(name.as_str(), "Read" | "Edit" | "Write" | "MultiEdit")
                 && !input_summary.is_empty()
+                && !SCRATCH_PREFIXES
+                    .iter()
+                    .any(|p| input_summary.starts_with(p))
             {
-                files.insert(input_summary.clone());
+                *counts.entry(input_summary.as_str()).or_default() += 1;
             }
         }
     }
-    let mut sorted: Vec<String> = files.into_iter().collect();
-    sorted.sort();
-    sorted
+    let total = counts.len();
+    let mut ranked: Vec<(&str, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let listed = ranked
+        .into_iter()
+        .take(MAX_FILES_TOUCHED)
+        .map(|(f, _)| f.to_string())
+        .collect();
+    (listed, total)
 }
 
 const AUTO_PREFIXES: &[&str] = &["You are a rule generator", "Generate a git commit message"];
@@ -1282,11 +1624,52 @@ fn derive_summary(file_path: &std::path::Path) -> Option<String> {
     None
 }
 
+/// Whole-session figures for a row that describes one day of the session.
+/// `None` when it was active on a single day — the row's own figures are then
+/// the session's, and repeating them would only cost the caller context.
+fn session_total_json(
+    total: &(
+        crate::aggregator::SessionCumulative,
+        &crate::aggregator::SessionInfo,
+    ),
+) -> Option<serde_json::Value> {
+    let (cum, newest) = total;
+    if cum.days <= 1 {
+        return None;
+    }
+    let mut v = serde_json::json!({
+        "cost_usd": round_cents(cum.cost),
+        "tokens": {
+            "input": cum.input_tokens,
+            "output": cum.output_tokens,
+            "cache_creation": cum.cache_creation,
+            "cache_read": cum.cache_read,
+        },
+        "active_days": cum.days,
+        "first_date": cum
+            .earliest_start
+            .map(|t| t.with_timezone(&Local).date_naive().to_string()),
+        "last_date": newest
+            .day_last_timestamp
+            .with_timezone(&Local)
+            .date_naive()
+            .to_string(),
+    });
+    if cum.unpriced {
+        v["cost_is_lower_bound"] = serde_json::json!(true);
+    }
+    Some(v)
+}
+
 fn build_session_json(
     date: NaiveDate,
     session: &crate::aggregator::SessionInfo,
     calculator: &CostCalculator,
     summary_cache: &HashMap<PathBuf, Option<String>>,
+    total: Option<&(
+        crate::aggregator::SessionCumulative,
+        &crate::aggregator::SessionInfo,
+    )>,
 ) -> serde_json::Value {
     let mut cost = 0.0;
     let mut cache_creation = 0u64;
@@ -1323,12 +1706,15 @@ fn build_session_json(
         .map(crate::aggregator::normalize_model_name)
         .unwrap_or_default();
 
-    let summary = session
-        .summary
-        .clone()
+    // The newest day's slice carries the current title: a rename or a late AI
+    // title lands there, and the TUI and `search` read it from the same place.
+    let titled = total.map_or(session, |(_, newest)| *newest);
+    let summary = titled
+        .display_title()
+        .map(str::to_string)
         .or_else(|| summary_cache.get(&session.file_path).and_then(Clone::clone));
 
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "session_id": session_id,
         "date": date.to_string(),
         "time": time_range,
@@ -1344,7 +1730,11 @@ fn build_session_json(
         "summary": summary,
         "git_branch": session.git_branch,
         "duration_mins": duration_mins,
-    })
+    });
+    if let Some(t) = total.and_then(session_total_json) {
+        row["session_total"] = t;
+    }
+    row
 }
 
 #[tool_handler]
@@ -1395,6 +1785,13 @@ mod tests {
         }
     }
 
+    fn extract_conversation(messages: &[ConversationMessage]) -> Vec<serde_json::Value> {
+        conversation_entries(messages)
+            .iter()
+            .map(|e| e.preview_json(false))
+            .collect()
+    }
+
     fn extract_json(result: &CallToolResult) -> serde_json::Value {
         let text = &result.content[0]
             .as_text()
@@ -1409,8 +1806,55 @@ mod tests {
             date_from: None,
             date_to: None,
             group_by: None,
+            compact: Some(false),
         };
         extract_json(&server.stats(Parameters(params)).unwrap())
+    }
+
+    // `mcp_servers` + `projects` + `languages` are the bulk of the payload, and
+    // a caller after totals pays for them in context it cannot use.
+    #[test]
+    fn stats_compact_drops_the_per_entity_lists_and_keeps_the_totals() {
+        let server = CcsightServer::from_groups(make_test_groups());
+        let call = |compact: Option<bool>| {
+            extract_json(
+                &server
+                    .stats(Parameters(StatsParams {
+                        period: None,
+                        date_from: None,
+                        date_to: None,
+                        group_by: None,
+                        compact,
+                    }))
+                    .unwrap(),
+            )
+        };
+        let full = call(Some(false));
+        let compact = call(None);
+        assert_eq!(compact, call(Some(true)), "an unset compact is compact");
+
+        for key in ["mcp_servers", "projects", "languages"] {
+            assert!(full.get(key).is_some(), "{key} missing from the full form");
+            assert!(compact.get(key).is_none(), "{key} survived compact");
+        }
+        for key in [
+            "total_cost_usd",
+            "total_sessions",
+            "tokens",
+            "model_breakdown",
+            "hourly_pattern",
+            "top_tools",
+        ] {
+            assert!(compact.get(key).is_some(), "compact dropped {key}");
+        }
+        assert_eq!(
+            compact["total_cost_usd"], full["total_cost_usd"],
+            "compact must not change the numbers"
+        );
+        assert!(
+            compact.to_string().len() < full.to_string().len(),
+            "compact has to be smaller"
+        );
     }
 
     fn call_stats_range(
@@ -1423,6 +1867,7 @@ mod tests {
             date_from: Some(start.to_string()),
             date_to: end.map(String::from),
             group_by: None,
+            compact: Some(false),
         };
         extract_json(&server.stats(Parameters(params)).unwrap())
     }
@@ -1446,6 +1891,7 @@ mod tests {
             conversation_limit: None,
             conversation_offset: None,
             conversation_query: None,
+            full_text: None,
             pinned: None,
         };
         extract_json(&server.sessions(Parameters(params)).unwrap())
@@ -1468,6 +1914,7 @@ mod tests {
             conversation_limit: None,
             conversation_offset: None,
             conversation_query: None,
+            full_text: None,
             pinned: None,
         };
         extract_json(&server.sessions(Parameters(params)).unwrap())
@@ -1735,7 +2182,7 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
         let calculator = CostCalculator::global();
 
-        let json = build_session_json(date, &session, calculator, &HashMap::new());
+        let json = build_session_json(date, &session, calculator, &HashMap::new(), None);
 
         assert_eq!(json["date"], "2026-03-19"); // lint-ok: date-literal
         assert_eq!(json["project"], "~/projects/myapp");
@@ -1756,7 +2203,13 @@ mod tests {
         );
         session.model = Some("claude-sonnet-4-20250514".to_string());
         let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
-        let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
+        let json = build_session_json(
+            date,
+            &session,
+            CostCalculator::global(),
+            &HashMap::new(),
+            None,
+        );
 
         assert_eq!(json["summary"], "Added MCP support");
         assert_eq!(json["git_branch"], "feature/mcp");
@@ -1767,7 +2220,13 @@ mod tests {
         let session =
             make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
         let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
-        let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
+        let json = build_session_json(
+            date,
+            &session,
+            CostCalculator::global(),
+            &HashMap::new(),
+            None,
+        );
 
         assert!(json["summary"].is_null());
         assert!(json["git_branch"].is_null());
@@ -1779,7 +2238,13 @@ mod tests {
             make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
         session.file_path = std::path::PathBuf::from("/tmp/abcdefghijklmnop.jsonl");
         let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
-        let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
+        let json = build_session_json(
+            date,
+            &session,
+            CostCalculator::global(),
+            &HashMap::new(),
+            None,
+        );
 
         assert_eq!(json["session_id"].as_str().unwrap().len(), 8);
         assert_eq!(json["session_id"], "abcdefgh");
@@ -2453,8 +2918,42 @@ mod tests {
             timestamp_utc: None,
             usage: None,
         }];
-        let files = extract_files_touched(&messages);
-        assert_eq!(files, vec!["/src/lib.rs", "/src/main.rs"]);
+        let (files, total) = extract_files_touched(&messages);
+        // Touch count orders the list, so a capped list keeps the files the
+        // session worked on most.
+        assert_eq!(files, vec!["/src/main.rs", "/src/lib.rs"]);
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn files_touched_drops_scratch_paths_and_caps_but_counts_every_file() {
+        let mut blocks: Vec<ConversationBlock> = (0..MAX_FILES_TOUCHED + 5)
+            .map(|i| ConversationBlock::ToolUse {
+                name: "Edit".to_string(),
+                input_summary: format!("/src/f{i:03}.rs"),
+            })
+            .collect();
+        blocks.push(ConversationBlock::ToolUse {
+            name: "Write".to_string(),
+            input_summary: "/tmp/scratch.txt".to_string(),
+        });
+        let messages = vec![ConversationMessage {
+            role: "assistant".to_string(),
+            blocks,
+            timestamp: None,
+            model: None,
+            tokens: None,
+            timestamp_utc: None,
+            usage: None,
+        }];
+        let (files, total) = extract_files_touched(&messages);
+        assert_eq!(files.len(), MAX_FILES_TOUCHED);
+        assert_eq!(
+            total,
+            MAX_FILES_TOUCHED + 5,
+            "the cap must not hide the count"
+        );
+        assert!(files.iter().all(|f| !f.starts_with("/tmp/")));
     }
 
     #[test]
@@ -2468,8 +2967,9 @@ mod tests {
             timestamp_utc: None,
             usage: None,
         }];
-        let files = extract_files_touched(&messages);
+        let (files, total) = extract_files_touched(&messages);
         assert!(files.is_empty());
+        assert_eq!(total, 0);
     }
 
     #[test]
@@ -2529,6 +3029,7 @@ mod tests {
             date_from: Some(yesterday.to_string()),
             date_to: None,
             group_by: None,
+            compact: None,
         };
         let json = extract_json(&server.stats(Parameters(params)).unwrap());
 
@@ -2686,6 +3187,7 @@ mod tests {
             conversation_limit: None,
             conversation_offset: None,
             conversation_query: None,
+            full_text: None,
             pinned: None,
         };
         let json = extract_json(&server.sessions(Parameters(params)).unwrap());
@@ -2720,6 +3222,7 @@ mod tests {
             conversation_limit: None,
             conversation_offset: None,
             conversation_query: None,
+            full_text: None,
             pinned: None,
         };
         let json = extract_json(&server.sessions(Parameters(params)).unwrap());
@@ -2757,6 +3260,7 @@ mod tests {
             conversation_limit: None,
             conversation_offset: None,
             conversation_query: None,
+            full_text: None,
             pinned: None,
         };
         let json = extract_json(&server.sessions(Parameters(params)).unwrap());
@@ -2801,6 +3305,7 @@ mod tests {
             conversation_limit: Some(15),
             conversation_offset: None,
             conversation_query: None,
+            full_text: None,
             pinned: None,
         };
         let json = extract_json(&server.sessions(Parameters(params)).unwrap());
@@ -2815,6 +3320,296 @@ mod tests {
         );
         let last = conv.last().unwrap();
         assert_eq!(last["text"].as_str().unwrap(), "request 29");
+    }
+
+    #[test]
+    fn search_reports_the_match_count_separately_from_the_returned_page() {
+        let today = Local::now().date_naive();
+        // Distinct branches keep the fixture file paths distinct; search
+        // dedupes by path, so same-path sessions would collapse into one.
+        let sessions: Vec<_> = (0..7)
+            .map(|i| {
+                make_session(
+                    "~/projects/app",
+                    Some(&format!("widget note {i}")),
+                    Some(&format!("b{i}")),
+                )
+            })
+            .collect();
+        let server = CcsightServer::from_groups(vec![make_daily_group(today, sessions)]);
+
+        let json = extract_json(
+            &server
+                .search(Parameters(SearchParams {
+                    query: "widget".to_string(),
+                    project: None,
+                    date_from: None,
+                    date_to: None,
+                    limit: Some(2),
+                }))
+                .unwrap(),
+        );
+
+        // A caller cannot tell a narrow page from an exhausted search unless
+        // the two counts are reported apart.
+        assert_eq!(json["total_results"], 2);
+        assert_eq!(json["matched_total"], 7);
+        // A server over fixed groups must not touch the on-disk index: a
+        // refresh from here would rewrite the developer's own index to
+        // these seven fixture sessions.
+        assert_eq!(json["content_index"], "unavailable: metadata-only results");
+    }
+
+    fn detail_params(id: &str, query: Option<&str>, full_text: bool) -> SessionsParams {
+        SessionsParams {
+            session_id: Some(id.to_string()),
+            query: None,
+            project: None,
+            date: None,
+            date_from: None,
+            date_to: None,
+            sort: None,
+            limit: None,
+            conversation_limit: None,
+            conversation_offset: None,
+            conversation_query: query.map(str::to_string),
+            full_text: Some(full_text),
+            pinned: None,
+        }
+    }
+
+    /// A server over one session whose single long message hides `NEEDLE`
+    /// far past any preview cut.
+    fn needle_server(tmp: &TempFile) -> (CcsightServer, usize) {
+        let long = format!("{}NEEDLE{}", "x".repeat(5000), "y".repeat(5000));
+        tmp.write_jsonl(&[serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-03-20T12:00:00Z",
+            "message": {"role": "user", "content": long}
+        })]);
+        let mut session = make_session("~/projects/app", Some("Long"), None);
+        session.file_path = tmp.path().to_path_buf();
+        let today = Local::now().date_naive();
+        let server = CcsightServer::from_groups(vec![make_daily_group(today, vec![session])]);
+        (server, long.chars().count())
+    }
+
+    #[test]
+    fn conversation_query_finds_a_term_past_the_preview_and_returns_it() {
+        let tmp = TempFile::new("ccsight_needle.jsonl");
+        let (server, full_len) = needle_server(&tmp);
+        let json = extract_json(
+            &server
+                .sessions(Parameters(detail_params(
+                    "ccsight_n",
+                    Some("needle"),
+                    false,
+                )))
+                .unwrap(),
+        );
+        let conv = json["conversation"].as_array().unwrap();
+        let hit = conv.iter().find(|c| c["match"] == true).expect("no match");
+        let text = hit["text"].as_str().unwrap();
+        // The window is what the caller reads, so it must hold the term.
+        assert!(text.contains("NEEDLE"), "window missed the term");
+        assert!(text.chars().count() < full_len);
+        assert_eq!(hit["text_truncated"], true);
+    }
+
+    #[test]
+    fn full_text_returns_the_whole_message() {
+        let tmp = TempFile::new("ccsight_fulltext.jsonl");
+        let (server, full_len) = needle_server(&tmp);
+        let json = extract_json(
+            &server
+                .sessions(Parameters(detail_params("ccsight_f", Some("needle"), true)))
+                .unwrap(),
+        );
+        let hit = &json["conversation"].as_array().unwrap()[0];
+        assert_eq!(hit["text"].as_str().unwrap().chars().count(), full_len);
+        assert!(hit.get("text_truncated").is_none());
+    }
+
+    #[test]
+    fn conversation_times_carry_the_date() {
+        let tmp = TempFile::new("ccsight_dated.jsonl");
+        let (server, _) = needle_server(&tmp);
+        let json = extract_json(
+            &server
+                .sessions(Parameters(detail_params("ccsight_d", None, false)))
+                .unwrap(),
+        );
+        let time = json["conversation"][0]["time"].as_str().unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-03-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Local)
+            .date_naive()
+            .to_string();
+        assert!(time.starts_with(&expected), "undated time {time:?}");
+    }
+
+    #[test]
+    fn index_hit_positions_list_every_day_newest_first_without_subagents() {
+        let newer = Local::now().date_naive();
+        let older = newer - chrono::Duration::days(1);
+        let with_path = |p: &str, sub: bool| {
+            let mut s = make_session("proj", None, None);
+            s.file_path = PathBuf::from(p);
+            s.is_subagent = sub;
+            s
+        };
+        let groups = vec![
+            make_daily_group(
+                newer,
+                vec![with_path("/s/sub", true), with_path("/s/multi", false)],
+            ),
+            make_daily_group(
+                older,
+                vec![with_path("/s/old", false), with_path("/s/multi", false)],
+            ),
+        ];
+        let pos = positions_by_path(&groups);
+        // Subagents are not counted, so the user session is index 0 on the
+        // newer day; newest day first, so a range filter can pick the newest
+        // day it covers.
+        assert_eq!(pos[std::path::Path::new("/s/multi")], vec![(0, 0), (1, 1)]);
+        assert_eq!(pos[std::path::Path::new("/s/old")], vec![(1, 0)]);
+        assert!(!pos.contains_key(std::path::Path::new("/s/sub")));
+    }
+
+    #[test]
+    fn an_index_hit_lands_on_the_newest_day_inside_the_range() {
+        let days = [(0, 2), (3, 1), (7, 0)];
+        assert_eq!(newest_in_range(&days, |_| true), Some((0, 2)));
+        // Day 0 is past `date_to`; the session was still active in range.
+        assert_eq!(newest_in_range(&days, |d| d >= 3), Some((3, 1)));
+        assert_eq!(newest_in_range(&days, |d| d > 7), None);
+    }
+
+    #[test]
+    fn a_catch_up_waits_out_the_cool_down_after_the_last_one() {
+        let done = 1_000_000;
+        assert!(!cooled_down(done, done + CATCH_UP_COOL_DOWN_SECS - 1));
+        assert!(cooled_down(done, done + CATCH_UP_COOL_DOWN_SECS));
+        assert!(
+            cooled_down(0, done),
+            "a server that never refreshed may start"
+        );
+    }
+
+    #[test]
+    fn sessions_query_still_matches_the_first_prompt_of_a_titled_session() {
+        let mut s = make_session("~/projects/app", Some("fix the flaky widget test"), None);
+        s.ai_title = Some("Test stabilisation".to_string());
+        let server =
+            CcsightServer::from_groups(vec![make_daily_group(Local::now().date_naive(), vec![s])]);
+        let json = call_sessions(&server, Some("widget"), None, None, None);
+        assert_eq!(json["count"], 1, "the prompt's words must stay searchable");
+        assert_eq!(json["sessions"][0]["summary"], "Test stabilisation");
+    }
+
+    #[test]
+    fn a_multi_day_session_row_carries_the_whole_session_total() {
+        let newer = Local::now().date_naive();
+        let older = newer - chrono::Duration::days(3);
+        let mk = |input| {
+            let mut s = make_session_with_tokens("proj", input, 0, "claude-opus-5");
+            s.file_path = PathBuf::from("/tmp/test/multi.jsonl");
+            s
+        };
+        let groups = vec![
+            make_daily_group(newer, vec![mk(1_000_000)]),
+            make_daily_group(older, vec![mk(3_000_000)]),
+        ];
+        let totals = crate::aggregator::cumulative_by_path(&groups);
+        let newest = &groups[0].sessions[0];
+        let row = build_session_json(
+            newer,
+            newest,
+            CostCalculator::global(),
+            &HashMap::new(),
+            totals.get(newest.file_path.as_path()),
+        );
+        // The row's own figure is the one day; the total spans both.
+        assert_eq!(row["cost_usd"], 5.0);
+        assert_eq!(row["session_total"]["cost_usd"], 20.0);
+        assert_eq!(row["session_total"]["active_days"], 2);
+        assert_eq!(row["session_total"]["tokens"]["input"], 4_000_000);
+
+        let single = vec![make_daily_group(newer, vec![mk(1_000_000)])];
+        let totals = crate::aggregator::cumulative_by_path(&single);
+        let s = &single[0].sessions[0];
+        let row = build_session_json(
+            newer,
+            s,
+            CostCalculator::global(),
+            &HashMap::new(),
+            totals.get(s.file_path.as_path()),
+        );
+        assert!(
+            row.get("session_total").is_none(),
+            "a one-day session repeats its own row"
+        );
+    }
+
+    #[test]
+    fn session_detail_bounds_the_conversation_without_an_explicit_limit() {
+        let today = Local::now().date_naive();
+        let mut session = make_session("~/projects/app", Some("Many messages"), None);
+
+        let tmp = TempFile::new("ccsight_default_window.jsonl");
+        let entries: Vec<serde_json::Value> = (0..DEFAULT_CONVERSATION_ENTRIES * 3)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": format!("2026-03-20T{:02}:{:02}:00Z", 10 + i / 60, i % 60),
+                    "message": {"role": "user", "content": format!("request {i}")}
+                })
+            })
+            .collect();
+        tmp.write_jsonl(&entries);
+        session.file_path = tmp.path().to_path_buf();
+
+        let groups = vec![make_daily_group(today, vec![session])];
+        let server = CcsightServer::from_groups(groups);
+
+        let params = SessionsParams {
+            session_id: Some("ccsight_d".to_string()),
+            query: None,
+            project: None,
+            date: None,
+            date_from: None,
+            date_to: None,
+            sort: None,
+            limit: None,
+            conversation_limit: None,
+            conversation_offset: None,
+            conversation_query: None,
+            full_text: None,
+            pinned: None,
+        };
+        let json = extract_json(&server.sessions(Parameters(params)).unwrap());
+
+        // A caller that names no limit still must not be handed the whole
+        // transcript: the default window is what keeps one call affordable.
+        assert_eq!(json["conversation_total"], DEFAULT_CONVERSATION_ENTRIES * 3);
+        let conv = json["conversation"].as_array().unwrap();
+        assert!(
+            conv.len() <= DEFAULT_CONVERSATION_ENTRIES + 1,
+            "default must bound the window, got {}",
+            conv.len()
+        );
+        assert_eq!(conv[0]["text"].as_str().unwrap(), "request 0");
+        assert!(
+            conv.iter().any(|c| c["role"] == "..."),
+            "should have omission marker"
+        );
+        let last = conv.last().unwrap();
+        let total = DEFAULT_CONVERSATION_ENTRIES * 3;
+        assert_eq!(
+            last["text"].as_str().unwrap(),
+            format!("request {}", total - 1)
+        );
     }
 
     #[test]
@@ -2890,6 +3685,7 @@ mod tests {
             date_from: None,
             date_to: None,
             group_by: Some("day".to_string()),
+            compact: None,
         };
         let json = extract_json(&server.stats(Parameters(params)).unwrap());
 
@@ -2926,6 +3722,7 @@ mod tests {
                     date_from: None,
                     date_to: None,
                     group_by: Some("day".to_string()),
+                    compact: Some(false),
                 }))
                 .unwrap(),
         );

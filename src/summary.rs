@@ -622,35 +622,122 @@ fn generate_session_summary_internal(
 // row (the field the resume picker shows and `display_title` ranks first), so
 // external tools and ccsight on next reload see the updated label.
 
-/// First 3 + last 2 user requests so a long session's title reflects both the
-/// opening ask and where it ended, not just the opening. Sessions with <=5
-/// requests pass through whole; for more, the two ranges never overlap so no
-/// dedup is needed.
-fn sample_title_requests(reqs: &[String]) -> Vec<&String> {
-    if reqs.len() <= 5 {
-        return reqs.iter().collect();
-    }
-    reqs.iter()
-        .take(3)
-        .chain(reqs.iter().skip(reqs.len() - 2))
+/// Context-compaction recaps, oldest first — each a `user` message that
+/// summarises everything before it, so the earliest and latest bracket what a
+/// long session set out to do and where it got to. Re-reads the file rather
+/// than widening `extract_session_details`'s shared tuple for three callers
+/// that have no use for them.
+fn extract_compaction_recaps(file_path: &std::path::Path) -> Vec<String> {
+    use crate::parser::JsonlParser;
+    let Ok(entries) = JsonlParser::parse_file(file_path) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|e| e.is_compact_summary)
+        .filter_map(|e| e.message.as_ref())
+        .map(|m| crate::text::clean_user_message_preview(&m.content.extract_text()))
+        .filter(|t| !t.is_empty())
         .collect()
 }
 
-/// Build the title-generation prompt context. The session's own recap (latest
-/// `type:summary`) is the strongest signal for what it became, so it leads;
-/// file names are generic and add little to a title, so they're omitted.
-fn build_title_context(project: &str, summary: Option<&str>, user_requests: &[String]) -> String {
+/// Earliest + latest recap: the pair brackets a long session. One recap alone
+/// pulls the title toward whichever end it came from.
+fn bracket_recaps(recaps: &[String]) -> Vec<&String> {
+    match recaps.len() {
+        0 => Vec::new(),
+        1 => vec![&recaps[0]],
+        _ => vec![&recaps[0], &recaps[recaps.len() - 1]],
+    }
+}
+
+/// Requests as the title prompt should see them: the same noise the
+/// conversation preview strips, consecutive repeats collapsed, and anything
+/// left too short to name a topic dropped. Falls back to the raw list rather
+/// than handing the prompt nothing.
+fn title_request_candidates(reqs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in reqs {
+        let cleaned = crate::text::clean_user_message_preview(raw);
+        if cleaned.chars().count() <= 10 || out.last().is_some_and(|p| *p == cleaned) {
+            continue;
+        }
+        out.push(cleaned);
+    }
+    if out.is_empty() { reqs.to_vec() } else { out }
+}
+
+/// Rows handed to the title prompt.
+const TITLE_SAMPLES: usize = 14;
+
+/// Evenly spaced across the WHOLE list, first and last included. A head-plus-
+/// tail sample made the title describe the latest request: a long session's
+/// opening rows are the caveat / slash-command text Claude Code injects, so
+/// only the tail carried signal and the body was never seen.
+fn sample_title_requests(reqs: &[String]) -> Vec<&String> {
+    if reqs.len() <= TITLE_SAMPLES {
+        return reqs.iter().collect();
+    }
+    let last = reqs.len() - 1;
+    (0..TITLE_SAMPLES)
+        .map(|i| &reqs[i * last / (TITLE_SAMPLES - 1)])
+        .collect()
+}
+
+/// Chars of each compaction recap fed to the prompt. A recap opens with its
+/// "Primary Request and Intent" section, so the head carries the purpose; a
+/// larger budget pulls the title toward whatever that section detailed.
+const RECAP_BUDGET: usize = 1500;
+
+/// Build the title-generation prompt context. Recaps lead — they summarise the
+/// whole session, which no sample of requests can. File names are generic and
+/// add little to a title, so they are omitted.
+fn build_title_context(
+    project: &str,
+    summary: Option<&str>,
+    recaps: &[String],
+    user_requests: &[String],
+) -> String {
     let mut context = format!("Project: {project}\n");
     if let Some(summary) = summary {
         let recap: String = summary.chars().take(300).collect();
         context.push_str(&format!("\nSession recap:\n{recap}\n"));
     }
-    context.push_str("\nUser requests:\n");
-    for req in sample_title_requests(user_requests) {
+    let bracketed = bracket_recaps(recaps);
+    for (i, recap) in bracketed.iter().enumerate() {
+        let label = if bracketed.len() > 1 && i == 0 {
+            "earliest"
+        } else {
+            "latest"
+        };
+        let head: String = recap.chars().take(RECAP_BUDGET).collect();
+        context.push_str(&format!(
+            "\nSession recap ({label} compaction summary):\n{head}\n"
+        ));
+    }
+    let candidates = title_request_candidates(user_requests);
+    context.push_str("\nUser requests (sampled across the whole session, in order):\n");
+    for req in sample_title_requests(&candidates) {
         let truncated: String = req.chars().take(100).collect();
         context.push_str(&format!("- {truncated}\n"));
     }
     context
+}
+
+/// The title instruction. Asking for the project name without saying where it
+/// goes produced `<project>: topic` in most generations — a label rather than a
+/// title, so the phrasing puts the name inside the phrase.
+fn title_prompt(context: &str) -> String {
+    format!(
+        "Generate a VERY SHORT title (max 60 chars) for this Claude Code session,\n\
+        in the same language as the session. Any recap below summarises the whole\n\
+        session and is the strongest signal; the requests are sampled evenly across\n\
+        the session in order. Name what the session as a whole was about — NOT just\n\
+        the latest request. Name the project inside the phrase itself, so the whole\n\
+        title reads as one continuous noun phrase.\n\
+        Reply with ONLY the title, nothing else.\n\n\
+        ---\n{context}\n---"
+    )
 }
 
 pub(crate) fn regenerate_jsonl_title(
@@ -664,19 +751,15 @@ pub(crate) fn regenerate_jsonl_title(
         return Err("No conversation to summarize".to_string());
     }
 
+    let recaps = extract_compaction_recaps(&session.file_path);
     let context = build_title_context(
         &session.project_name,
         session.summary.as_deref(),
+        &recaps,
         &user_requests,
     );
 
-    let prompt = format!(
-        "Based on this Claude Code session, generate a VERY SHORT title (max 60 chars)\n\
-        in the same language as the session. Prefer the session recap when present;\n\
-        otherwise infer from the user requests. Format: a brief noun phrase naming\n\
-        what the session is about. Reply with ONLY the title, nothing else.\n\n\
-        ---\n{context}\n---"
-    );
+    let prompt = title_prompt(&context);
 
     use std::io::Read;
     use std::process::Stdio;
@@ -765,7 +848,7 @@ mod tests {
     #[test]
     fn title_context_leads_with_recap_and_omits_files() {
         let reqs = vec!["fix the parser".to_string(), "add a test".to_string()];
-        let ctx = build_title_context("myproj", Some("Refactored the JSONL parser"), &reqs);
+        let ctx = build_title_context("myproj", Some("Refactored the JSONL parser"), &[], &reqs);
         assert!(ctx.contains("Project: myproj"));
         assert!(ctx.contains("Session recap:\nRefactored the JSONL parser"));
         assert!(ctx.contains("- fix the parser"));
@@ -778,21 +861,127 @@ mod tests {
     #[test]
     fn title_context_without_summary_falls_back_to_requests() {
         let reqs: Vec<String> = (0..8).map(|i| format!("request number {i}")).collect();
-        let ctx = build_title_context("p", None, &reqs);
+        let ctx = build_title_context("p", None, &[], &reqs);
         assert!(!ctx.contains("Session recap"));
-        // First 3 + last 2 = 5 lines: opening ask AND final direction, never
-        // just the opening — a long session's title must reflect where it ended.
-        assert_eq!(ctx.matches("- request number").count(), 5);
-        assert!(ctx.contains("request number 0"), "keeps the opening");
-        assert!(ctx.contains("request number 7"), "keeps the last");
-        assert!(!ctx.contains("request number 4"), "drops the middle");
+        assert_eq!(
+            ctx.matches("- request number").count(),
+            8,
+            "short list passes whole"
+        );
     }
 
+    // Asking for the project name without saying where it goes produced
+    // `<project>: topic` — a label, not a title. Both halves of the fix (name
+    // it, and put it inside the phrase) have to survive prompt edits.
     #[test]
-    fn sample_title_requests_passes_short_lists_whole() {
+    fn title_prompt_places_the_project_inside_the_phrase() {
+        let prompt = title_prompt("Project: p\n");
+        assert!(
+            prompt.contains("Name the project inside the phrase"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("one continuous noun phrase"), "{prompt}");
+        assert!(
+            prompt.contains("NOT just"),
+            "whole-session instruction is gone"
+        );
+        assert!(
+            prompt.ends_with("---"),
+            "context must be delimited: {prompt}"
+        );
+    }
+
+    // The compaction recap is the only input that summarises the whole session;
+    // one alone pulls the title toward whichever end it came from.
+    #[test]
+    fn bracket_recaps_takes_the_ends() {
+        let none: Vec<String> = Vec::new();
+        assert!(bracket_recaps(&none).is_empty());
+
+        let one = vec!["only".to_string()];
+        assert_eq!(bracket_recaps(&one), vec![&one[0]]);
+
+        let many: Vec<String> = (0..5).map(|i| format!("r{i}")).collect();
+        assert_eq!(bracket_recaps(&many), vec![&many[0], &many[4]]);
+    }
+
+    // The recap is the strongest signal, so it has to reach the prompt labelled
+    // and ahead of the sampled requests.
+    #[test]
+    fn title_context_carries_both_recap_ends_before_the_requests() {
+        let recaps: Vec<String> = vec![
+            "opening intent alpha".to_string(),
+            "middle beta".to_string(),
+            "final state gamma".to_string(),
+        ];
+        let reqs = vec!["do the thing".to_string()];
+        let ctx = build_title_context("proj", None, &recaps, &reqs);
+
+        assert!(ctx.contains("earliest compaction summary"), "{ctx}");
+        assert!(ctx.contains("latest compaction summary"), "{ctx}");
+        assert!(ctx.contains("opening intent alpha"));
+        assert!(ctx.contains("final state gamma"));
+        assert!(!ctx.contains("middle beta"), "only the ends are fed");
+        assert!(
+            ctx.find("compaction summary").unwrap() < ctx.find("User requests").unwrap(),
+            "recap must precede the requests"
+        );
+    }
+
+    // A head-plus-tail sample made the title describe the latest request: the
+    // opening rows of a long session are injected caveat / slash-command text,
+    // so the body of the work never reached the prompt.
+    #[test]
+    fn sample_title_requests_spans_the_whole_session() {
         let reqs: Vec<String> = (0..4).map(|i| i.to_string()).collect();
-        let sampled: Vec<&String> = sample_title_requests(&reqs);
-        assert_eq!(sampled.len(), 4, "<=5 requests pass through unchanged");
+        assert_eq!(
+            sample_title_requests(&reqs).len(),
+            4,
+            "a list under the sample size passes through unchanged"
+        );
+
+        let long: Vec<String> = (0..1000).map(|i| format!("r{i}")).collect();
+        let picked: Vec<usize> = sample_title_requests(&long)
+            .iter()
+            .map(|r| r.trim_start_matches('r').parse::<usize>().unwrap())
+            .collect();
+        assert_eq!(picked.len(), TITLE_SAMPLES);
+        assert_eq!(picked[0], 0, "keeps the opening");
+        assert_eq!(*picked.last().unwrap(), 999, "keeps the latest");
+        assert!(
+            picked.windows(2).all(|w| w[0] < w[1]),
+            "in order: {picked:?}"
+        );
+        // The middle has to be represented, not skipped over.
+        let mid = picked.iter().filter(|&&i| (300..700).contains(&i)).count();
+        assert!(mid >= 4, "middle of the session is missing: {picked:?}");
+    }
+
+    // The title prompt sees what the conversation preview shows, not the raw
+    // injected text — the opening rows are otherwise pure noise.
+    #[test]
+    fn title_candidates_drop_noise_and_consecutive_repeats() {
+        let reqs = vec![
+            "<command-name>/clear</command-name> <command-message>clear</command-message>"
+                .to_string(),
+            "investigate the parser cap".to_string(),
+            "investigate the parser cap".to_string(),
+            "ok".to_string(),
+            "measure the memory ceiling".to_string(),
+        ];
+        let out = title_request_candidates(&reqs);
+        assert_eq!(
+            out,
+            vec![
+                "investigate the parser cap".to_string(),
+                "measure the memory ceiling".to_string()
+            ],
+            "noise, the repeat and the ack all drop"
+        );
+
+        // Never hand the prompt an empty list.
+        let all_noise = vec!["<command-name>/x</command-name>".to_string()];
+        assert_eq!(title_request_candidates(&all_noise), all_noise);
     }
 
     use std::sync::atomic::{AtomicU64, Ordering};

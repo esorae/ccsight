@@ -574,7 +574,7 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_search_index() {
-        let _ = infrastructure::SearchIndex::clear_index();
+        let _ = infrastructure::SearchIndex::clear_index(); // lint-ok: real-index
         let result = load_data(0).unwrap();
         if result.daily_groups.is_empty() {
             return;
@@ -587,7 +587,7 @@ mod tests {
         println!("Sessions: {session_count}");
 
         let start = Instant::now();
-        let index = infrastructure::SearchIndex::update_or_build(groups).unwrap();
+        let index = infrastructure::SearchIndex::update_or_build(groups).unwrap(); // lint-ok: real-index
         let build_time = start.elapsed();
         println!("Index build: {build_time:?}");
 
@@ -635,7 +635,7 @@ mod tests {
 
         println!("\n--- 2nd update_or_build (no changes) ---");
         let start = Instant::now();
-        let _index2 = infrastructure::SearchIndex::update_or_build(groups).unwrap();
+        let _index2 = infrastructure::SearchIndex::update_or_build(groups).unwrap(); // lint-ok: real-index
         println!("Open existing: {:?}", start.elapsed());
     }
 

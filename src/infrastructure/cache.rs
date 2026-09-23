@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // Bump on changes to: parser output, aggregator field semantics
 // (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
-const CACHE_VERSION: u32 = 36;
+const CACHE_VERSION: u32 = 39;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {
@@ -41,6 +41,12 @@ pub struct CachedDailyStats {
     pub language_usage: HashMap<String, usize>,
     #[serde(default)]
     pub extension_usage: HashMap<String, usize>,
+    /// Lines added / removed by this day's edits. Stored per day only — a
+    /// per-file copy would be a second definition of the same number that the
+    /// two independent writers could disagree on. `serde(default)` keeps the
+    /// derive total; the version gate is what stops a stale entry being read.
+    #[serde(default)]
+    pub line_churn: crate::domain::LineChurn,
     /// Per-day count of user / assistant message turns. `serde(default)`
     /// keeps deserialisation tolerant of older cache layouts; a version
     /// bump forces a rebuild that populates real values.

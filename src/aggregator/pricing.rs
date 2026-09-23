@@ -110,7 +110,7 @@ impl CostCalculator {
 
         // Per-model rates from platform.claude.com/docs/en/about-claude/pricing.
         // 5m cache write = base × 1.25; 1h cache write = base × 2.0; cache read
-        // = base × 0.10, except the 5.1 pair below (× 0.025).
+        // = base × 0.10, except the 5.1 pair (× 0.025) and Opus 5.5 (× 0.05).
 
         // Claude Fable 5.1 / Mythos 5.1: base $10 / $50 like the .0 pair, but
         // cache reads bill at 0.025x base instead of the usual 0.1x — the only
@@ -153,6 +153,18 @@ impl CostCalculator {
                 cache_write_5m_cost_per_mtok: 12.5,
                 cache_write_1h_cost_per_mtok: 20.0,
                 cache_read_cost_per_mtok: 1.0,
+            },
+        );
+
+        // Claude Opus 5.5
+        pricing.insert(
+            "claude-opus-5-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 4.0,
+                output_cost_per_mtok: 20.0,
+                cache_write_5m_cost_per_mtok: 5.0,
+                cache_write_1h_cost_per_mtok: 8.0,
+                cache_read_cost_per_mtok: 0.20,
             },
         );
 
@@ -240,9 +252,6 @@ impl CostCalculator {
             },
         );
 
-        // Claude Sonnet 5 is on an introductory rate; a flat rate is exact
-        // while all data falls within that window — a date-aware rate is
-        // needed only once sessions span the changeover to the standard rate.
         pricing.insert(
             "claude-sonnet-5".to_string(),
             ModelPricing {
@@ -628,6 +637,27 @@ mod tests {
     }
 
     #[test]
+    fn opus_5_5_rates_match_the_published_table_and_stay_off_opus_5() {
+        let calculator = CostCalculator::new();
+        let p = calculator.get_pricing(Some("claude-opus-5-5")).unwrap();
+        assert_eq!(p.input_cost_per_mtok, 4.0);
+        assert_eq!(p.output_cost_per_mtok, 20.0);
+        assert_eq!(p.cache_write_5m_cost_per_mtok, 5.0);
+        assert_eq!(p.cache_write_1h_cost_per_mtok, 8.0);
+        assert_eq!(p.cache_read_cost_per_mtok, 0.20);
+
+        let long_ctx = calculator.get_pricing(Some("claude-opus-5-5[1m]")).unwrap();
+        assert_eq!(long_ctx.input_cost_per_mtok, 4.0);
+        assert_eq!(normalize_model_name("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(normalize_model_name("claude-opus-5-5[1m]"), "Opus 5.5");
+
+        let o5 = calculator.get_pricing(Some("claude-opus-5")).unwrap();
+        assert_eq!(o5.input_cost_per_mtok, 5.0);
+        assert_eq!(o5.cache_read_cost_per_mtok, 0.50);
+        assert_eq!(normalize_model_name("claude-opus-5"), "Opus 5");
+    }
+
+    #[test]
     fn opus_5_rates_match_the_published_table() {
         // Comparing the two ids to each other passes for any rate, so pin the
         // absolute numbers: a mistyped digit reaches every cost surface with
@@ -709,8 +739,6 @@ mod tests {
                 .is_none(),
             "undefined claude-sonnet-6 must not fall back to sonnet-5/4"
         );
-        // claude-sonnet-5 IS defined at the introductory rate ($2 / $10), and
-        // must resolve to that — not sonnet-4's $3.
         let s5 = calculator
             .get_pricing(Some("claude-sonnet-5-20260701"))
             .expect("sonnet-5 is priced");
@@ -1030,6 +1058,7 @@ mod tests {
             "claude-mythos-5-1",
             "claude-fable-5",
             "claude-mythos-5",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-opus-4-8",
             "claude-opus-4-7",

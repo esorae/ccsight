@@ -74,7 +74,8 @@ isn't obvious from the filename.
 | `infrastructure/live_sessions.rs` | `is_today()` is the single source of truth shared between sort tier and row glyph (busy / today / older). |
 | `infrastructure/live_snapshots.rs` | Per-poll alive-set history at `~/.ccsight/live_snapshots/<YYYY-MM-DD>-<HHMM>.json`. Diff-detected + 30-min debounce: a poll that sees no change is a no-op; same-window changes overwrite the latest file; cross-window changes create a new one. Drives the Live tab's `⟳ restorable` flag and `←/→ h/l` time-travel. Singular `LiveSnapshot` struct here = one historical record; the diagnostic singleton (latest alive-set + `last_refresh_at`) lives in `live_diagnostic.rs`. |
 | `infrastructure/live_diagnostic.rs` | Singleton `~/.ccsight/live_snapshot.json`. Diagnostic only: stores the last poll's alive metadata so external readers (MCP, debug scripts) can answer "when did the TUI last refresh". The Live tab's restorable logic does NOT read this file. |
-| `infrastructure/cache.rs` | `CachedFileStats` is single-shape (no partial flag). Both `StatsAggregator::aggregate_with_shared_cache` (TUI) and `DailyGrouper::group_by_date_with_shared_cache` (`--daily`) write fully-populated entries derived from the same entry-walk — anything else gets re-parsed on the other reader's next pass. Bump `CACHE_VERSION` when adding a field. |
+| `infrastructure/cache.rs` | `CachedFileStats` is single-shape (no partial flag). Both `StatsAggregator::aggregate_with_shared_cache` (TUI) and `DailyGrouper::group_by_date_with_shared_cache` (`--daily`) write fully-populated entries derived from the same entry-walk — anything else gets re-parsed on the other reader's next pass. Bump `CACHE_VERSION` when adding a field, and store a derived total in ONE place: a second copy is a second definition the two writers can disagree on. |
+| Two cold entry walks | `StatsAggregator` and `DailyGrouper` each walk entries themselves and each write the shared cache. A per-entry field folded into only one of them is invisible in the TUI (stats parses first) yet zeroed by `--daily` / MCP, which then persist the zero. `grouping.rs::cache_round_trip_dailygrouper_to_stats_matches_fresh_parse` is where a new folded field earns its assertion. |
 | `shell.rs` | `posix_shell_quote` is the only sanctioned interpolation for `cd ... && claude -r ...`. Lint #28 enforces. |
 | `state.rs` | Adding a field is compiler-checked at every exhaustive `AppState { ... }` literal (`new_initial` + `test_helpers::make_test_app_state`). |
 
@@ -131,7 +132,10 @@ govern, so they're seen at the moment of violation:
 - TextInput / UTF-8 safety → `state.rs::TextInput`
 - Scroll / cursor coord unity → `handlers::mcp_popup::mcp_pre_server_offset`
 - Session-representative value → `aggregator::extract_session_model`
-- Footer span format → `ui/mod.rs::help_bar` (every tab's bar routes through it)
+- Footer span format → `ui/mod.rs::help_bar` (every tab's bar routes through it).
+  A tab's bar goes through `tab_help_bar`, which collapses it while a
+  blocking popup is up — key dispatch is exclusive, so the tab's own keys
+  cannot fire there.
 
 **Compiler-enforced** (no rule needed):
 - AppState init parity — every `AppState { ... }` literal lists every field.
@@ -250,6 +254,13 @@ guarded two ways, next to the seam:
   drops everything. Pick blobs from the shapes that seam's own input takes.
   Inline `&[u8]` literals rather than files on disk so a review diff shows
   the bytes; a corpus directory would render as "Binary files differ".
+
+Reading a new value out of a foreign payload on `LogEntry` (`toolUseResult`
+and friends) is a seam change: those fields carry third-party JSON of unknown
+shape and depth. `#[serde(untagged)]` and `serde_json::Value` both buffer the
+value through a depth-limited path, so a nested payload fails the WHOLE entry
+and takes its tokens with it — write a `deserialize_map` visitor that
+`IgnoredAny`s everything it does not need.
 
 Adding a seam invariant = add it to the proptest AND the `SEAM_INPUTS` table.
 Coverage-guided fuzzing (cargo-fuzz) is deliberately absent: a seam's input

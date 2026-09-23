@@ -1755,8 +1755,15 @@ impl AppState {
                         session.day_tool_usage.keys(),
                     );
                 }
+                // Every session, subagents included: the scope `tool_usage`
+                // counts calls in, as the unfiltered aggregation uses.
+                crate::aggregator::StatsAggregator::add_tool_sessions(
+                    &mut stats,
+                    session.day_tool_usage.keys(),
+                );
 
                 let work_tokens = session.work_tokens();
+                stats.line_churn.add(session.line_churn);
                 stats.total_tokens.input_tokens += session.day_input_tokens;
                 stats.total_tokens.output_tokens += session.day_output_tokens;
 
@@ -1936,6 +1943,30 @@ mod filtered_stats_tests {
         assert_eq!(
             state.stats.total_sessions_count, 1,
             "session count must exclude the subagent"
+        );
+    }
+
+    // `tool_sessions` has the scope `tool_usage` has — every session,
+    // subagents included — or a filtered view reads `N calls · 0 ses`.
+    #[test]
+    fn filtered_rebuild_counts_tool_sessions_over_every_session() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let model = "claude-sonnet-4-20250514";
+        let mut user = make_session_with_tokens("~/proj", 1, 1, model);
+        user.day_tool_usage.insert("Read".to_string(), 3);
+        let mut sub = make_session_with_tokens("~/proj", 1, 1, model);
+        sub.is_subagent = true;
+        sub.file_path = std::path::PathBuf::from("/tmp/test/sub.jsonl");
+        sub.day_tool_usage.insert("Read".to_string(), 2);
+        sub.day_tool_usage.insert("Grep".to_string(), 1);
+        let mut state = make_test_app_state(vec![make_daily_group(date, vec![user, sub])]);
+        state.period_filter = PeriodFilter::Custom(date, Some(date));
+        state.apply_filter();
+        assert_eq!(state.stats.tool_sessions.get("Read"), Some(&2));
+        assert_eq!(
+            state.stats.tool_sessions.get("Grep"),
+            Some(&1),
+            "subagent-only tool"
         );
     }
 

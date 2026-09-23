@@ -43,6 +43,10 @@ pub(crate) fn extract_command_names(text: &str) -> Vec<String> {
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
     pub total_entries: usize,
+    /// Cumulative lines added / removed across every edit in scope. Churn, so
+    /// re-editing a line counts again; not a net diff and not scoped to one
+    /// context window the way `/usage` is.
+    pub line_churn: crate::domain::LineChurn,
     pub total_tokens: TokenStats,
     pub tool_usage: HashMap<String, usize>,
     pub model_usage: HashMap<String, usize>,
@@ -165,6 +169,7 @@ pub(crate) struct DailyStats {
     pub(crate) output_tokens: u64,
     pub(crate) user_msgs: u64,
     pub(crate) assistant_msgs: u64,
+    pub(crate) line_churn: crate::domain::LineChurn,
     pub(crate) tokens_by_model: HashMap<String, TokenStats>,
     pub(crate) hourly_activity: HashMap<u8, u64>,
     pub(crate) hourly_work_activity: HashMap<u8, u64>,
@@ -225,11 +230,39 @@ pub struct CacheStats {
     pub parsed_files: usize,
 }
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Files walked / total for the running stats pass. A process global rather
+/// than a threaded parameter because the only reader is the render thread,
+/// which has no call path into the walk.
+static PROGRESS_DONE: AtomicUsize = AtomicUsize::new(0);
+static PROGRESS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// `(files walked, files to walk)`. `(_, 0)` means no pass has started.
+pub fn load_progress() -> (usize, usize) {
+    (
+        PROGRESS_DONE.load(Ordering::Relaxed),
+        PROGRESS_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
 impl StatsAggregator {
-    /// For one session-day (iterator over the keys used in that day), increment adoption
-    /// counters and per-tool `tool_sessions` in `stats`. Each key in the iterator contributes
-    /// exactly +1 to `tool_sessions[key]`. The `sessions_using_*` counters are incremented at
-    /// most once per call (regardless of how many keys of a category appear).
+    /// Per-tool session-day count, over EVERY session including subagents —
+    /// the same scope `tool_usage` counts calls in. Scoping the two columns
+    /// differently rendered a subagent-only entry as `2 calls · 0 ses`.
+    pub(crate) fn add_tool_sessions<'a, I: IntoIterator<Item = &'a String>>(
+        stats: &mut Stats,
+        keys: I,
+    ) {
+        for key in keys {
+            *stats.tool_sessions.entry(key.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// For one session-day (iterator over the keys used in that day), increment the
+    /// `sessions_using_*` adoption counters. Each counter is incremented at most once
+    /// per call regardless of how many keys of a category appear. Subagent sessions are
+    /// excluded by the caller: adoption answers "how many of MY sessions use this".
     pub(crate) fn add_session_adoption<'a, I: IntoIterator<Item = &'a String>>(
         stats: &mut Stats,
         keys: I,
@@ -255,7 +288,6 @@ impl StatsAggregator {
                     servers_seen.insert(server);
                 }
             }
-            *stats.tool_sessions.entry(key.clone()).or_insert(0) += 1;
         }
         if used_skill {
             stats.sessions_using_skills += 1;
@@ -308,7 +340,11 @@ impl StatsAggregator {
         let mut sorted_files: Vec<&PathBuf> = files.iter().collect();
         sorted_files.sort();
 
+        PROGRESS_DONE.store(0, Ordering::Relaxed);
+        PROGRESS_TOTAL.store(sorted_files.len(), Ordering::Relaxed);
+
         for file in &sorted_files {
+            PROGRESS_DONE.fetch_add(1, Ordering::Relaxed);
             if cache.is_valid(file)
                 && let Some(cached) = cache.get(file)
             {
@@ -366,6 +402,7 @@ impl StatsAggregator {
                                 extension_usage: ds.extension_usage,
                                 user_msgs: ds.user_msgs,
                                 assistant_msgs: ds.assistant_msgs,
+                                line_churn: ds.line_churn,
                             },
                         )
                     })
@@ -428,6 +465,9 @@ impl StatsAggregator {
         project_name: &Option<String>,
     ) {
         stats.total_entries += cached.entry_count;
+        for ds in cached.daily_stats.values() {
+            stats.line_churn.add(ds.line_churn);
+        }
         stats.total_tokens.input_tokens += cached.input_tokens;
         stats.total_tokens.output_tokens += cached.output_tokens;
         stats.total_tokens.cache_creation_tokens += cached.cache_creation_tokens;
@@ -439,8 +479,11 @@ impl StatsAggregator {
             *stats.tool_usage.entry(tool.clone()).or_insert(0) += count;
         }
 
-        // Per-session-day adoption counts (skip subagent sessions). Denominator is
-        // `total_session_days` (also incremented per-day here).
+        // `tool_sessions` spans every session so its scope matches `tool_usage`
+        // above; adoption and `total_session_days` count user sessions only.
+        for ds in cached.daily_stats.values() {
+            Self::add_tool_sessions(stats, ds.tool_usage.keys());
+        }
         if !cached.is_subagent {
             for ds in cached.daily_stats.values() {
                 Self::add_session_adoption(stats, ds.tool_usage.keys());
@@ -637,6 +680,15 @@ impl StatsAggregator {
                 if daily.last_timestamp.is_none() || Some(ts) > daily.last_timestamp {
                     daily.last_timestamp = Some(ts);
                 }
+                let churn = crate::aggregator::grouping::credited_churn(
+                    entry,
+                    global_seen,
+                    &mut file_stats.unique_hashes,
+                );
+                daily.line_churn.add(churn);
+                // The cold walk folds into `stats` directly, as it does for
+                // tokens; only a cache hit goes through `merge_cached_stats`.
+                stats.line_churn.add(churn);
 
                 if entry.entry_type == EntryType::Assistant
                     && let Some(ref message) = entry.message
@@ -763,8 +815,11 @@ impl StatsAggregator {
             project.work_tokens += session_work_tokens;
         }
 
-        // Per-session-day adoption counts (skip subagent sessions). Denominator is
-        // `total_session_days` (also incremented per-day here).
+        // `tool_sessions` spans every session so its scope matches `tool_usage`
+        // above; adoption and `total_session_days` count user sessions only.
+        for ds in file_stats.daily_stats.values() {
+            Self::add_tool_sessions(stats, ds.tool_usage.keys());
+        }
         if !file_stats.is_subagent {
             for ds in file_stats.daily_stats.values() {
                 Self::add_session_adoption(stats, ds.tool_usage.keys());
@@ -1290,6 +1345,7 @@ mod tests {
             "agent:t1",
             "mcp__server1__action",
         ]);
+        StatsAggregator::add_tool_sessions(&mut stats, day_keys.iter());
         StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
 
         // Even though two `skill:*` keys are present, sessions_using_skills increments only once.
@@ -1298,13 +1354,87 @@ mod tests {
         assert_eq!(stats.sessions_using_mcp, 1);
     }
 
+    // The guard that produced `2 calls · 0 ses` lives at the call site, not in
+    // the counters, so it has to be pinned there. A subagent's session-day must
+    // reach `tool_sessions` (same scope as `tool_usage`) but not adoption.
+    #[test]
+    fn a_subagent_session_day_reaches_tool_sessions_but_not_adoption() {
+        let cached_for = |is_subagent: bool| -> crate::infrastructure::CachedFileStats {
+            serde_json::from_value(serde_json::json!({
+                "modified_secs": 0,
+                "entry_count": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "is_subagent": is_subagent,
+                "tool_usage": { "skill:s1": 2 },
+                "model_usage": {},
+                "daily_stats": { "2026-01-01": { // lint-ok: date-literal
+                    "first_timestamp": null,
+                    "last_timestamp": null,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "tokens_by_model": {},
+                    "tool_usage": { "skill:s1": 2 }
+                } },
+            }))
+            .expect("cached fixture")
+        };
+
+        let mut sub = Stats::default();
+        StatsAggregator::merge_cached_stats(&mut sub, &cached_for(true), &None);
+        assert_eq!(
+            sub.tool_sessions.get("skill:s1"),
+            Some(&1),
+            "a subagent-only skill must not read as `0 ses`"
+        );
+        assert_eq!(sub.sessions_using_skills, 0, "adoption stays user-only");
+        assert_eq!(sub.total_session_days, 0);
+
+        let mut user = Stats::default();
+        StatsAggregator::merge_cached_stats(&mut user, &cached_for(false), &None);
+        assert_eq!(user.tool_sessions.get("skill:s1"), Some(&1));
+        assert_eq!(user.sessions_using_skills, 1);
+        assert_eq!(user.total_session_days, 1);
+    }
+
+    // `tool_usage` counts calls over every session; `tool_sessions` has to use
+    // the same scope or a subagent-only entry renders as `2 calls · 0 ses`.
+    // Adoption keeps the narrower scope — it answers "how many of MY sessions".
+    #[test]
+    fn tool_sessions_and_adoption_use_different_scopes_on_purpose() {
+        let mut stats = Stats::default();
+        let day = keys(&["skill:s1"]);
+
+        // A subagent session-day: calls and tool_sessions, no adoption.
+        StatsAggregator::add_tool_sessions(&mut stats, day.iter());
+        assert_eq!(
+            stats.tool_sessions.get("skill:s1"),
+            Some(&1),
+            "a subagent-only entry still has a session count"
+        );
+        assert_eq!(
+            stats.sessions_using_skills, 0,
+            "adoption must not count subagent sessions"
+        );
+
+        // A user session-day on top: both move.
+        StatsAggregator::add_tool_sessions(&mut stats, day.iter());
+        StatsAggregator::add_session_adoption(&mut stats, day.iter());
+        assert_eq!(stats.tool_sessions.get("skill:s1"), Some(&2));
+        assert_eq!(stats.sessions_using_skills, 1);
+    }
+
     #[test]
     fn test_add_session_adoption_per_tool_session_count() {
         let mut stats = Stats::default();
         let day1 = keys(&["Bash", "skill:s1"]);
         let day2 = keys(&["Bash", "skill:s1", "skill:s2"]);
-        StatsAggregator::add_session_adoption(&mut stats, day1.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day2.iter());
+        for day in [&day1, &day2] {
+            StatsAggregator::add_tool_sessions(&mut stats, day.iter());
+            StatsAggregator::add_session_adoption(&mut stats, day.iter());
+        }
 
         // tool_sessions counts +1 per call where the key appears.
         assert_eq!(stats.tool_sessions.get("Bash"), Some(&2));
@@ -1318,6 +1448,7 @@ mod tests {
     fn test_add_session_adoption_no_meta_keys_no_increment() {
         let mut stats = Stats::default();
         let day_keys = keys(&["Bash", "Read", "Edit"]);
+        StatsAggregator::add_tool_sessions(&mut stats, day_keys.iter());
         StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
 
         assert_eq!(stats.sessions_using_skills, 0);
@@ -1330,6 +1461,7 @@ mod tests {
     fn test_add_session_adoption_empty_input() {
         let mut stats = Stats::default();
         let empty: Vec<String> = Vec::new();
+        StatsAggregator::add_tool_sessions(&mut stats, empty.iter());
         StatsAggregator::add_session_adoption(&mut stats, empty.iter());
 
         assert_eq!(stats.sessions_using_skills, 0);
@@ -1342,7 +1474,9 @@ mod tests {
         let mut stats = Stats::default();
         let day1 = keys(&["agent:type-a"]);
         let day2 = keys(&["agent:type-b"]);
+        StatsAggregator::add_tool_sessions(&mut stats, day1.iter());
         StatsAggregator::add_session_adoption(&mut stats, day1.iter());
+        StatsAggregator::add_tool_sessions(&mut stats, day2.iter());
         StatsAggregator::add_session_adoption(&mut stats, day2.iter());
 
         assert_eq!(stats.sessions_using_subagents, 2);
@@ -1362,8 +1496,10 @@ mod tests {
             "mcp__server1__action2",
             "mcp__server2__other",
         ]);
+        StatsAggregator::add_tool_sessions(&mut stats, day1.iter());
         StatsAggregator::add_session_adoption(&mut stats, day1.iter());
         let day2 = keys(&["mcp__server1__action1"]);
+        StatsAggregator::add_tool_sessions(&mut stats, day2.iter());
         StatsAggregator::add_session_adoption(&mut stats, day2.iter());
 
         // server1: used in day1 and day2 → 2 sessions (despite 3 tool invocations total)
@@ -1380,6 +1516,7 @@ mod tests {
         // Both standard `mcp__server__tool` and plugin `mcp__plugin_*` are detected.
         let mut stats = Stats::default();
         let day_keys = keys(&["mcp__server1__action", "mcp__plugin_orgA_serverB__action"]);
+        StatsAggregator::add_tool_sessions(&mut stats, day_keys.iter());
         StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
 
         assert_eq!(stats.sessions_using_mcp, 1);
@@ -1393,6 +1530,7 @@ mod tests {
         // narrows the prefix check to e.g. `starts_with("mcp__server")`.
         let mut stats = Stats::default();
         let day_keys = keys(&["mcp__plugin_orgA_serverB__action"]);
+        StatsAggregator::add_tool_sessions(&mut stats, day_keys.iter());
         StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
 
         assert_eq!(stats.sessions_using_mcp, 1);
