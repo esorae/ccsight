@@ -1,24 +1,28 @@
 use std::collections::HashMap;
 use std::fs;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, OwnedValue, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
+    FAST, Field, INDEXED, IndexRecordOption, OwnedValue, STORED, STRING, Schema, TextFieldIndexing,
+    TextOptions,
 };
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
+
+use chrono::{Local, NaiveDate};
 
 use crate::aggregator::DailyGroup;
 use crate::domain::{EntryType, Role};
 use crate::parser::JsonlParser;
 use crate::search::{SearchMatchType, SearchResult, extract_snippet};
 
-const INDEX_VERSION: u32 = 6;
+const INDEX_VERSION: u32 = 7;
 const TOKENIZER_NAME: &str = "ngram23";
 
 #[derive(Serialize, Deserialize)]
@@ -33,6 +37,7 @@ struct Fields {
     session_idx: Field,
     role: Field,
     text: Field,
+    msg_ts: Field,
 }
 
 struct ParsedDoc {
@@ -41,6 +46,7 @@ struct ParsedDoc {
     session_idx: u64,
     role: String,
     text: String,
+    msg_ts: Option<i64>,
 }
 
 pub struct SearchIndex {
@@ -57,6 +63,37 @@ fn get_u64(doc: &TantivyDocument, field: Field) -> u64 {
             _ => None,
         })
         .unwrap_or(0)
+}
+
+fn get_i64(doc: &TantivyDocument, field: Field) -> Option<i64> {
+    doc.get_first(field)
+        .map(OwnedValue::from)
+        .and_then(|v| match v {
+            OwnedValue::I64(n) => Some(n),
+            _ => None,
+        })
+}
+
+/// Epoch-second bounds of inclusive local dates; UTC seconds keep the stored
+/// value independent of the zone the index was built in.
+fn local_day_bounds(from: Option<NaiveDate>, to: Option<NaiveDate>) -> (Bound<i64>, Bound<i64>) {
+    // A zone that springs forward at midnight has no 00:00 that day; the
+    // day then starts at the first hour that exists, not at "unbounded".
+    let start_of = |d: NaiveDate| {
+        (0..3).find_map(|h| {
+            d.and_hms_opt(h, 0, 0)
+                .and_then(|t| t.and_local_timezone(Local).earliest())
+                .map(|t| t.timestamp())
+        })
+    };
+    let lower = from
+        .and_then(start_of)
+        .map_or(Bound::Unbounded, Bound::Included);
+    let upper = to
+        .and_then(|d| d.succ_opt())
+        .and_then(start_of)
+        .map_or(Bound::Unbounded, Bound::Excluded);
+    (lower, upper)
 }
 
 fn get_str(doc: &TantivyDocument, field: Field) -> String {
@@ -126,6 +163,7 @@ fn parse_session(session_path: &Path, day_idx: usize, session_idx: usize) -> Vec
                 session_idx: session_idx as u64,
                 role: role.to_string(),
                 text,
+                msg_ts: e.timestamp.map(|t| t.timestamp()),
             })
         })
         .collect()
@@ -144,13 +182,17 @@ fn install_merge_policy(writer: &IndexWriter) {
 
 fn write_docs(writer: &IndexWriter, fields: &Fields, docs: &[ParsedDoc]) -> anyhow::Result<()> {
     for d in docs {
-        writer.add_document(doc!(
+        let mut document = doc!(
             fields.session_path => d.session_path.clone(),
             fields.day_idx => d.day_idx,
             fields.session_idx => d.session_idx,
             fields.role => d.role.clone(),
             fields.text => d.text.clone(),
-        ))?;
+        );
+        if let Some(ts) = d.msg_ts {
+            document.add_i64(fields.msg_ts, ts);
+        }
+        writer.add_document(document)?;
     }
     Ok(())
 }
@@ -300,6 +342,16 @@ impl SearchIndex {
 
     /// `index_dir` and `first_chunk` are injectable so tests can build in a
     /// temp dir with a tiny head instead of touching the real index.
+    /// A build under `index_dir` for tests outside this module, which must not
+    /// reach the developer's real index.
+    #[cfg(test)]
+    pub(crate) fn build_for_test(
+        index_dir: &Path,
+        daily_groups: &[DailyGroup],
+    ) -> anyhow::Result<Self> {
+        Self::build_in(index_dir, daily_groups, &|_| {}, FIRST_COMMIT_SESSIONS)
+    }
+
     fn build_in(
         index_dir: &Path,
         daily_groups: &[DailyGroup],
@@ -469,7 +521,21 @@ impl SearchIndex {
     }
 
     pub fn search(&self, query_str: &str, limit: usize, snippet_len: usize) -> Vec<SearchResult> {
-        let query = match self.query_parser.parse_query(query_str) {
+        self.search_between(query_str, limit, snippet_len, None, None)
+    }
+
+    /// Matches whose message was written between the inclusive local dates.
+    /// The bound sits inside the query, so `limit` counts in-range messages and
+    /// a session's out-of-range hits can't crowd out its in-range one.
+    pub fn search_between(
+        &self,
+        query_str: &str,
+        limit: usize,
+        snippet_len: usize,
+        from: Option<NaiveDate>,
+        to: Option<NaiveDate>,
+    ) -> Vec<SearchResult> {
+        let text_query = match self.query_parser.parse_query(query_str) {
             Ok(q) => q,
             Err(_) => {
                 let escaped = regex::escape(query_str);
@@ -478,6 +544,17 @@ impl SearchIndex {
                     Err(_) => return Vec::new(),
                 }
             }
+        };
+        let query: Box<dyn Query> = if from.is_none() && to.is_none() {
+            text_query
+        } else {
+            let (lower, upper) = local_day_bounds(from, to);
+            let term = |ts| Term::from_field_i64(self.fields.msg_ts, ts);
+            let range = RangeQuery::new(lower.map(term), upper.map(term));
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, text_query),
+                (Occur::Must, Box::new(range)),
+            ]))
         };
 
         let searcher = self.reader.searcher();
@@ -492,7 +569,10 @@ impl SearchIndex {
             return Vec::new();
         };
 
-        let mut seen: HashMap<(usize, usize), bool> = HashMap::new();
+        // Keyed by path: a document keeps the position it was indexed at, and
+        // an incremental update leaves unchanged files at stale positions, so
+        // two sessions can share one.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut results = Vec::new();
 
         for (_score, doc_address) in top_docs {
@@ -504,13 +584,15 @@ impl SearchIndex {
             let session_idx = get_u64(&doc, self.fields.session_idx) as usize;
             let session_path = get_str(&doc, self.fields.session_path);
 
-            if seen.contains_key(&(day_idx, session_idx)) {
+            if !seen.insert(session_path.clone()) {
                 continue;
             }
-            seen.insert((day_idx, session_idx), true);
 
             let role = get_str(&doc, self.fields.role);
             let text = get_str(&doc, self.fields.text);
+            let message_date = get_i64(&doc, self.fields.msg_ts)
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                .map(|t| t.with_timezone(&Local).date_naive());
             let snippet = extract_snippet(&text, query_str, snippet_len);
 
             results.push(SearchResult {
@@ -523,6 +605,7 @@ impl SearchIndex {
                 // daily_groups, the caller must remap using this path before
                 // pushing the result into `state.search_results`.
                 session_path: Some(session_path),
+                message_date,
             });
         }
 
@@ -551,6 +634,7 @@ impl SearchIndex {
             .set_indexing_options(text_indexing)
             .set_stored();
         let text = schema_builder.add_text_field("text", text_options);
+        let msg_ts = schema_builder.add_i64_field("msg_ts", INDEXED | STORED | FAST);
 
         let schema = schema_builder.build();
         let fields = Fields {
@@ -559,6 +643,7 @@ impl SearchIndex {
             session_idx,
             role,
             text,
+            msg_ts,
         };
         (schema, fields)
     }
@@ -782,6 +867,116 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_sessions_sharing_a_stale_position_both_come_back() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let dir = std::env::temp_dir().join(format!("ccsight-stalepos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = |name: &str| {
+            let p = dir.join(format!("{name}.jsonl"));
+            std::fs::write(
+                &p,
+                format!(
+                    r#"{{"type":"user","uuid":"{name}","timestamp":"2026-01-10T10:00:00Z","message":{{"role":"user","content":"needle"}}}}"#
+                ),
+            )
+            .unwrap();
+            let mut s = make_session("p", None, None);
+            s.file_path = p;
+            s
+        };
+        let day = |n: u32| NaiveDate::from_ymd_opt(2026, 1, n).unwrap(); // lint-ok: date-literal
+        let index_dir = dir.join("index");
+        let a = session("a");
+        // `a` is indexed at (0, 0); a newer day then takes position 0 and its
+        // new session `b` is indexed there too, while unchanged `a` keeps it.
+        drop(
+            SearchIndex::build_in(
+                &index_dir,
+                &[make_daily_group(day(10), vec![a.clone()])],
+                &|_| {},
+                FIRST_COMMIT_SESSIONS,
+            )
+            .unwrap(),
+        );
+        let later = vec![
+            make_daily_group(day(11), vec![session("b")]),
+            make_daily_group(day(10), vec![a]),
+        ];
+        let manifest: Manifest = serde_json::from_str(
+            &std::fs::read_to_string(index_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let index =
+            SearchIndex::update_incremental(&later, &index_dir, &manifest, &build_file_map(&later))
+                .unwrap();
+        assert_eq!(index.search("needle", 10, 50).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_date_bound_keeps_only_messages_written_inside_it() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let dir = std::env::temp_dir().join(format!("ccsight-msgdate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let day = |n: u32| NaiveDate::from_ymd_opt(2026, 1, n).unwrap(); // lint-ok: date-literal
+        let line = |uuid: &str, d: NaiveDate| {
+            let at = d
+                .and_hms_opt(12, 0, 0)
+                .and_then(|t| t.and_local_timezone(Local).earliest())
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339();
+            format!(
+                r#"{{"type":"user","uuid":"{uuid}","timestamp":"{at}","message":{{"role":"user","content":"needle"}}}}"#
+            )
+        };
+        let write = |name: &str, lines: &[String]| {
+            let p = dir.join(name);
+            std::fs::write(&p, lines.join("\n")).unwrap();
+            let mut s = make_session("p", None, None);
+            s.file_path = p;
+            s
+        };
+        // `a` matches on days 1 and 3 (twice on 3); `b` only on day 2.
+        let a = write(
+            "a.jsonl",
+            &[line("a1", day(1)), line("a3", day(3)), line("a3b", day(3))],
+        );
+        let b = write("b.jsonl", &[line("b2", day(2))]);
+        let groups = vec![
+            make_daily_group(day(3), vec![a.clone()]),
+            make_daily_group(day(2), vec![b.clone()]),
+            make_daily_group(day(1), vec![a.clone()]),
+        ];
+        let index =
+            SearchIndex::build_in(&dir.join("index"), &groups, &|_| {}, FIRST_COMMIT_SESSIONS)
+                .unwrap();
+        let hits = |from, to, limit| {
+            index
+                .search_between("needle", limit, 50, from, to)
+                .into_iter()
+                .map(|r| (r.session_path.unwrap_or_default(), r.message_date))
+                .collect::<Vec<_>>()
+        };
+        let path = |s: &crate::aggregator::SessionInfo| s.file_path.to_string_lossy().into_owned();
+
+        assert_eq!(
+            hits(Some(day(1)), Some(day(1)), 10),
+            vec![(path(&a), Some(day(1)))]
+        );
+        // One slot, and `a` holds more matches — the bound must still admit `b`.
+        assert_eq!(
+            hits(Some(day(2)), Some(day(2)), 1),
+            vec![(path(&b), Some(day(2)))]
+        );
+        assert_eq!(hits(Some(day(3)), None, 10), vec![(path(&a), Some(day(3)))]);
+        assert_eq!(hits(None, None, 10).len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

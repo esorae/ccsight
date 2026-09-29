@@ -75,9 +75,18 @@ mod tests {
         assert_eq!(format_number(100000000000), "100B");
     }
 
+    /// The developer's cache, read but never written: `load_data` saves the
+    /// cache it aggregates with, and a test build with a different
+    /// `CACHE_VERSION` would leave the installed release a cache it rejects.
+    fn real_cache_read_only() -> crate::infrastructure::Cache {
+        crate::infrastructure::Cache::load() // lint-ok: real-cache
+            .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty())
+            .read_only()
+    }
+
     #[test]
     fn test_load_data_performance() {
-        let result = load_data(20).unwrap();
+        let result = load_data_with(20, real_cache_read_only()).unwrap();
         if result.file_count == 0 {
             return; // No data available (CI environment)
         }
@@ -98,7 +107,7 @@ mod tests {
         .ok();
 
         let start1 = Instant::now();
-        let result1 = load_data(20).unwrap();
+        let result1 = load_data(20).unwrap(); // lint-ok: real-cache
         let duration1 = start1.elapsed();
         // No ~/.claude data on this runner → nothing to cache or time; no-op
         // like the other real-data #[ignore] tests so the release ignored-test
@@ -109,7 +118,7 @@ mod tests {
         let _cache1 = result1.cache_stats;
 
         let start2 = Instant::now();
-        let result2 = load_data(20);
+        let result2 = load_data(20); // lint-ok: real-cache
         let duration2 = start2.elapsed();
         let cache2 = result2.unwrap().cache_stats;
 
@@ -122,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_load_data_integration() {
-        let result = load_data(5).unwrap();
+        let result = load_data_with(5, real_cache_read_only()).unwrap();
         if result.file_count == 0 {
             return; // No data available (CI environment)
         }
@@ -171,8 +180,7 @@ mod tests {
         let before: Vec<_> = files.iter().map(|p| identity(p)).collect();
 
         let started = Instant::now();
-        let cache = crate::infrastructure::Cache::load()
-            .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
+        let cache = real_cache_read_only();
         let (stats, _, cache) =
             crate::aggregator::StatsAggregator::aggregate_with_shared_cache(&files, cache);
         let mut cache = Some(cache);
@@ -211,7 +219,7 @@ mod tests {
     #[test]
     #[ignore = "perf measurement — run via --ignored --nocapture"]
     fn measure_per_tab_draw() {
-        let data = load_data(0).unwrap();
+        let data = load_data_with(0, real_cache_read_only()).unwrap();
         if data.file_count == 0 {
             return;
         }
@@ -575,7 +583,7 @@ mod tests {
     #[ignore]
     fn bench_search_index() {
         let _ = infrastructure::SearchIndex::clear_index(); // lint-ok: real-index
-        let result = load_data(0).unwrap();
+        let result = load_data_with(0, real_cache_read_only()).unwrap();
         if result.daily_groups.is_empty() {
             return;
         }
@@ -1466,5 +1474,170 @@ mod tests {
                 );
             }
         }
+    }
+
+    // An index hit names a session, not a day. A session active today and on
+    // previous days must land on today under `filter:today`; landing on its
+    // oldest day drops it from the very period it was active in.
+    #[test]
+    fn an_index_hit_on_a_multi_day_session_survives_a_period_filter() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let older = today - chrono::Duration::days(5);
+        let at = |p: &str| {
+            let mut s = make_session("~/projects/a", None, None);
+            s.file_path = std::path::PathBuf::from(p);
+            s
+        };
+        let groups = vec![
+            make_daily_group(today, vec![at("/s/long")]),
+            make_daily_group(older, vec![at("/s/long")]),
+        ];
+        let mut state = make_test_app_state(groups);
+        state.search_mode = true;
+        state.search_input.text = "needle filter:today".to_string();
+        let (tx, rx) = mpsc::channel();
+        tx.send(vec![search::SearchResult {
+            // Positions the index captured; the stored path is what counts.
+            day_idx: 1,
+            session_idx: 0,
+            snippet: Some("needle".to_string()),
+            match_type: search::SearchMatchType::Content,
+            session_path: Some("/s/long".to_string()),
+            message_date: None,
+        }])
+        .unwrap();
+        state.search_task = Some((rx, state.search_input.text.clone()));
+        poll_search_task(&mut state);
+        assert_eq!(state.search_results.len(), 1, "the session was dropped");
+        assert_eq!(state.search_results[0].day_idx, 0, "not placed on today");
+    }
+
+    fn live(id: &str) -> crate::infrastructure::live_sessions::LiveSession {
+        crate::infrastructure::live_sessions::LiveSession {
+            session_id: id.to_string(),
+            jsonl_path: None,
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            name: None,
+            status: None,
+            pid: 1,
+            started_at: None,
+            updated_at: None,
+            jsonl_mtime: None,
+            is_live: true,
+            was_recently_live: false,
+        }
+    }
+
+    /// Deliver one Live poll whose active rows arrive in `order`.
+    fn deliver_live_poll(state: &mut AppState, order: &[&str]) {
+        let (tx, rx) = mpsc::channel();
+        tx.send((order.iter().map(|id| live(id)).collect(), Vec::new()))
+            .unwrap();
+        state.live_sessions_task = Some(rx);
+        poll_live_sessions_task(state);
+    }
+
+    fn live_ids(state: &AppState) -> Vec<String> {
+        state.live_active.iter().map(|s| s.session_id.clone()).collect()
+    }
+
+    // A status flip re-sorts the rows every few seconds. While the reader is
+    // steering they must not move; once idle they re-sort, and the cursor goes
+    // with its session rather than staying on a row number.
+    #[test]
+    fn a_live_poll_holds_row_order_while_steering_and_follows_the_session_after() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.live_active = vec![live("a"), live("b"), live("c")];
+        state.live_selected = 1; // on "b"
+
+        state.last_input_at = Some(Instant::now());
+        deliver_live_poll(&mut state, &["c", "a", "b"]);
+        assert_eq!(live_ids(&state), ["a", "b", "c"], "rows moved while steering");
+        assert_eq!(state.live_selected, 1);
+
+        state.last_input_at = None;
+        deliver_live_poll(&mut state, &["c", "a", "b"]);
+        assert_eq!(live_ids(&state), ["c", "a", "b"], "idle rows must re-sort");
+        assert_eq!(state.live_selected, 2, "the cursor stayed on a row number");
+    }
+
+    // With only one pane on screen, a session that crosses into the hidden one
+    // must not drag the cursor off the rows the reader can see.
+    #[test]
+    fn a_live_poll_keeps_the_cursor_inside_the_visible_pane() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.live_pane_mode = crate::LivePaneMode::ActiveOnly;
+        state.live_active = vec![live("a"), live("b"), live("c")];
+        state.live_selected = 2; // on "c", which goes idle below
+        let (tx, rx) = mpsc::channel();
+        tx.send((vec![live("a"), live("b")], vec![live("c")])).unwrap();
+        state.live_sessions_task = Some(rx);
+        poll_live_sessions_task(&mut state);
+        assert_eq!(state.live_selected, 1, "cursor left the active pane");
+    }
+
+    // The popup shows "content matches appear once the index is ready" while
+    // the index builds; its arrival has to re-run the query, not wait for an edit.
+    #[test]
+    fn an_index_arriving_under_an_open_search_reruns_the_query() {
+        let dir = std::env::temp_dir().join(format!("ccsight-idxarrive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let index = infrastructure::SearchIndex::build_for_test(&dir, &[]).unwrap();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.search_mode = true;
+        state.search_input.set("needle".to_string());
+        let (tx, rx) = mpsc::channel();
+        tx.send(std::sync::Arc::new(index)).unwrap();
+        state.index_build_task = Some(rx);
+        poll_index_build_task(&mut state);
+        assert!(state.search_task.is_some(), "the open query was not re-run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A reload can put a new day at the head of the list and re-sort the
+    // session the reader is on to the top of its day. The cursor must stay on
+    // that day and that session, not on the indices it had.
+    #[test]
+    fn a_data_reload_keeps_the_daily_cursor_on_its_day_and_session() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let day = chrono::Local::now().date_naive() - chrono::Duration::days(2);
+        let at = |p: &str| {
+            let mut s = make_session("~/projects/a", None, None);
+            s.file_path = std::path::PathBuf::from(p);
+            s
+        };
+        let mut state = make_test_app_state(vec![make_daily_group(day, vec![at("/a"), at("/b"), at("/c")])]);
+        state.selected_day = 0;
+        state.selected_session = 1; // on "/b"
+        // Inside the rebuild throttle: the reload would otherwise start an
+        // index build, and that writes the developer's real index.
+        state.last_index_build = Some(Instant::now());
+
+        let groups = vec![
+            make_daily_group(day + chrono::Duration::days(1), vec![at("/new")]),
+            make_daily_group(day, vec![at("/b"), at("/c"), at("/a")]),
+        ];
+        let data = LoadedData {
+            stats: Default::default(),
+            cost: 0.0,
+            model_costs: Vec::new(),
+            aggregated_model_tokens: Default::default(),
+            models_without_pricing: Default::default(),
+            daily_groups: groups,
+            daily_costs: Vec::new(),
+            file_count: 0,
+            cache_stats: crate::aggregator::CacheStats {
+                cached_files: 0,
+                parsed_files: 0,
+            },
+        };
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(data)).unwrap();
+        state.data_reload_task = Some(rx);
+        poll_data_reload_task(&mut state);
+
+        assert_eq!(state.selected_day, 1, "left its day when a new one arrived");
+        assert_eq!(state.selected_session, 0, "stayed on an index, not on /b");
     }
 }

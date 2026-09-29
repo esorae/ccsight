@@ -618,6 +618,9 @@ pub struct ConversationPane {
     /// Deferred jump: the draw fn (which knows line layout + viewport
     /// height) centers the current match and clears this flag.
     pub pending_search_scroll: bool,
+    /// Day of the message a content hit matched: the seeded search starts at
+    /// that day's first match instead of the transcript's first.
+    pub search_seed_day: Option<chrono::NaiveDate>,
     /// Reopened bar carries the previous query "selected" — the first
     /// typed char replaces it wholesale (VS Code find-widget behavior).
     pub search_select_all: bool,
@@ -657,6 +660,7 @@ impl Default for ConversationPane {
             search_saved_scroll: None,
             peek_expanded: None,
             pending_search_scroll: false,
+            search_seed_day: None,
             search_select_all: false,
             last_visible_height: None,
             rendered_sig: 0,
@@ -699,6 +703,7 @@ impl ConversationPane {
         self.expanded.clear();
         self.peek_expanded = None;
         self.pending_search_scroll = false;
+        self.search_seed_day = None;
         self.search_select_all = false;
         // `compact` intentionally NOT reset — clear() reuses the pane for a
         // new session and the user's view-mode preference should persist.
@@ -804,6 +809,8 @@ pub struct AppState {
     pub live_active: Vec<crate::infrastructure::live_sessions::LiveSession>,
     pub live_paused: Vec<crate::infrastructure::live_sessions::LiveSession>,
     pub live_selected: usize,
+    /// Last key or mouse event; `LIVE_ORDER_HOLD` is measured from it.
+    pub last_input_at: Option<std::time::Instant>,
     /// Active-frame viewport scroll. The Live tab renders Active now and
     /// Recently paused in two separate frames, each scrolling independently;
     /// `live_scroll` follows the cursor while it is in the active section,
@@ -1015,6 +1022,41 @@ pub struct AppState {
     /// ranks by the last day a file of that language/extension was touched.
     pub dashboard_languages_sort: RankSort,
 }
+
+/// Row the cursor lands on once a list is rebuilt. Rows are named by `prev` /
+/// `next` keys, because a bare position points at whichever row moved into
+/// it: the same row if it survived, else the one that sat just below it (just
+/// above when it was last), so the cursor stays where the reader was looking.
+pub(crate) fn follow_selection<K: PartialEq>(prev: &[K], prev_sel: usize, next: &[K]) -> usize {
+    let find = |k: &K| next.iter().position(|n| n == k);
+    if let Some(k) = prev.get(prev_sel) {
+        if let Some(i) = find(k) {
+            return i;
+        }
+        if let Some(i) = prev[prev_sel + 1..].iter().find_map(&find) {
+            return i;
+        }
+        if let Some(i) = prev[..prev_sel].iter().rev().find_map(&find) {
+            return i;
+        }
+    }
+    prev_sel.min(next.len().saturating_sub(1))
+}
+
+/// Put `items` back in the order `prev` showed them; items `prev` lacks follow
+/// in their own order. The sort is stable, so a refresh that lands while the
+/// reader is steering updates each row's contents but not where it sits.
+pub(crate) fn hold_order<T, K: PartialEq>(items: &mut [T], prev: &[K], key: impl Fn(&T) -> K) {
+    items.sort_by_key(|t| {
+        let k = key(t);
+        prev.iter().position(|p| *p == k).unwrap_or(usize::MAX)
+    });
+}
+
+/// How long after the last key or mouse event the Live rows keep their order.
+/// Status flips re-sort them every few seconds, which moves the row under the
+/// cursor while the reader is reaching for it.
+pub(crate) const LIVE_ORDER_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Fold every session's verified cwd into a storage-dir-slug → path map,
 /// then let `extra_paths` (`~/.claude.json` project keys) fill dirs whose
@@ -1448,6 +1490,7 @@ impl AppState {
             live_active: Vec::new(),
             live_paused: Vec::new(),
             live_selected: 0,
+            last_input_at: None,
             live_scroll: 0,
             live_paused_scroll: 0,
             live_has_snapshot_history,
@@ -1618,13 +1661,20 @@ impl AppState {
                 self.original_daily_groups
                     .iter()
                     .filter_map(|g| {
+                        // A pinned session keeps the subagents it launched, so
+                        // its rows and totals carry them as they do unfiltered.
                         let pinned: Vec<_> = g
                             .sessions
                             .iter()
-                            .filter(|s| self.pins.is_pinned(&s.file_path))
+                            .filter(|s| {
+                                self.pins.is_pinned(&s.file_path)
+                                    || s.parent_path
+                                        .as_deref()
+                                        .is_some_and(|p| self.pins.is_pinned(p))
+                            })
                             .cloned()
                             .collect();
-                        if pinned.is_empty() {
+                        if pinned.iter().all(|s| s.is_subagent) {
                             None
                         } else {
                             Some(DailyGroup {
@@ -1745,9 +1795,10 @@ impl AppState {
                 // counts exclude subagents; tokens / model / activity /
                 // project / tool / language are subagent-inclusive so
                 // filtered totals reconcile with subagent-inclusive cost.
+                let first_sighting = !session.is_subagent && seen_paths.insert(&session.file_path);
                 if !session.is_subagent {
                     stats.total_session_days += 1;
-                    if seen_paths.insert(&session.file_path) {
+                    if first_sighting {
                         stats.total_sessions_count += 1;
                     }
                     crate::aggregator::StatsAggregator::add_session_adoption(
@@ -1806,7 +1857,8 @@ impl AppState {
                     .project_stats
                     .entry(session.project_name.clone())
                     .or_default();
-                project_stats.sessions += 1;
+                // Distinct user sessions, as the unfiltered aggregation counts.
+                project_stats.sessions += usize::from(first_sighting);
                 project_stats.work_tokens += work_tokens;
                 project_stats.tokens += work_tokens;
 
@@ -1944,6 +1996,61 @@ mod filtered_stats_tests {
             state.stats.total_sessions_count, 1,
             "session count must exclude the subagent"
         );
+    }
+
+    #[test]
+    fn the_pinned_view_keeps_the_subagents_a_pinned_session_launched() {
+        let day = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let model = "claude-sonnet-4-20250514";
+        let parent = make_session_with_tokens("~/proj", 10, 0, model);
+        let mut own_sub = make_session_with_tokens("~/proj", 20, 0, model);
+        own_sub.is_subagent = true;
+        own_sub.file_path = std::path::PathBuf::from("/tmp/test/own-sub.jsonl");
+        own_sub.parent_path = Some(parent.file_path.clone());
+        let mut other_sub = own_sub.clone();
+        other_sub.file_path = std::path::PathBuf::from("/tmp/test/other-sub.jsonl");
+        other_sub.parent_path = Some(std::path::PathBuf::from("/tmp/test/unpinned.jsonl"));
+        let mut state = make_test_app_state(vec![make_daily_group(
+            day,
+            vec![parent.clone(), own_sub, other_sub],
+        )]);
+        state.pins.toggle(&parent.file_path);
+        state.period_filter = PeriodFilter::Pinned;
+        state.apply_filter();
+        let kept: Vec<_> = state.daily_groups[0]
+            .sessions
+            .iter()
+            .map(|s| s.file_path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept.iter().any(|p| p.ends_with("own-sub.jsonl")));
+        assert_eq!(
+            state.daily_groups[0]
+                .subagent_spend(&parent.file_path)
+                .work_tokens,
+            20
+        );
+    }
+
+    #[test]
+    fn filtered_rebuild_counts_a_projects_distinct_user_sessions() {
+        let day = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let model = "claude-sonnet-4-20250514";
+        let user = make_session_with_tokens("~/proj", 10, 0, model);
+        let mut sub = make_session_with_tokens("~/proj", 10, 0, model);
+        sub.is_subagent = true;
+        sub.file_path = std::path::PathBuf::from("/tmp/test/sub.jsonl");
+        // The same user session on two days is still one session.
+        let groups = vec![
+            make_daily_group(day, vec![user.clone(), sub]),
+            make_daily_group(day - chrono::Duration::days(1), vec![user]),
+        ];
+        let mut state = make_test_app_state(groups);
+        state.period_filter = PeriodFilter::Custom(day - chrono::Duration::days(1), Some(day));
+        state.apply_filter();
+        let p = &state.stats.project_stats["~/proj"];
+        assert_eq!(p.sessions, 1);
+        assert_eq!(p.work_tokens, 30);
     }
 
     // `tool_sessions` has the scope `tool_usage` has — every session,
@@ -2092,5 +2199,41 @@ mod input_routing_tests {
             state.active_text_input().map(|(_, k)| k),
             Some(InputKind::Filter)
         );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn the_cursor_stays_on_its_row_when_the_list_reorders() {
+        let prev = ["a", "b", "c", "d"];
+        // `c` moved to the top; the cursor was on it.
+        assert_eq!(follow_selection(&prev, 2, &["c", "a", "b", "d"]), 0);
+    }
+
+    #[test]
+    fn a_vanished_row_hands_the_cursor_to_the_row_below_it() {
+        let prev = ["a", "b", "c", "d"];
+        assert_eq!(
+            follow_selection(&prev, 1, &["d", "a", "c"]),
+            2,
+            "the row below b is c"
+        );
+        // The last row gone: the one above takes over.
+        assert_eq!(follow_selection(&prev, 3, &["a", "b", "c"]), 2);
+        assert_eq!(
+            follow_selection(&prev, 1, &[] as &[&str]),
+            0,
+            "an empty list"
+        );
+    }
+
+    #[test]
+    fn held_order_keeps_known_rows_in_place_and_appends_new_ones() {
+        let mut next = vec!["d", "new", "b", "a"];
+        hold_order(&mut next, &["a", "b", "c", "d"], |s| *s);
+        assert_eq!(next, vec!["a", "b", "d", "new"]);
     }
 }

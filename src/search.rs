@@ -180,6 +180,65 @@ fn session_matches_filters(
     true
 }
 
+/// Index hits fetched when filters run after the index answers — a narrow
+/// filter would otherwise starve on a small fetch, and one busy session's
+/// hits collapse into a single result.
+pub(crate) const FILTERED_INDEX_FETCH: usize = 2000;
+
+/// Inclusive date bounds of a search period — the same days `period_matches`
+/// accepts, so the index query and the post-filter agree.
+pub(crate) fn period_bounds(
+    period: Option<PeriodFilter>,
+    today: NaiveDate,
+) -> (Option<NaiveDate>, Option<NaiveDate>) {
+    match period {
+        None => (None, None),
+        Some(PeriodFilter::Today) => (Some(today), Some(today)),
+        Some(PeriodFilter::Week) => (Some(today - chrono::Duration::days(6)), Some(today)),
+        Some(PeriodFilter::Month) => (Some(today - chrono::Duration::days(29)), Some(today)),
+        Some(PeriodFilter::On(d)) => (Some(d), Some(d)),
+    }
+}
+
+/// Narrowest of two inclusive ranges; either side `None` = unbounded.
+pub(crate) fn intersect_bounds(
+    a: (Option<NaiveDate>, Option<NaiveDate>),
+    b: (Option<NaiveDate>, Option<NaiveDate>),
+) -> (Option<NaiveDate>, Option<NaiveDate>) {
+    let pick =
+        |x: Option<NaiveDate>, y: Option<NaiveDate>, f: fn(NaiveDate, NaiveDate) -> NaiveDate| {
+            match (x, y) {
+                (Some(x), Some(y)) => Some(f(x, y)),
+                (x, y) => x.or(y),
+            }
+        };
+    (pick(a.0, b.0, std::cmp::max), pick(a.1, b.1, std::cmp::min))
+}
+
+/// The slice a content hit opens: the day its message was written, else the
+/// newest in-range day (a hit that carries no message date).
+pub(crate) fn hit_position(
+    days: &[(usize, usize)],
+    in_range: impl Fn(usize) -> bool,
+    is_message_day: impl Fn(usize) -> bool,
+) -> Option<(usize, usize)> {
+    days.iter()
+        .copied()
+        .find(|(d, _)| in_range(*d) && is_message_day(*d))
+        .or_else(|| newest_in_range(days, in_range))
+}
+
+/// First `(day_idx, session_idx)` whose day passes `in_range`; `days` runs
+/// newest first. An index hit names a session, not a day, so a multi-day
+/// session must land on a day the active period covers — its newest one —
+/// or a period filter drops a session it should keep.
+pub(crate) fn newest_in_range(
+    days: &[(usize, usize)],
+    in_range: impl Fn(usize) -> bool,
+) -> Option<(usize, usize)> {
+    days.iter().copied().find(|(d, _)| in_range(*d))
+}
+
 #[derive(Clone)]
 pub struct SearchResult {
     /// Position in `daily_groups` that the result currently refers to. The
@@ -196,6 +255,9 @@ pub struct SearchResult {
     /// filter changes. `None` for non-index searches (where indices already
     /// reflect the current filtered set).
     pub session_path: Option<String>,
+    /// Local date the matched message was written; `None` for matches that
+    /// aren't a single message (metadata, file scan).
+    pub message_date: Option<NaiveDate>,
 }
 
 #[derive(Clone)]
@@ -246,6 +308,7 @@ pub fn perform_search(
                     snippet: None,
                     match_type: SearchMatchType::ProjectName,
                     session_path: None,
+                    message_date: None,
                 });
                 continue;
             }
@@ -259,6 +322,7 @@ pub fn perform_search(
                     snippet: None,
                     match_type: SearchMatchType::ProjectName,
                     session_path: None,
+                    message_date: None,
                 });
                 continue;
             }
@@ -273,6 +337,7 @@ pub fn perform_search(
                     snippet: Some(snippet),
                     match_type: SearchMatchType::Summary,
                     session_path: None,
+                    message_date: None,
                 });
                 continue;
             }
@@ -288,6 +353,7 @@ pub fn perform_search(
                     snippet: None,
                     match_type: SearchMatchType::GitBranch,
                     session_path: None,
+                    message_date: None,
                 });
                 continue;
             }
@@ -301,6 +367,7 @@ pub fn perform_search(
                     snippet: Some(session_id.to_string()),
                     match_type: SearchMatchType::SessionId,
                     session_path: None,
+                    message_date: None,
                 });
                 continue;
             }
@@ -317,6 +384,7 @@ pub fn perform_search(
                     snippet: None,
                     match_type: SearchMatchType::Date,
                     session_path: None,
+                    message_date: None,
                 });
                 continue;
             }
@@ -779,5 +847,53 @@ mod tests {
         let __ctx = ctx(&__c);
         let results = perform_search(&groups, "agent-task", &__ctx);
         assert_eq!(results.len(), 0, "subagent sessions should be excluded");
+    }
+
+    #[test]
+    fn period_bounds_admit_exactly_the_days_period_matches_admits() {
+        let today = chrono::Local::now().date_naive();
+        let periods = [
+            None,
+            Some(PeriodFilter::Today),
+            Some(PeriodFilter::Week),
+            Some(PeriodFilter::Month),
+            Some(PeriodFilter::On(today - chrono::Duration::days(3))),
+        ];
+        for period in periods {
+            let (from, to) = period_bounds(period, today);
+            for back in -2..40 {
+                let day = today - chrono::Duration::days(back);
+                let inside = from.is_none_or(|f| day >= f) && to.is_none_or(|t| day <= t);
+                assert_eq!(
+                    inside,
+                    period_matches(day, period, today),
+                    "{period:?} {day}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intersecting_bounds_keeps_the_narrower_side_of_each_end() {
+        let d = |n| chrono::NaiveDate::from_ymd_opt(2026, 1, n).unwrap(); // lint-ok: date-literal
+        assert_eq!(
+            intersect_bounds((Some(d(1)), None), (Some(d(5)), Some(d(9)))),
+            (Some(d(5)), Some(d(9)))
+        );
+        assert_eq!(
+            intersect_bounds((Some(d(6)), Some(d(8))), (Some(d(5)), Some(d(9)))),
+            (Some(d(6)), Some(d(8)))
+        );
+        assert_eq!(intersect_bounds((None, None), (None, None)), (None, None));
+    }
+
+    #[test]
+    fn a_hit_opens_the_day_its_message_was_written() {
+        // Newest first, as a path's positions are listed.
+        let days = [(0, 4), (3, 1), (7, 2)];
+        assert_eq!(hit_position(&days, |_| true, |d| d == 3), Some((3, 1)));
+        // A message day outside the range falls back to the newest in range.
+        assert_eq!(hit_position(&days, |d| d >= 7, |d| d == 3), Some((7, 2)));
+        assert_eq!(hit_position(&days, |_| true, |_| false), Some((0, 4)));
     }
 }

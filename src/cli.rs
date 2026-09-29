@@ -5,7 +5,7 @@ use crate::infrastructure::FileDiscovery;
 
 // ANSI escape sequences. Emitted only when stdout is a TTY so pipes (e.g.
 // `ccsight --daily | column -t`) stay clean. Cost tier coloring mirrors
-// the TUI's `cost_style` (5-tier scale, same boundaries) so the daily $
+// the TUI's `cost_color` tier scale (5-tier scale, same boundaries) so the daily $
 // reads the same in CLI and TUI.
 const C_RESET: &str = "\x1b[0m";
 const C_BOLD: &str = "\x1b[1m";
@@ -17,7 +17,7 @@ const C_BR_RED: &str = "\x1b[91m"; // ERROR
 const C_RED: &str = "\x1b[31m"; // DANGER
 const C_BR_MAGENTA: &str = "\x1b[95m"; // CRITICAL — highest tier
 
-/// CLI mirror of `ui::cost_style`. Boundaries and tier-to-color mapping
+/// CLI mirror of the TUI's `cost_color` tier scale. Boundaries and tier-to-color mapping
 /// must stay in lockstep with the TUI — when the TUI rebalances tiers,
 /// update both. Tiers from low to high spend: SUCCESS / WARNING / ERROR
 /// / DANGER / CRITICAL.
@@ -320,7 +320,7 @@ fn buckets_to_json(period: &str, rows: &[(String, u64, u64, u64, u64, f64)]) -> 
                 "output_tokens": output,
                 "cache_write_tokens": cw,
                 "cache_read_tokens": cr,
-                "cost_usd": cost,
+                "cost_usd": crate::text::round_cents(*cost),
             })
         })
         .collect();
@@ -332,7 +332,7 @@ fn buckets_to_json(period: &str, rows: &[(String, u64, u64, u64, u64, f64)]) -> 
             "output_tokens": total.1,
             "cache_write_tokens": total.2,
             "cache_read_tokens": total.3,
-            "cost_usd": total.4,
+            "cost_usd": crate::text::round_cents(total.4),
         },
     })
 }
@@ -451,6 +451,20 @@ mod tests {
         assert_eq!(v["total"]["cache_write_tokens"], 30);
         assert_eq!(v["total"]["cache_read_tokens"], 40);
         assert!((v["total"]["cost_usd"].as_f64().unwrap() - 1.75).abs() < 1e-9);
+    }
+
+    // Cents, like the MCP tools: a raw float sum prints long binary tails.
+    #[test]
+    fn json_costs_are_rounded_to_cents() {
+        let v = buckets_to_json(
+            "daily",
+            &[
+                ("day-1".to_string(), 1, 1, 0, 0, 1.234_567),
+                ("day-2".to_string(), 1, 1, 0, 0, 0.1),
+            ],
+        );
+        assert_eq!(v["rows"][0]["cost_usd"], 1.23);
+        assert_eq!(v["total"]["cost_usd"], 1.33);
     }
 
     #[test]

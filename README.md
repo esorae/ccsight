@@ -95,6 +95,8 @@ Tokens can be combined freely with each other and with free text:
 /filter:month model:opus mcp setup        # last 30 days, Opus, containing "mcp setup"
 ```
 
+A conversation-content match counts only when the matched message was
+written inside the date range, not merely when its session was active then.
 The Live tab pre-fills `filter:live `, and the search popup renders recognised tokens as chips so you can confirm parsing.
 
 ## MCP Server
@@ -105,7 +107,8 @@ claude mcp add --scope user ccsight -- ccsight --mcp
 
 Four tools over stdio: `stats`, `sessions` (with `conversation_query`),
 `search`, `live_sessions`. The first three take `date_from` / `date_to`
-(`YYYY-MM-DD`, local timezone); `live_sessions` reports the current poll.
+(`YYYY-MM-DD`, local timezone; `search` applies them to the matched
+message's date); `live_sessions` reports the current poll.
 Other hosts: add `ccsight --mcp` as a stdio server.
 
 ## Data Source

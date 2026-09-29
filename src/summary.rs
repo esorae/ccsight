@@ -724,6 +724,24 @@ fn build_title_context(
     context
 }
 
+/// Openings of the prompts ccsight hands `claude -p`, with the label its
+/// session shows. Those calls leave transcripts like any session; matching a
+/// session's first prompt against these names it as ccsight's own work.
+pub(crate) const GENERATED_PROMPTS: &[(&str, &str)] = &[
+    (
+        "Generate a VERY SHORT title (max 60 chars) for this Claude Code session",
+        "ccsight · title generation",
+    ),
+    (
+        "Below is a detailed Claude Code work session.",
+        "ccsight · session summary",
+    ),
+    (
+        "Below is a detailed Claude Code work log for one day.",
+        "ccsight · day summary",
+    ),
+];
+
 /// The title instruction. Asking for the project name without saying where it
 /// goes produced `<project>: topic` in most generations — a label rather than a
 /// title, so the phrasing puts the name inside the phrase.
@@ -873,6 +891,13 @@ mod tests {
     // Asking for the project name without saying where it goes produced
     // `<project>: topic` — a label, not a title. Both halves of the fix (name
     // it, and put it inside the phrase) have to survive prompt edits.
+    #[test]
+    fn the_title_prompt_opens_with_its_generated_prompt_marker() {
+        // Drift here stops ccsight recognising its own title sessions.
+        let (opening, _) = GENERATED_PROMPTS[0];
+        assert!(title_prompt("ctx").starts_with(opening));
+    }
+
     #[test]
     fn title_prompt_places_the_project_inside_the_phrase() {
         let prompt = title_prompt("Project: p\n");

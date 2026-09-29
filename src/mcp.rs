@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{Local, NaiveDate};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 
 use crate::PeriodFilter;
@@ -661,7 +661,7 @@ impl CcsightServer {
             if params.date_from.is_some() || params.date_to.is_some() || params.project.is_some() {
                 // Those filters run after the index answers, so a narrow one
                 // would otherwise starve on the unfiltered fetch.
-                FILTERED_INDEX_FETCH
+                crate::search::FILTERED_INDEX_FETCH
             } else {
                 (limit * 5).max(MIN_INDEX_FETCH)
             };
@@ -742,14 +742,22 @@ impl CcsightServer {
                 .filter(|r| day_in_range(r.day_idx))
                 .filter_map(path_of)
                 .collect();
-            for mut result in index.search(&free_text, fetch_limit, 200) {
+            for mut result in index.search_between(&free_text, fetch_limit, 200, date_from, date_to)
+            {
                 if let Some(stored) = result.session_path.as_deref() {
-                    // The newest active day inside the date range: a session
-                    // matches a range it was active in, not only its last day.
-                    // None — gone since indexing, or never active in range.
-                    let Some((d, i)) = position_of
-                        .get(std::path::Path::new(stored))
-                        .and_then(|days| newest_in_range(days, day_in_range))
+                    // The day the matched message was written. None — gone
+                    // since indexing, or never active in range.
+                    let is_message_day = |d: usize| {
+                        result
+                            .message_date
+                            .is_some_and(|m| data.daily_groups.get(d).is_some_and(|g| g.date == m))
+                    };
+                    let Some((d, i)) =
+                        position_of
+                            .get(std::path::Path::new(stored))
+                            .and_then(|days| {
+                                crate::search::hit_position(days, day_in_range, is_message_day)
+                            })
                     else {
                         continue;
                     };
@@ -811,7 +819,8 @@ impl CcsightServer {
                 continue;
             }
 
-            let cost: f64 = session.cost(calculator);
+            let subagents = group.subagent_spend(&session.file_path);
+            let cost: f64 = session.cost(calculator) + subagents.cost;
 
             let session_id: String = session
                 .file_path
@@ -839,11 +848,14 @@ impl CcsightServer {
                 "summary": titled.display_title(),
                 "snippet": result.snippet,
                 "match_type": match_type,
-                "tokens": session.work_tokens(),
+                "tokens": session.work_tokens() + subagents.work_tokens,
                 "cost_usd": round_cents(cost),
                 "session_id": session_id,
                 "git_branch": session.git_branch,
             });
+            if subagents.count > 0 {
+                row["subagents"] = subagents_json(subagents.cost, subagents.work_tokens);
+            }
             if let Some(t) = total.and_then(session_total_json) {
                 row["session_total"] = t;
             }
@@ -988,7 +1000,14 @@ impl CcsightServer {
             }
             let reason = crate::session_state::reason_for(state, tail, idle);
             let entry = s.jsonl_path.as_deref().and_then(|p| cum_map.get(p));
-            let total = entry.map(|(c, _)| (c.cost, c.input_tokens + c.output_tokens, c.unpriced));
+            let total = entry.map(|(c, _)| {
+                let (cost, unpriced) = c.cost_with_subagents();
+                (
+                    cost,
+                    c.input_tokens + c.output_tokens + c.subagents.work_tokens,
+                    unpriced,
+                )
+            });
             let meta = entry.map(|(_, m)| *m);
             Some(build_live_row(
                 s, tier, age_secs, state, &reason, compact, total, meta,
@@ -1019,7 +1038,7 @@ impl CcsightServer {
     }
 
     #[tool(
-        description = "List sessions or get one session's detail. Rows describe one day of a session (`date`, `cost_usd`, `tokens`); a session active on several days also carries `session_total`. With session_id: conversation, tool usage and files touched over the whole session; conversation_query matches whole message text and returns a window around each match. Without: lists sessions filtered by query (metadata only: project/summary/branch/date), project, date range, sort; use `search` for content. All dates/times local."
+        description = "List sessions or get one session's detail. Rows describe one day of a session (`date`, `cost_usd`, `tokens`); a session active on several days also carries `session_total`. `cost_usd` includes the subagents a session launched (their share in `subagents`). With session_id: conversation, tool usage and files touched over the whole session; conversation_query matches whole message text and returns a window around each match. Without: lists sessions filtered by query (metadata only: project/summary/branch/date), project, date range, sort; use `search` for content. All dates/times local."
     )]
     fn sessions(
         &self,
@@ -1102,6 +1121,7 @@ impl CcsightServer {
 
         let totals = crate::aggregator::cumulative_by_path(&data.daily_groups);
         for group in &data.daily_groups {
+            let by_parent = group.subagent_spend_by_parent();
             for session in &group.sessions {
                 if session.is_subagent {
                     continue;
@@ -1115,13 +1135,18 @@ impl CcsightServer {
                     calculator,
                     &data.summary_cache,
                     totals.get(session.file_path.as_path()),
+                    by_parent
+                        .get(session.file_path.as_path())
+                        .copied()
+                        .unwrap_or_default(),
                 );
                 // Judged on the first prompt, not the title: a generated
                 // session keeps its tool prompt there even once titled.
-                let auto = session
-                    .summary
-                    .as_deref()
-                    .is_some_and(|s| AUTO_PREFIXES.iter().any(|p| s.starts_with(p)));
+                let auto = session.ccsight_generated().is_some()
+                    || session
+                        .summary
+                        .as_deref()
+                        .is_some_and(|s| AUTO_PREFIXES.iter().any(|p| s.starts_with(p)));
                 if auto {
                     json["auto"] = serde_json::json!(true);
                 }
@@ -1220,6 +1245,7 @@ impl CcsightServer {
             calculator,
             &data.summary_cache,
             totals.get(session.file_path.as_path()),
+            crate::aggregator::day_subagent_spend(session, &data.daily_groups),
         );
         // Summed over every day: the conversation and `files_touched` below
         // cover the whole transcript, so a one-day tool count beside them
@@ -1345,17 +1371,6 @@ fn positions_by_path(groups: &[DailyGroup]) -> HashMap<&std::path::Path, Vec<(us
     out
 }
 
-/// First position whose day passes `in_range`; `days` runs newest first.
-fn newest_in_range(
-    days: &[(usize, usize)],
-    in_range: impl Fn(usize) -> bool,
-) -> Option<(usize, usize)> {
-    days.iter().copied().find(|(d, _)| in_range(*d))
-}
-
-/// Index hits fetched when a date or project filter narrows the results.
-const FILTERED_INDEX_FETCH: usize = 2000;
-
 /// Set while a background index build or catch-up runs, so repeated `search`
 /// calls start at most one.
 static INDEX_REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1425,11 +1440,7 @@ const MIN_INDEX_FETCH: usize = 200;
 /// names `conversation_offset` for the rest.
 const DEFAULT_CONVERSATION_ENTRIES: usize = 60;
 
-/// Round a dollar figure to whole cents for JSON `cost_usd` output. Clamps at
-/// 0 so a zero-token session can't emit `-0.0` (the TUI clamps via format_cost).
-fn round_cents(cost: f64) -> f64 {
-    (cost.max(0.0) * 100.0).round() / 100.0
-}
+use crate::text::round_cents;
 
 fn clean_summary(text: &str) -> String {
     let text = text.trim();
@@ -1465,10 +1476,10 @@ struct ConvEntry {
     text: String,
 }
 
-/// Chars a preview keeps per message; user prompts carry the intent, so they
-/// get the larger share.
+/// Chars a preview keeps per message; user prompts and compaction recaps carry
+/// the intent, so they get the larger share.
 fn preview_len(role: &str) -> usize {
-    if role == "user" { 300 } else { 200 }
+    if role == "assistant" { 200 } else { 300 }
 }
 
 /// Chars of a matched message returned around its first occurrence. A
@@ -1479,7 +1490,7 @@ const MATCH_WINDOW_CHARS: usize = 2000;
 fn conversation_entries(messages: &[ConversationMessage]) -> Vec<ConvEntry> {
     messages
         .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
+        .filter(|m| matches!(m.role.as_str(), "user" | "assistant" | "recap"))
         .filter_map(|msg| {
             let text: String = msg
                 .blocks
@@ -1624,6 +1635,12 @@ fn derive_summary(file_path: &std::path::Path) -> Option<String> {
     None
 }
 
+/// The share of a row that ran in subagents the session launched. The row's
+/// `cost_usd` already includes it, as the TUI's rows do.
+fn subagents_json(cost: f64, work_tokens: u64) -> serde_json::Value {
+    serde_json::json!({ "cost_usd": round_cents(cost), "tokens": work_tokens })
+}
+
 /// Whole-session figures for a row that describes one day of the session.
 /// `None` when it was active on a single day — the row's own figures are then
 /// the session's, and repeating them would only cost the caller context.
@@ -1637,8 +1654,9 @@ fn session_total_json(
     if cum.days <= 1 {
         return None;
     }
+    let (cost, unpriced) = cum.cost_with_subagents();
     let mut v = serde_json::json!({
-        "cost_usd": round_cents(cum.cost),
+        "cost_usd": round_cents(cost),
         "tokens": {
             "input": cum.input_tokens,
             "output": cum.output_tokens,
@@ -1655,7 +1673,10 @@ fn session_total_json(
             .date_naive()
             .to_string(),
     });
-    if cum.unpriced {
+    if cum.subagents.count > 0 {
+        v["subagents"] = subagents_json(cum.subagents.cost, cum.subagents.work_tokens);
+    }
+    if unpriced {
         v["cost_is_lower_bound"] = serde_json::json!(true);
     }
     Some(v)
@@ -1670,8 +1691,9 @@ fn build_session_json(
         crate::aggregator::SessionCumulative,
         &crate::aggregator::SessionInfo,
     )>,
+    subagents: crate::aggregator::SubagentSpend,
 ) -> serde_json::Value {
-    let mut cost = 0.0;
+    let mut cost = subagents.cost;
     let mut cache_creation = 0u64;
     let mut cache_read = 0u64;
     for (model, tokens) in &session.day_tokens_by_model {
@@ -1731,6 +1753,9 @@ fn build_session_json(
         "git_branch": session.git_branch,
         "duration_mins": duration_mins,
     });
+    if subagents.count > 0 {
+        row["subagents"] = subagents_json(subagents.cost, subagents.work_tokens);
+    }
     if let Some(t) = total.and_then(session_total_json) {
         row["session_total"] = t;
     }
@@ -1739,8 +1764,8 @@ fn build_session_json(
 
 #[tool_handler]
 impl ServerHandler for CcsightServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("ccsight", env!("CARGO_PKG_VERSION")))
             .with_instructions("Claude Code usage analytics. Use 'stats' for aggregated metrics, 'sessions' to search sessions. Tool guide: 'search' to find past conversations by content (full-text, returns snippets with session_id) -> 'sessions' with session_id to get conversation detail. 'stats' for cost/token/model summaries. All tools accept date_from/date_to (YYYY-MM-DD) for date filtering.")
     }
@@ -2172,6 +2197,36 @@ mod tests {
     }
 
     #[test]
+    fn a_session_row_carries_the_subagents_it_launched_as_the_tui_does() {
+        use crate::aggregator::SubagentSpend;
+        let session = make_session_with_tokens("~/p", 1_000_000, 0, "claude-opus-4-6");
+        let calculator = CostCalculator::global();
+        let own = session.cost(calculator);
+        let spend = SubagentSpend {
+            count: 2,
+            work_tokens: 500,
+            cost: own,
+            unpriced: false,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
+        let json = build_session_json(date, &session, calculator, &HashMap::new(), None, spend);
+        assert_eq!(json["cost_usd"], serde_json::json!(round_cents(2.0 * own)));
+        assert_eq!(json["subagents"]["tokens"], 500);
+        let bare = build_session_json(
+            date,
+            &session,
+            calculator,
+            &HashMap::new(),
+            None,
+            SubagentSpend::default(),
+        );
+        assert!(
+            bare.get("subagents").is_none(),
+            "no block without subagents"
+        );
+    }
+
+    #[test]
     fn test_build_session_json_fields() {
         let session = make_session_with_tokens(
             "~/projects/myapp",
@@ -2182,7 +2237,14 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
         let calculator = CostCalculator::global();
 
-        let json = build_session_json(date, &session, calculator, &HashMap::new(), None);
+        let json = build_session_json(
+            date,
+            &session,
+            calculator,
+            &HashMap::new(),
+            None,
+            Default::default(),
+        );
 
         assert_eq!(json["date"], "2026-03-19"); // lint-ok: date-literal
         assert_eq!(json["project"], "~/projects/myapp");
@@ -2209,6 +2271,7 @@ mod tests {
             CostCalculator::global(),
             &HashMap::new(),
             None,
+            Default::default(),
         );
 
         assert_eq!(json["summary"], "Added MCP support");
@@ -2226,6 +2289,7 @@ mod tests {
             CostCalculator::global(),
             &HashMap::new(),
             None,
+            Default::default(),
         );
 
         assert!(json["summary"].is_null());
@@ -2244,6 +2308,7 @@ mod tests {
             CostCalculator::global(),
             &HashMap::new(),
             None,
+            Default::default(),
         );
 
         assert_eq!(json["session_id"].as_str().unwrap().len(), 8);
@@ -3480,10 +3545,16 @@ mod tests {
     #[test]
     fn an_index_hit_lands_on_the_newest_day_inside_the_range() {
         let days = [(0, 2), (3, 1), (7, 0)];
-        assert_eq!(newest_in_range(&days, |_| true), Some((0, 2)));
+        assert_eq!(
+            crate::search::newest_in_range(&days, |_| true),
+            Some((0, 2))
+        );
         // Day 0 is past `date_to`; the session was still active in range.
-        assert_eq!(newest_in_range(&days, |d| d >= 3), Some((3, 1)));
-        assert_eq!(newest_in_range(&days, |d| d > 7), None);
+        assert_eq!(
+            crate::search::newest_in_range(&days, |d| d >= 3),
+            Some((3, 1))
+        );
+        assert_eq!(crate::search::newest_in_range(&days, |d| d > 7), None);
     }
 
     #[test]
@@ -3529,6 +3600,7 @@ mod tests {
             CostCalculator::global(),
             &HashMap::new(),
             totals.get(newest.file_path.as_path()),
+            Default::default(),
         );
         // The row's own figure is the one day; the total spans both.
         assert_eq!(row["cost_usd"], 5.0);
@@ -3545,6 +3617,7 @@ mod tests {
             CostCalculator::global(),
             &HashMap::new(),
             totals.get(s.file_path.as_path()),
+            Default::default(),
         );
         assert!(
             row.get("session_total").is_none(),

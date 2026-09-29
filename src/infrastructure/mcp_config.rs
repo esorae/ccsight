@@ -332,6 +332,7 @@ mod tests {
                 day_input_tokens: 0,
                 day_output_tokens: 0,
                 day_user_msgs: 0,
+                day_prompts: 0,
                 day_assistant_msgs: 0,
                 day_tokens_by_model: HashMap::new(),
                 day_hourly_activity: HashMap::new(),
@@ -346,6 +347,7 @@ mod tests {
                 first_user_message: None,
                 model: None,
                 is_subagent: false,
+                parent_path: None,
                 is_continued: false,
                 line_churn: Default::default(),
             }

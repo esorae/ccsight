@@ -126,6 +126,7 @@ mod tests {
             version: None,
             is_sidechain: false,
             is_compact_summary: false,
+            is_meta: false,
             user_type: None,
             request_id: None,
             level: None,

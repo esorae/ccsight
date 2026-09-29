@@ -6,8 +6,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use super::cost_style;
 use super::theme;
+use super::{cost_style_marked, cost_total_style};
 use crate::AppState;
 
 /// Derived rates shared by Insights preview card and detail popup —
@@ -190,7 +190,7 @@ fn draw_insights_today(frame: &mut Frame, area: Rect, state: &AppState, calendar
             } else if today_in_row {
                 ('●', theme::SUCCESS)
             } else if avg_in_row {
-                ('○', theme::LABEL_MUTED)
+                ('○', theme::META)
             } else if today_below && avg_below {
                 ('│', theme::SEPARATOR)
             } else if today_below {
@@ -198,16 +198,13 @@ fn draw_insights_today(frame: &mut Frame, area: Rect, state: &AppState, calendar
             } else if avg_below {
                 ('┆', theme::FAINT)
             } else {
-                (' ', theme::DIM)
+                (' ', theme::LABEL)
             };
             row_spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
         }
 
         let mut line_spans = vec![
-            Span::styled(
-                format!("{y_label:>5} "),
-                Style::default().fg(theme::LABEL_MUTED),
-            ),
+            Span::styled(format!("{y_label:>5} "), Style::default().fg(theme::META)),
             Span::raw("│"),
         ];
         line_spans.extend(row_spans);
@@ -222,7 +219,7 @@ fn draw_insights_today(frame: &mut Frame, area: Rect, state: &AppState, calendar
     }
     graph_lines.push(Line::from(Span::styled(
         x_axis,
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::META),
     )));
 
     // Hour labels
@@ -238,7 +235,7 @@ fn draw_insights_today(frame: &mut Frame, area: Rect, state: &AppState, calendar
     }
     graph_lines.push(Line::from(Span::styled(
         hour_labels,
-        Style::default().fg(theme::LABEL_MUTED),
+        Style::default().fg(theme::TIME),
     )));
 
     // Current time marker with progress
@@ -274,6 +271,7 @@ fn draw_insights_today(frame: &mut Frame, area: Rect, state: &AppState, calendar
         .iter()
         .find(|(d, _)| *d == today)
         .map_or(0.0, |(_, c)| *c);
+    let today_unpriced = super::any_unpriced(&state.daily_groups, |g, _| g.date == today);
 
     let today_block = Paragraph::new(graph_lines).block(
         Block::default()
@@ -304,11 +302,14 @@ fn draw_insights_today(frame: &mut Frame, area: Rect, state: &AppState, calendar
                 ),
                 // Above-average days are neutral signals (more activity, not
                 // "over budget") — subscription users see this every busy day
-                // and an alert colour misframes the meaning. Keep DIM.
-                Span::styled(format!("({diff_pct}%) "), Style::default().fg(theme::DIM)),
+                // and an alert colour misframes the meaning, so it stays META.
+                Span::styled(format!("({diff_pct}%) "), Style::default().fg(theme::META)),
                 Span::styled(
-                    format!(" ${:.2} ", today_cost.max(0.0)),
-                    cost_style(today_cost),
+                    format!(
+                        " {} ",
+                        super::format_cost_marked(today_cost.max(0.0), today_unpriced, 2)
+                    ),
+                    cost_style_marked(today_cost, today_unpriced),
                 ),
             ])),
     );
@@ -361,7 +362,7 @@ fn draw_insights_weekly(
                 Style::default().fg(if *weekday == today_weekday {
                     theme::PRIMARY
                 } else {
-                    theme::LABEL_MUTED
+                    theme::META
                 }),
             ),
             Span::styled(
@@ -376,7 +377,7 @@ fn draw_insights_weekly(
                 format!(" {:>5}", crate::format_number(avg_tokens)),
                 Style::default().fg(theme::PRIMARY),
             ),
-            Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::META)),
         ]));
     }
 
@@ -398,7 +399,7 @@ fn draw_insights_weekly(
                 Style::default().fg(theme::PRIMARY),
             ))
             .title_bottom(Line::from(vec![
-                Span::styled(" avg: ", Style::default().fg(theme::DIM)),
+                Span::styled(" avg: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     format!("{}/day ", crate::format_number(avg_daily_tokens)),
                     Style::default().fg(theme::PRIMARY),
@@ -494,15 +495,19 @@ fn draw_insights_monthly(frame: &mut Frame, area: Rect, state: &AppState) {
         );
         label_spans.push(Span::styled(
             format!("{short_month:^col_width$}"),
-            Style::default().fg(theme::LABEL_MUTED),
+            Style::default().fg(theme::TIME),
         ));
         cost_spans.push(Span::styled(
             format!(
                 "{:^width$}",
-                super::format_cost(**cost, 0),
+                super::format_cost_marked(
+                    **cost,
+                    super::month_unpriced(&state.daily_groups, month),
+                    0
+                ),
                 width = col_width
             ),
-            Style::default().fg(theme::WARM),
+            cost_total_style(super::month_unpriced(&state.daily_groups, month)),
         ));
 
         let diff_str = if avg_monthly > 0.0 {
@@ -520,7 +525,7 @@ fn draw_insights_monthly(frame: &mut Frame, area: Rect, state: &AppState) {
         // every busy month coloured WARNING).
         diff_spans.push(Span::styled(
             format!("{diff_str:^col_width$}"),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::META),
         ));
     }
     monthly_lines.push(Line::from(label_spans));
@@ -543,10 +548,17 @@ fn draw_insights_monthly(frame: &mut Frame, area: Rect, state: &AppState) {
             if days_elapsed > 0.0 {
                 let forecast = current_cost / days_elapsed * days_in_month;
                 let mut spans = vec![
-                    Span::styled("this mo: ", Style::default().fg(theme::DIM)),
+                    Span::styled("this mo: ", Style::default().fg(theme::LABEL)),
                     Span::styled(
-                        super::format_cost(*current_cost, 0),
-                        Style::default().fg(theme::PRIMARY),
+                        super::format_cost_marked(
+                            *current_cost,
+                            super::month_unpriced(&state.daily_groups, &current_month_key),
+                            0,
+                        ),
+                        cost_total_style(super::month_unpriced(
+                            &state.daily_groups,
+                            &current_month_key,
+                        )),
                     ),
                 ];
                 // Projection only adds information when more than one day
@@ -554,11 +566,18 @@ fn draw_insights_monthly(frame: &mut Frame, area: Rect, state: &AppState) {
                 if days_elapsed < days_in_month {
                     spans.push(Span::styled(
                         " · forecast: ",
-                        Style::default().fg(theme::DIM),
+                        Style::default().fg(theme::LABEL),
                     ));
                     spans.push(Span::styled(
-                        super::format_cost(forecast, 0),
-                        Style::default().fg(theme::WARM),
+                        super::format_cost_marked(
+                            forecast,
+                            super::month_unpriced(&state.daily_groups, &current_month_key),
+                            0,
+                        ),
+                        cost_total_style(super::month_unpriced(
+                            &state.daily_groups,
+                            &current_month_key,
+                        )),
                     ));
                 }
                 spans
@@ -571,14 +590,17 @@ fn draw_insights_monthly(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let mut bottom_spans = vec![
-        Span::styled(" avg: ", Style::default().fg(theme::DIM)),
+        Span::styled(" avg: ", Style::default().fg(theme::LABEL)),
         Span::styled(
-            format!("{}/mo", super::format_cost(avg_monthly, 0)),
-            Style::default().fg(theme::PRIMARY),
+            format!(
+                "{}/mo",
+                super::format_cost_marked(avg_monthly, !state.models_without_pricing.is_empty(), 0)
+            ),
+            cost_total_style(!state.models_without_pricing.is_empty()),
         ),
     ];
     if !forecast_spans.is_empty() {
-        bottom_spans.push(Span::styled(" | ", Style::default().fg(theme::DIM)));
+        bottom_spans.push(Span::styled(" | ", Style::default().fg(theme::LABEL)));
         bottom_spans.extend(forecast_spans);
     }
     bottom_spans.push(Span::raw(" "));
@@ -671,7 +693,7 @@ fn draw_insights_metrics(
         (
             format!("${:.2}/day", avg_cost_per_day.max(0.0)),
             "cost",
-            theme::SECONDARY,
+            theme::VALUE,
         ),
     ];
 
@@ -688,14 +710,14 @@ fn draw_insights_metrics(
         (
             format!("{}/ses", crate::format_number(tokens_per_session)),
             label_density,
-            theme::SECONDARY,
+            theme::VALUE,
         ),
         (
             format!("{}", state.stats.tool_usage.len()),
             // Counts every invoked entry across Tools / Skills / Commands /
             // Subagents / MCP, so `tools` named a subset of what it totals.
             "entries",
-            theme::SECONDARY,
+            theme::VALUE,
         ),
         (format!("{total_sessions}"), "sessions", theme::PRIMARY),
     ];
@@ -703,16 +725,16 @@ fn draw_insights_metrics(
     for (i, (value, label, color)) in row1_items.iter().enumerate() {
         let mut spans = vec![
             Span::styled(value.as_str(), Style::default().fg(*color).bold()),
-            Span::styled(format!(" {label}"), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {label}"), Style::default().fg(theme::LABEL)),
         ];
         // Append 1h-TTL share to the cache card (index 0) so the dual cache
         // signal — "how much we hit" and "how durable the hits are" —
         // reads as one unit. Skip when there are no cache writes at all.
         if i == 0 && (cache_5m + cache_1h) > 0 && (row1_chunks[i].width as usize) >= 22 {
-            spans.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+            spans.push(Span::styled(" · ", Style::default().fg(theme::LABEL)));
             spans.push(Span::styled(
                 format!("{cache_5m_share:.1}% 5m"),
-                Style::default().fg(theme::SECONDARY),
+                Style::default().fg(theme::META),
             ));
         }
         let card = Paragraph::new(Line::from(spans)).centered();
@@ -722,7 +744,7 @@ fn draw_insights_metrics(
     for (i, (value, label, color)) in row2_items.iter().enumerate() {
         let card = Paragraph::new(Line::from(vec![
             Span::styled(value.as_str(), Style::default().fg(*color).bold()),
-            Span::styled(format!(" {label}"), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {label}"), Style::default().fg(theme::LABEL)),
         ]))
         .centered();
         frame.render_widget(card, row2_chunks[i]);
@@ -793,9 +815,9 @@ fn draw_insights_metrics(
                 format!("{count} models"),
                 Style::default().fg(theme::WARNING),
             ),
-            Span::styled(" · ", Style::default().fg(theme::DIM)),
-            Span::styled(preview, Style::default().fg(theme::DIM)),
-            Span::styled(suffix, Style::default().fg(theme::DIM)),
+            Span::styled(" · ", Style::default().fg(theme::LABEL)),
+            Span::styled(preview, Style::default().fg(theme::LABEL)),
+            Span::styled(suffix, Style::default().fg(theme::LABEL)),
         ];
         frame.render_widget(Paragraph::new(Line::from(gap_spans)).centered(), *gap_row);
     }
@@ -818,16 +840,16 @@ pub(super) struct EcoRowCounts {
 /// second copy of the labels. Numbers are session counts — the Dashboard
 /// Ecosystem panel counts calls under similar labels.
 pub(super) fn eco_row_spans(c: &EcoRowCounts, long: bool) -> Vec<Span<'static>> {
-    let dim = Style::default().fg(theme::DIM);
+    let label_style = Style::default().fg(theme::LABEL);
     let mut spans = vec![
         Span::styled(
             format!("{}/{}", c.active, c.configured),
             Style::default().fg(theme::PRIMARY).bold(),
         ),
-        Span::styled(if long { " MCP active" } else { " MCP" }, dim),
+        Span::styled(if long { " MCP active" } else { " MCP" }, label_style),
     ];
     if c.stale > 0 {
-        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(" · ", label_style));
         spans.push(Span::styled(
             if long {
                 format!("{} stale", c.stale)
@@ -843,7 +865,7 @@ pub(super) fn eco_row_spans(c: &EcoRowCounts, long: bool) -> Vec<Span<'static>> 
         } else {
             "  ses: "
         },
-        dim,
+        label_style,
     ));
     // Order matches the popup tabs: MCP → Skills → Commands → Subagents.
     let cats = [
@@ -866,7 +888,7 @@ pub(super) fn eco_row_spans(c: &EcoRowCounts, long: bool) -> Vec<Span<'static>> 
     ];
     for (i, (label, n, color)) in cats.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" · ", dim));
+            spans.push(Span::styled(" · ", label_style));
         }
         spans.push(Span::styled(*label, Style::default().fg(*color)));
         spans.push(Span::styled(
@@ -1012,15 +1034,19 @@ fn insights_detail_metrics(
         String::new()
     };
     lines.push(Line::from(vec![
-        Span::styled(" Total Cost  ", Style::default().fg(theme::DIM)),
+        Span::styled(" Total Cost  ", Style::default().fg(theme::LABEL)),
         Span::styled(
-            super::format_cost(state.total_cost, 2),
-            cost_style(state.total_cost),
+            super::format_cost_marked(
+                state.total_cost,
+                !state.models_without_pricing.is_empty(),
+                2,
+            ),
+            cost_total_style(!state.models_without_pricing.is_empty()),
         ),
-        Span::styled(subagent_cost_suffix, Style::default().fg(theme::DIM)),
+        Span::styled(subagent_cost_suffix, Style::default().fg(theme::META)),
         Span::styled(
             format!("  ({calendar_days} days, {active_days} active)"),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::META),
         ),
     ]));
 
@@ -1054,12 +1080,12 @@ fn insights_detail_metrics(
         String::new()
     };
     lines.push(Line::from(vec![
-        Span::styled(" Sessions    ", Style::default().fg(theme::DIM)),
+        Span::styled(" Sessions    ", Style::default().fg(theme::LABEL)),
         Span::styled(
             format!("{total_sessions}"),
             Style::default().fg(theme::SUCCESS).bold(),
         ),
-        Span::styled(subagent_session_suffix, Style::default().fg(theme::DIM)),
+        Span::styled(subagent_session_suffix, Style::default().fg(theme::META)),
         Span::styled(
             format!(
                 "  ${:.2}/day  {}/day  {}/ses  {avg_dur_str}/ses",
@@ -1067,13 +1093,13 @@ fn insights_detail_metrics(
                 crate::format_number(tokens_per_day),
                 crate::format_number(tokens_per_session)
             ),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::META),
         ),
     ]));
     lines.push(super::churn_line(
         " Edits       ",
         state.stats.line_churn,
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::META),
     ));
     // Without this the reader cannot tell a per-calendar-day average from a
     // per-active-day one, and the two differ by the idle-day share. Silent
@@ -1083,7 +1109,7 @@ fn insights_detail_metrics(
             format!(
                 " /day figures divide by all {calendar_days} days, not the {active_days} active ones."
             ),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )));
     }
     lines.push(sep.clone());
@@ -1109,7 +1135,7 @@ fn insights_detail_metrics(
     for (rate, label, color) in &rates {
         let filled = (*rate / 100.0 * bar_w as f64).round() as usize;
         lines.push(Line::from(vec![
-            Span::styled(format!(" {label} "), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {label} "), Style::default().fg(theme::LABEL)),
             Span::styled(format!("{rate:>5.1}%"), Style::default().fg(*color).bold()),
             Span::raw(" "),
             Span::styled("█".repeat(filled.min(bar_w)), Style::default().fg(*color)),
@@ -1125,24 +1151,24 @@ fn insights_detail_metrics(
     let output = state.stats.total_tokens.output_tokens;
     let cache_write = state.stats.total_tokens.cache_creation_tokens;
     lines.push(Line::from(vec![
-        Span::styled(" Input  ", Style::default().fg(theme::DIM)),
+        Span::styled(" Input  ", Style::default().fg(theme::LABEL)),
         Span::styled(
             format!("{:<10}", crate::format_number(input_tokens)),
             Style::default().fg(theme::TEXT_BRIGHT),
         ),
-        Span::styled("  Output  ", Style::default().fg(theme::DIM)),
+        Span::styled("  Output  ", Style::default().fg(theme::LABEL)),
         Span::styled(
             crate::format_number(output),
             Style::default().fg(theme::TEXT_BRIGHT),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" CacheR ", Style::default().fg(theme::DIM)),
+        Span::styled(" CacheR ", Style::default().fg(theme::LABEL)),
         Span::styled(
             format!("{:<10}", crate::format_number(cache_read)),
             Style::default().fg(theme::TEXT_BRIGHT),
         ),
-        Span::styled("  CacheW  ", Style::default().fg(theme::DIM)),
+        Span::styled("  CacheW  ", Style::default().fg(theme::LABEL)),
         Span::styled(
             crate::format_number(cache_write),
             Style::default().fg(theme::TEXT_BRIGHT),
@@ -1160,13 +1186,13 @@ fn insights_detail_metrics(
             0.0
         };
         lines.push(Line::from(vec![
-            Span::styled(" of which subagent ", Style::default().fg(theme::DIM)),
+            Span::styled(" of which subagent ", Style::default().fg(theme::LABEL)),
             Span::styled(
                 format!(
                     "{} ({sub_pct:.0}% of work)",
                     crate::format_number(subagent_work_tokens)
                 ),
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(theme::META),
             ),
         ]));
     }
@@ -1253,7 +1279,7 @@ fn insights_detail_metrics(
         ];
         for t in &trends {
             lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", t.label), Style::default().fg(theme::DIM)),
+                Span::styled(format!(" {} ", t.label), Style::default().fg(theme::LABEL)),
                 Span::styled(t.spark.clone(), Style::default().fg(theme::PRIMARY)),
                 Span::styled(
                     format!("  7d {}", t.recent),
@@ -1261,9 +1287,9 @@ fn insights_detail_metrics(
                 ),
                 Span::styled(
                     format!("  30d {}  ", t.baseline),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::META),
                 ),
-                Span::styled(t.delta.clone(), Style::default().fg(theme::DIM)),
+                Span::styled(t.delta.clone(), Style::default().fg(theme::META)),
             ]));
         }
     }
@@ -1295,7 +1321,7 @@ fn insights_detail_metrics(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {name:<name_w$}"),
-                    Style::default().fg(theme::PRIMARY),
+                    Style::default().fg(super::model_color(model)),
                 ),
                 Span::styled(
                     "█".repeat(filled.min(bar_max)),
@@ -1306,10 +1332,17 @@ fn insights_detail_metrics(
                     Style::default().fg(theme::SEPARATOR),
                 ),
                 Span::styled(
-                    format!(" {:>6}", super::format_cost(*cost, 0)),
-                    Style::default().fg(theme::WARM),
+                    format!(
+                        " {:>6}",
+                        super::format_cost_marked(
+                            *cost,
+                            state.models_without_pricing.contains(model),
+                            0
+                        )
+                    ),
+                    cost_total_style(state.models_without_pricing.contains(model)),
                 ),
-                Span::styled(format!(" {pct_label:>4}"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(" {pct_label:>4}"), Style::default().fg(theme::META)),
             ]));
         }
         lines.push(sep.clone());
@@ -1332,7 +1365,7 @@ fn insights_detail_metrics(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {display:<name_w$}"),
-                    Style::default().fg(theme::SECONDARY),
+                    Style::default().fg(theme::PROJECT),
                 ),
                 Span::styled(
                     "█".repeat(filled.min(bar_max)),
@@ -1344,11 +1377,11 @@ fn insights_detail_metrics(
                 ),
                 Span::styled(
                     format!(" {:>4} ses", ps.sessions),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::META),
                 ),
                 Span::styled(
                     format!(" {}", crate::format_number(ps.work_tokens)),
-                    Style::default().fg(theme::LABEL_MUTED),
+                    Style::default().fg(theme::TOKENS),
                 ),
             ]));
         }
@@ -1419,11 +1452,8 @@ fn insights_detail_metrics(
                     "░".repeat(bar_max.saturating_sub(filled)),
                     Style::default().fg(theme::SEPARATOR),
                 ),
-                Span::styled(
-                    format!(" {count:>5}"),
-                    Style::default().fg(theme::LABEL_MUTED),
-                ),
-                Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(" {count:>5}"), Style::default().fg(theme::VALUE)),
+                Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::META)),
             ]));
         };
 
@@ -1433,7 +1463,7 @@ fn insights_detail_metrics(
         // total, not against the grand total across categories.
         lines.push(Line::from(vec![Span::styled(
             " Top tools (% per category)",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )]));
         if !has_meta {
             // Fallback: top 6 built-in
@@ -1527,10 +1557,10 @@ fn insights_detail_metrics(
         let mcp_used = state.stats.sessions_using_mcp;
         let commands_used = state.stats.sessions_using_commands;
         lines.push(Line::from(vec![
-            Span::styled(" Usage by category  ", Style::default().fg(theme::DIM)),
+            Span::styled(" Usage by category  ", Style::default().fg(theme::LABEL)),
             Span::styled(
                 format!("of {total} session-days"),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             ),
         ]));
         // Order matches popup tabs: MCP → Skills → Commands → Subagents.
@@ -1566,7 +1596,7 @@ fn insights_detail_metrics(
                 Span::styled("   ", Style::default()),
                 Span::styled(format!("{name:<11}"), Style::default().fg(color)),
                 Span::styled(format!("{used:>4} ses"), Style::default().fg(color).bold()),
-                Span::styled(top_text, Style::default().fg(theme::DIM)),
+                Span::styled(top_text, Style::default().fg(theme::LABEL)),
             ]));
         }
         lines.push(sep.clone());
@@ -1599,12 +1629,12 @@ fn insights_detail_metrics(
         });
 
         lines.push(Line::from(vec![
-            Span::styled(" MCP Activation  ", Style::default().fg(theme::DIM)),
+            Span::styled(" MCP Activation  ", Style::default().fg(theme::LABEL)),
             Span::styled(
                 format!("{}/{configured_count}", active.len()),
                 Style::default().fg(theme::PRIMARY).bold(),
             ),
-            Span::styled(" active", Style::default().fg(theme::DIM)),
+            Span::styled(" active", Style::default().fg(theme::LABEL)),
         ]));
         for s in &active {
             let detail = match s.days_since_last_use(now) {
@@ -1619,7 +1649,7 @@ fn insights_detail_metrics(
                     format!("{:<20}", s.name),
                     Style::default().fg(theme::SUCCESS),
                 ),
-                Span::styled(detail, Style::default().fg(theme::DIM)),
+                Span::styled(detail, Style::default().fg(theme::LABEL)),
             ]));
         }
         for s in &underutilized {
@@ -1635,7 +1665,7 @@ fn insights_detail_metrics(
                     format!("{:<20}", s.name),
                     Style::default().fg(theme::WARNING),
                 ),
-                Span::styled(detail, Style::default().fg(theme::DIM)),
+                Span::styled(detail, Style::default().fg(theme::LABEL)),
             ]));
         }
         lines.push(sep.clone());
@@ -1661,7 +1691,7 @@ fn insights_detail_metrics(
                         " {name:<name_w$}",
                         name = lang.chars().take(name_w).collect::<String>()
                     ),
-                    Style::default().fg(theme::LABEL_MUTED),
+                    Style::default().fg(theme::VALUE),
                 ),
                 Span::styled(
                     "█".repeat(filled.min(bar_max)),
@@ -1671,11 +1701,8 @@ fn insights_detail_metrics(
                     "░".repeat(bar_max.saturating_sub(filled)),
                     Style::default().fg(theme::SEPARATOR),
                 ),
-                Span::styled(
-                    format!(" {count:>5}"),
-                    Style::default().fg(theme::LABEL_MUTED),
-                ),
-                Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(" {count:>5}"), Style::default().fg(theme::VALUE)),
+                Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::META)),
             ]));
         }
     }
@@ -1756,6 +1783,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 .iter()
                 .find(|(d, _)| *d == today)
                 .map_or(0.0, |(_, c)| *c);
+            let today_unpriced = super::any_unpriced(&state.daily_groups, |g, _| g.date == today);
 
             let diff_pct = if avg_total > 0 {
                 (today_total as f64 / avg_total as f64 * 100.0) as i32
@@ -1775,7 +1803,12 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             }
             let max_cumulative = running_today.max(running_avg).max(1);
 
-            let graph_height = 8usize;
+            // Fill the popup like the inline chart fills its panel: the rows
+            // left after the axis, hour labels, summary and one spare line.
+            const BELOW_GRAPH: usize = 4;
+            let graph_height = (popup_height.saturating_sub(2) as usize)
+                .saturating_sub(BELOW_GRAPH)
+                .max(8);
             let graph_width = inner_width.saturating_sub(10);
 
             let is_top_row = |r: usize| r == graph_height - 1;
@@ -1814,7 +1847,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     } else if today_in_row {
                         ('●', theme::SUCCESS)
                     } else if avg_in_row {
-                        ('○', theme::LABEL_MUTED)
+                        ('○', theme::META)
                     } else if today_below && avg_below {
                         ('│', theme::SEPARATOR)
                     } else if today_below {
@@ -1822,16 +1855,13 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     } else if avg_below {
                         ('┆', theme::FAINT)
                     } else {
-                        (' ', theme::DIM)
+                        (' ', theme::LABEL)
                     };
                     row_spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
                 }
 
                 let mut line_spans = vec![
-                    Span::styled(
-                        format!(" {y_label:>5} "),
-                        Style::default().fg(theme::LABEL_MUTED),
-                    ),
+                    Span::styled(format!(" {y_label:>5} "), Style::default().fg(theme::META)),
                     Span::raw("│"),
                 ];
                 line_spans.extend(row_spans);
@@ -1845,7 +1875,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             }
             lines.push(Line::from(Span::styled(
                 x_axis,
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::META),
             )));
 
             let mut hour_labels = "        ".to_string();
@@ -1860,7 +1890,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             }
             lines.push(Line::from(Span::styled(
                 hour_labels,
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(theme::TIME),
             )));
 
             // Neutral framing — "above average" is just "busier" for
@@ -1876,11 +1906,11 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     format!("{} full-day avg ", crate::format_number(avg_total)),
                     Style::default().fg(theme::TEXT_BRIGHT),
                 ),
-                Span::styled(format!("({diff_pct}%)"), Style::default().fg(theme::DIM)),
+                Span::styled(format!("({diff_pct}%)"), Style::default().fg(theme::META)),
                 Span::styled("  ", Style::default()),
                 Span::styled(
-                    format!("${:.2}", today_cost.max(0.0)),
-                    cost_style(today_cost),
+                    super::format_cost_marked(today_cost.max(0.0), today_unpriced, 2),
+                    cost_style_marked(today_cost, today_unpriced),
                 ),
             ]));
         }
@@ -1925,7 +1955,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                         Style::default().fg(if is_today {
                             theme::PRIMARY
                         } else {
-                            theme::LABEL_MUTED
+                            theme::META
                         }),
                     ),
                     Span::styled(
@@ -1940,7 +1970,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                         format!(" {:>5}/day", crate::format_number(avg)),
                         Style::default().fg(theme::PRIMARY),
                     ),
-                    Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
+                    Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::META)),
                 ]));
             }
 
@@ -1952,9 +1982,9 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     .find(|(wd, _)| *wd == max_day)
                     .map_or("?", |(_, l)| *l);
                 lines.push(Line::from(vec![
-                    Span::styled(" Most active: ", Style::default().fg(theme::DIM)),
+                    Span::styled(" Most active: ", Style::default().fg(theme::LABEL)),
                     Span::styled(max_label, Style::default().fg(theme::SUCCESS).bold()),
-                    Span::styled("  avg: ", Style::default().fg(theme::DIM)),
+                    Span::styled("  avg: ", Style::default().fg(theme::LABEL)),
                     Span::styled(
                         format!("{}/day", crate::format_number(avg_daily_tokens)),
                         Style::default().fg(theme::PRIMARY),
@@ -1963,7 +1993,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             } else {
                 lines.push(Line::from(Span::styled(
                     " No activity recorded",
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::PLACEHOLDER),
                 )));
             }
         }
@@ -2054,15 +2084,19 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 );
                 label_spans.push(Span::styled(
                     format!("{short_month:^col_width$}"),
-                    Style::default().fg(theme::LABEL_MUTED),
+                    Style::default().fg(theme::TIME),
                 ));
                 cost_spans.push(Span::styled(
                     format!(
                         "{:^width$}",
-                        super::format_cost(**cost, 0),
+                        super::format_cost_marked(
+                            **cost,
+                            super::month_unpriced(&state.daily_groups, month),
+                            0
+                        ),
                         width = col_width
                     ),
-                    Style::default().fg(theme::WARM),
+                    cost_total_style(super::month_unpriced(&state.daily_groups, month)),
                 ));
                 let tokens = monthly_tokens.get(*month).copied().unwrap_or(0);
                 tok_spans.push(Span::styled(
@@ -2089,7 +2123,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 // under API billing.
                 diff_spans.push(Span::styled(
                     format!("{diff_str:^col_width$}"),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::META),
                 ));
             }
             lines.push(Line::from(label_spans));
@@ -2108,10 +2142,17 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     / months.len() as u64
             };
             let mut summary_spans = vec![
-                Span::styled("  avg: ", Style::default().fg(theme::DIM)),
+                Span::styled("  avg: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
-                    format!("{}/mo", super::format_cost(avg_monthly, 0)),
-                    Style::default().fg(theme::PRIMARY),
+                    format!(
+                        "{}/mo",
+                        super::format_cost_marked(
+                            avg_monthly,
+                            !state.models_without_pricing.is_empty(),
+                            0
+                        )
+                    ),
+                    cost_total_style(!state.models_without_pricing.is_empty()),
                 ),
                 Span::styled(
                     format!("  {}/mo", crate::format_number(avg_monthly_tokens)),
@@ -2134,37 +2175,56 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     && days_elapsed > 0.0
                 {
                     let forecast = current_cost / days_elapsed * days_in_month;
-                    summary_spans.push(Span::styled(" | ", Style::default().fg(theme::DIM)));
-                    summary_spans.push(Span::styled("this mo: ", Style::default().fg(theme::DIM)));
+                    summary_spans.push(Span::styled(" | ", Style::default().fg(theme::LABEL)));
+                    summary_spans
+                        .push(Span::styled("this mo: ", Style::default().fg(theme::LABEL)));
                     summary_spans.push(Span::styled(
-                        super::format_cost(*current_cost, 0),
-                        Style::default().fg(theme::PRIMARY),
+                        super::format_cost_marked(
+                            *current_cost,
+                            super::month_unpriced(&state.daily_groups, &current_month_key),
+                            0,
+                        ),
+                        cost_total_style(super::month_unpriced(
+                            &state.daily_groups,
+                            &current_month_key,
+                        )),
                     ));
                     if days_elapsed < days_in_month {
                         summary_spans.push(Span::styled(
                             " · forecast: ",
-                            Style::default().fg(theme::DIM),
+                            Style::default().fg(theme::LABEL),
                         ));
                         summary_spans.push(Span::styled(
-                            super::format_cost(forecast, 0),
-                            Style::default().fg(theme::WARM),
+                            super::format_cost_marked(
+                                forecast,
+                                super::month_unpriced(&state.daily_groups, &current_month_key),
+                                0,
+                            ),
+                            cost_total_style(super::month_unpriced(
+                                &state.daily_groups,
+                                &current_month_key,
+                            )),
                         ));
                     }
                 }
             }
-            summary_spans.push(Span::styled(" | ", Style::default().fg(theme::DIM)));
-            summary_spans.push(Span::styled("total: ", Style::default().fg(theme::DIM)));
+            summary_spans.push(Span::styled(" | ", Style::default().fg(theme::LABEL)));
+            summary_spans.push(Span::styled("total: ", Style::default().fg(theme::LABEL)));
             // precision=0 matches the neighbouring avg / this mo / forecast
             // figures on the same line and avoids clipping the last digit
             // against the popup border.
             summary_spans.push(Span::styled(
-                super::format_cost(state.total_cost, 0),
-                Style::default().fg(theme::PRIMARY),
+                super::format_cost_marked(
+                    state.total_cost,
+                    !state.models_without_pricing.is_empty(),
+                    0,
+                ),
+                cost_total_style(!state.models_without_pricing.is_empty()),
             ));
             lines.push(Line::from(summary_spans));
             if total_months > visible_months {
                 lines.push(Line::from(vec![
-                    Span::styled("  ↑↓: scroll months  ", Style::default().fg(theme::DIM)),
+                    Span::styled("  ↑↓: scroll months  ", Style::default().fg(theme::LABEL)),
                     Span::styled(
                         format!(
                             "{}-{} of {}",
@@ -2172,7 +2232,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                             (skip + visible_months).min(total_months),
                             total_months
                         ),
-                        Style::default().fg(theme::LABEL_MUTED),
+                        Style::default().fg(theme::META),
                     ),
                 ]));
             }
@@ -2196,7 +2256,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             super::popup_block(&format!(" {panel_label} ")).title_bottom(Line::from(vec![
                 Span::styled(
                     " ←→: switch  Enter/i/q: close ",
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::LABEL),
                 ),
                 Span::styled(
                     format!("[{}/4] {} ", current_panel + 1, panel_label),

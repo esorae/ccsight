@@ -253,6 +253,17 @@ impl CostCalculator {
         );
 
         pricing.insert(
+            "claude-sonnet-5-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 2.0,
+                output_cost_per_mtok: 10.0,
+                cache_write_5m_cost_per_mtok: 2.50,
+                cache_write_1h_cost_per_mtok: 4.0,
+                cache_read_cost_per_mtok: 0.20,
+            },
+        );
+
+        pricing.insert(
             "claude-sonnet-5".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 2.0,
@@ -633,6 +644,26 @@ mod tests {
                 .unwrap()
                 .cache_read_cost_per_mtok,
             0.25
+        );
+    }
+
+    #[test]
+    fn sonnet_5_5_is_priced_under_its_own_name() {
+        let calculator = CostCalculator::new();
+        for id in ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"] {
+            let p = calculator.get_pricing(Some(id)).unwrap();
+            assert_eq!(p.input_cost_per_mtok, 2.0);
+            assert_eq!(p.output_cost_per_mtok, 10.0);
+            assert_eq!(p.cache_write_5m_cost_per_mtok, 2.50);
+            assert_eq!(p.cache_write_1h_cost_per_mtok, 4.0);
+            assert_eq!(p.cache_read_cost_per_mtok, 0.20);
+            assert_eq!(normalize_model_name(id), "Sonnet 5.5");
+        }
+        // The display-name lookup must find 5.5 itself, not Sonnet 5's entry.
+        assert!(
+            calculator
+                .get_pricing_by_display_name("Sonnet 5.5")
+                .is_some()
         );
     }
 
@@ -1066,6 +1097,7 @@ mod tests {
             "claude-opus-4-5",
             "claude-opus-4-1",
             "claude-opus-4",
+            "claude-sonnet-5-5",
             "claude-sonnet-5",
             "claude-sonnet-4-6",
             "claude-sonnet-4-5",

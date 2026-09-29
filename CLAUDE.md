@@ -139,6 +139,11 @@ govern, so they're seen at the moment of violation:
 
 **Compiler-enforced** (no rule needed):
 - AppState init parity — every `AppState { ... }` literal lists every field.
+- Text color by role — `ui::theme` keeps its text grays private, so a site
+  names a role (`TIME`, `LABEL`, `VALUE`…) and the same role can't fork into
+  two shades. Cost tiers sit behind `ui::cost_color` the same way: per-day
+  amounts go through `cost_style_marked`, multi-day sums through
+  `cost_total_style`.
 
 **Real data never becomes a literal**: lint #17's denylist is *reactive* — it
 only matches terms already listed, so a fresh project / directory / glob /

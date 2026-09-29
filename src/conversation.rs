@@ -175,7 +175,12 @@ pub fn load_conversation(
                 return None;
             }
 
+            // Claude Code's context-compaction recap and its own injected
+            // notes arrive as `user` entries nobody typed; their own roles
+            // keep them out of "You".
             let role = match message.role {
+                _ if e.is_compact_summary => "recap".to_string(),
+                _ if e.is_meta => "meta".to_string(),
                 Role::User => "user".to_string(),
                 Role::Assistant => "assistant".to_string(),
                 Role::Unknown => "unknown".to_string(),
@@ -237,7 +242,12 @@ pub fn recent_message_previews(
     n: usize,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for msg in messages.iter().rev() {
+    // A recap is not a turn; its opening lines are boilerplate.
+    for msg in messages
+        .iter()
+        .rev()
+        .filter(|m| m.role != "recap" && m.role != "meta")
+    {
         let Some(text) = msg.blocks.iter().find_map(|b| match b {
             ConversationBlock::Text(t) if !t.trim().is_empty() => Some(t.trim()),
             _ => None,
@@ -723,5 +733,34 @@ mod tests {
             vec![ConversationBlock::Thinking("t".into())],
         )];
         assert!(recent_message_previews(&messages, 6).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod recap_tests {
+    use super::*;
+
+    // Claude Code writes its compaction recap as a `user` entry. Rendering it
+    // as "You" credits the user with a summary they never typed.
+    #[test]
+    fn a_compaction_recap_gets_its_own_role_and_stays_out_of_recent_turns() {
+        let path = std::env::temp_dir().join(format!("ccsight-recap-{}.jsonl", std::process::id()));
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-03-20T10:00:00Z","message":{"role":"user","content":"real question"}}"#,
+            r#"{"type":"user","isCompactSummary":true,"timestamp":"2026-03-20T11:00:00Z","message":{"role":"user","content":"This session is being continued..."}}"#,
+            r#"{"type":"user","isMeta":true,"timestamp":"2026-03-20T12:00:00Z","message":{"role":"user","content":"Continue from where you left off."}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let messages = load_conversation(&path).unwrap();
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "recap", "meta"]);
+        let recent = recent_message_previews(&messages, 5);
+        assert!(
+            recent
+                .iter()
+                .all(|(_, t)| !t.contains("continued") && !t.contains("left off")),
+            "a recap or injected note showed as a recent turn: {recent:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

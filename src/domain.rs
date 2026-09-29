@@ -286,6 +286,12 @@ pub struct LogEntry {
     #[serde(rename = "isCompactSummary", default)]
     pub is_compact_summary: bool,
 
+    /// Set on user-role entries Claude Code injects itself (caveats, resume
+    /// nudges, scheduled prompts, messages from other sessions) — text nobody
+    /// typed, much of it not wrapped in a tag.
+    #[serde(rename = "isMeta", default)]
+    pub is_meta: bool,
+
     #[serde(rename = "userType")]
     pub user_type: Option<UserType>,
 

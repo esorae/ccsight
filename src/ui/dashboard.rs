@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use chrono::NaiveDate;
 
 use super::theme;
-use super::{calc_scroll, cost_style, format_cost};
+use super::{calc_scroll, cost_style_marked, cost_total_style, format_cost};
 use crate::AppState;
 use crate::aggregator::CostCalculator;
 
@@ -27,7 +27,7 @@ fn panel_styles(selected: bool) -> (Style, Style) {
     } else {
         (
             Style::default().fg(theme::BORDER),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )
     }
 }
@@ -106,7 +106,7 @@ pub(super) fn cost_caption_spans(gap_count: usize, long: bool) -> Vec<Span<'stat
             } else {
                 "cost (est.)"
             },
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )];
     }
     vec![
@@ -173,7 +173,7 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
         top_row[0],     // 0: Recent Costs
         top_row[1],     // 1: Top Projects
         bottom_row[0],  // 2: Model Tokens
-        bottom_row[1],  // 3: Tool Usage
+        bottom_row[1],  // 3: Ecosystem
         bottom_row[2],  // 4: Languages
         heatmap_row[0], // 5: Heatmap
         heatmap_row[1], // 6: Hourly Pattern
@@ -240,7 +240,7 @@ pub(super) fn empty_dashboard_lines() -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled(
             "Looked in ~/.claude/projects/**/*.jsonl — run `claude` once, then reopen",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         )),
     ]
 }
@@ -286,7 +286,7 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
-        Line::from(Span::styled("sessions", Style::default().fg(theme::DIM)))
+        Line::from(Span::styled("sessions", Style::default().fg(theme::LABEL)))
             .alignment(Alignment::Center),
     ])
     .block(Block::default().borders(Borders::NONE));
@@ -300,8 +300,11 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
-        Line::from(Span::styled("active days", Style::default().fg(theme::DIM)))
-            .alignment(Alignment::Center),
+        Line::from(Span::styled(
+            "active days",
+            Style::default().fg(theme::LABEL),
+        ))
+        .alignment(Alignment::Center),
     ])
     .block(Block::default().borders(Borders::NONE));
 
@@ -313,7 +316,7 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
-        Line::from(Span::styled("tokens", Style::default().fg(theme::DIM)))
+        Line::from(Span::styled("tokens", Style::default().fg(theme::LABEL)))
             .alignment(Alignment::Center),
     ])
     .block(Block::default().borders(Borders::NONE));
@@ -337,13 +340,7 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
     let cost_card = Paragraph::new(vec![
         Line::from(Span::styled(
             cost_text,
-            Style::default()
-                .fg(if pricing_gap_count == 0 {
-                    theme::WARM
-                } else {
-                    theme::WARNING
-                })
-                .add_modifier(Modifier::BOLD),
+            cost_total_style(pricing_gap_count > 0),
         ))
         .alignment(Alignment::Center),
         caption,
@@ -471,7 +468,7 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
             }
             month_row.push(Span::styled(
                 label.clone(),
-                Style::default().fg(theme::LABEL_SUBTLE),
+                Style::default().fg(theme::TIME),
             ));
             used_chars += label.len();
             prev_month = month;
@@ -495,10 +492,7 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
         if label_start > used_chars {
             let gap = label_start - used_chars;
             month_row.push(Span::raw(" ".repeat(gap)));
-            month_row.push(Span::styled(
-                label,
-                Style::default().fg(theme::LABEL_SUBTLE),
-            ));
+            month_row.push(Span::styled(label, Style::default().fg(theme::TIME)));
         }
     }
     lines.push(Line::from(month_row));
@@ -511,7 +505,7 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
         };
         let mut row_spans: Vec<Span> = vec![Span::styled(
             format!("{pad_str}{label:<4}"),
-            Style::default().fg(theme::LABEL_SUBTLE),
+            Style::default().fg(theme::TIME),
         )];
 
         for week in 0..weeks {
@@ -534,16 +528,16 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
     // tucked to the bottom-right.
     let date_label = Line::from(Span::styled(
         format!(" {start_str} - {end_str} "),
-        Style::default().fg(theme::LABEL_SUBTLE),
+        Style::default().fg(theme::TIME),
     ));
     let intensity_legend = Line::from(vec![
-        Span::styled("Less ", Style::default().fg(theme::LABEL_SUBTLE)),
+        Span::styled("Less ", Style::default().fg(theme::META)),
         Span::styled("■ ", Style::default().fg(theme::HEATMAP_EMPTY)),
         Span::styled("■ ", Style::default().fg(theme::HEATMAP_LOW)),
         Span::styled("■ ", Style::default().fg(theme::HEATMAP_MID)),
         Span::styled("■ ", Style::default().fg(theme::HEATMAP_HIGH)),
         Span::styled("■ ", Style::default().fg(theme::PRIMARY)),
-        Span::styled(" More ", Style::default().fg(theme::LABEL_SUBTLE)),
+        Span::styled(" More ", Style::default().fg(theme::META)),
     ])
     .alignment(Alignment::Right);
 
@@ -640,7 +634,7 @@ fn draw_hourly_pattern(
     // the final bar's hour window), giving a natural 0..24 axis.
     lines.push(Line::from(Span::styled(
         "0     6    12    18   24",
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::TIME),
     )));
 
     // Tie-break on the hour: HashMap iteration order is randomized, so a
@@ -666,7 +660,7 @@ fn draw_hourly_pattern(
         )]))
         .title_bottom(Line::from(Span::styled(
             peak_title,
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )));
 
     let paragraph = Paragraph::new(lines).centered().block(block);
@@ -708,10 +702,12 @@ fn draw_top_projects(
             let tokens_str = crate::format_number(stats.work_tokens);
 
             Row::new(vec![
-                Cell::from(format!("{}.", i + 1)).style(Style::default().fg(theme::DIM)),
+                Cell::from(format!("{}.", i + 1)).style(Style::default().fg(theme::LABEL)),
+                // Default fg, as every compact panel's name column, so the
+                // panels read as one set; role colors belong to the popups.
                 Cell::from(super::truncate_with_ellipsis(&dir_name, name_w)),
-                Cell::from(tokens_str).style(Style::default().fg(theme::PRIMARY)),
-                Cell::from(pct_str).style(Style::default().fg(theme::MUTED)),
+                Cell::from(tokens_str).style(Style::default().fg(theme::TOKENS)),
+                Cell::from(pct_str).style(Style::default().fg(theme::META)),
             ])
         })
         .collect();
@@ -793,11 +789,12 @@ fn draw_model_tokens(
             let rank = format!("{}.", i + 1);
             let pct = crate::text::format_pct(*tokens, total_tokens);
             Row::new(vec![
-                Cell::from(rank).style(Style::default().fg(theme::DIM)),
+                Cell::from(rank).style(Style::default().fg(theme::LABEL)),
+                // Default fg, matching the other compact panels' names.
                 Cell::from(super::truncate_with_ellipsis(name, name_w)),
                 Cell::from(crate::format_number(*tokens))
                     .style(Style::default().fg(theme::PRIMARY)),
-                Cell::from(pct).style(Style::default().fg(theme::DIM)),
+                Cell::from(pct).style(Style::default().fg(theme::META)),
             ])
         })
         .collect();
@@ -1109,7 +1106,7 @@ fn draw_tool_usage(
                 prefix_label,
                 Style::default().fg(*color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(middle, Style::default().fg(theme::DIM)),
+            Span::styled(middle, Style::default().fg(theme::LABEL)),
             Span::raw(" ".repeat(pad)),
             Span::styled("▶", Style::default().fg(arrow_color)),
         ]));
@@ -1133,12 +1130,12 @@ fn draw_tool_usage(
         if compress_tier2 {
             lines.push(Line::from(vec![Span::styled(
                 eco_top_row(&top_tools, inner_width as usize),
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(theme::LABEL),
             )]));
         } else {
             lines.push(Line::from(vec![Span::styled(
                 " Top tools",
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             )]));
             let name_w = (inner_width as usize).saturating_sub(15);
             for (name, count) in &top_tools {
@@ -1153,9 +1150,9 @@ fn draw_tool_usage(
                     ),
                     Span::styled(
                         format!(" {:>5}", crate::format_number(*count as u64)),
-                        Style::default().fg(theme::LABEL_MUTED),
+                        Style::default().fg(theme::VALUE),
                     ),
-                    Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
+                    Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::META)),
                 ]));
             }
         }
@@ -1347,18 +1344,18 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
             // Unknown extensions render dimmer so they're visually
             // distinguishable from the named language categories.
             let name_style = if *is_unknown {
-                Style::default().fg(theme::DIM)
+                Style::default().fg(theme::LABEL)
             } else {
                 Style::default()
             };
             Row::new(vec![
-                Cell::from(rank).style(Style::default().fg(theme::DIM)),
+                Cell::from(rank).style(Style::default().fg(theme::LABEL)),
                 Cell::from(super::truncate_with_ellipsis(name, name_w)).style(name_style),
                 // K/M formatting: a raw 6-digit count would be cut by the
                 // fixed cell width and read as a smaller number.
                 Cell::from(crate::format_number(*count as u64))
                     .style(Style::default().fg(theme::PRIMARY)),
-                Cell::from(pct_str).style(Style::default().fg(theme::MUTED)),
+                Cell::from(pct_str).style(Style::default().fg(theme::META)),
             ])
         })
         .collect();
@@ -1417,7 +1414,8 @@ fn draw_recent_costs(
         .map(|(i, (date, cost))| {
             let date_str = date.format("%m-%d (%a)").to_string();
             let cost_display = cost.max(0.0);
-            let cost_str = super::format_cost(cost_display, cost_precision);
+            let unpriced = super::any_unpriced(&state.daily_groups, |g, _| g.date == *date);
+            let cost_str = super::format_cost_marked(cost_display, unpriced, cost_precision);
             let tokens: u64 =
                 state
                     .daily_groups
@@ -1432,10 +1430,10 @@ fn draw_recent_costs(
                             .sum()
                     });
             Row::new(vec![
-                Cell::from(format!("{}.", i + 1)).style(Style::default().fg(theme::DIM)),
+                Cell::from(format!("{}.", i + 1)).style(Style::default().fg(theme::LABEL)),
                 Cell::from(date_str),
-                Cell::from(crate::format_number(tokens)).style(Style::default().fg(theme::DIM)),
-                Cell::from(cost_str).style(cost_style(*cost)),
+                Cell::from(crate::format_number(tokens)).style(Style::default().fg(theme::TOKENS)),
+                Cell::from(cost_str).style(cost_style_marked(*cost, unpriced)),
             ])
         })
         .collect();
@@ -1625,44 +1623,50 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
         String::from("→ prev —")
     };
 
+    let gap = super::any_unpriced(&state.daily_groups, |g, _| {
+        g.date.year() == today.year() && g.date.month() == today.month()
+    });
     let summary = vec![
-        Span::styled("  this mo: ", Style::default().fg(theme::DIM)),
+        Span::styled("  this mo: ", Style::default().fg(theme::LABEL)),
         Span::styled(
-            super::format_cost(mtd_cost, 0),
-            Style::default()
-                .fg(theme::PRIMARY)
-                .add_modifier(Modifier::BOLD),
+            super::format_cost_marked(mtd_cost, gap, 0),
+            cost_total_style(gap),
         ),
-        Span::styled(" · forecast: ", Style::default().fg(theme::DIM)),
-        Span::styled(super::format_cost(forecast, 0), cost_style(forecast)),
+        Span::styled(" · forecast: ", Style::default().fg(theme::LABEL)),
+        Span::styled(
+            super::format_cost_marked(forecast, gap, 0),
+            cost_total_style(gap),
+        ),
         Span::styled(
             format!(
                 " ({days_remaining}d left @ {}/day)  ",
                 super::format_cost(run_rate, 0)
             ),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::META),
         ),
-        Span::styled(delta_text, Style::default().fg(theme::DIM)),
+        Span::styled(delta_text, Style::default().fg(theme::META)),
     ];
 
     // Top model composition for the current month.
     let calculator = crate::aggregator::CostCalculator::global();
     let mut model_cost_mtd: std::collections::HashMap<String, f64> =
         std::collections::HashMap::new();
+    let mut model_unpriced_mtd: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for group in &state.daily_groups {
         if group.date.year() != today.year() || group.date.month() != today.month() {
             continue;
         }
+        // Subagents included, as in `this mo` above: shares of a total must
+        // be taken over the same sessions the total sums.
         for session in &group.sessions {
-            if session.is_subagent {
-                continue;
-            }
             for (model, tokens) in &session.day_tokens_by_model {
-                let c = calculator
-                    .calculate_cost(tokens, Some(model))
-                    .unwrap_or(0.0);
+                let c = calculator.calculate_cost(tokens, Some(model));
                 let normalized = crate::aggregator::normalize_model_name(model);
-                *model_cost_mtd.entry(normalized).or_insert(0.0) += c;
+                if c.is_none() {
+                    model_unpriced_mtd.insert(normalized.clone());
+                }
+                *model_cost_mtd.entry(normalized).or_insert(0.0) += c.unwrap_or(0.0);
             }
         }
     }
@@ -1671,27 +1675,31 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
 
     let mut model_line: Vec<Span> = vec![Span::styled(
         "  Top models  ",
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::LABEL),
     )];
     if mtd_cost > 0.0 && !model_costs.is_empty() {
         for (i, (name, cost)) in model_costs.iter().take(3).enumerate() {
             let pct_str = crate::text::format_pct_f64(*cost, mtd_cost);
             if i > 0 {
-                model_line.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+                model_line.push(Span::styled(" · ", Style::default().fg(theme::LABEL)));
             }
             model_line.push(Span::styled(
                 name.clone(),
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(super::model_color(name)),
             ));
+            let unpriced = model_unpriced_mtd.contains(name);
             model_line.push(Span::styled(
-                format!(" {} {pct_str}", super::format_cost(*cost, 0)),
-                Style::default().fg(theme::PRIMARY),
+                format!(
+                    " {} {pct_str}",
+                    super::format_cost_marked(*cost, unpriced, 0)
+                ),
+                cost_total_style(unpriced),
             ));
         }
     } else {
         model_line.push(Span::styled(
             "no spend this month yet",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         ));
     }
 
@@ -1700,18 +1708,20 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
     // entry in `state.project_labels` fall back to the bare project_name.
     let mut project_cost_mtd: std::collections::HashMap<String, f64> =
         std::collections::HashMap::new();
+    let mut project_unpriced_mtd: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for group in &state.daily_groups {
         if group.date.year() != today.year() || group.date.month() != today.month() {
             continue;
         }
         for session in &group.sessions {
-            if session.is_subagent {
-                continue;
-            }
             let cost: f64 = session.cost(calculator);
             *project_cost_mtd
                 .entry(session.project_name.clone())
                 .or_insert(0.0) += cost;
+            if session.has_unpriced_model(calculator) {
+                project_unpriced_mtd.insert(session.project_name.clone());
+            }
         }
     }
     let mut project_costs: Vec<(String, f64)> = project_cost_mtd.into_iter().collect();
@@ -1719,25 +1729,29 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
 
     let mut project_line: Vec<Span> = vec![Span::styled(
         "  Top projects ",
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::LABEL),
     )];
     if mtd_cost > 0.0 && !project_costs.is_empty() {
         for (i, (name, cost)) in project_costs.iter().take(3).enumerate() {
             let pct_str = crate::text::format_pct_f64(*cost, mtd_cost);
             if i > 0 {
-                project_line.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+                project_line.push(Span::styled(" · ", Style::default().fg(theme::LABEL)));
             }
             let label = state.project_label(name);
-            project_line.push(Span::styled(label, Style::default().fg(theme::LABEL_MUTED)));
+            project_line.push(Span::styled(label, Style::default().fg(theme::PROJECT)));
+            let unpriced = project_unpriced_mtd.contains(name);
             project_line.push(Span::styled(
-                format!(" {} {pct_str}", super::format_cost(*cost, 0)),
-                Style::default().fg(theme::PRIMARY),
+                format!(
+                    " {} {pct_str}",
+                    super::format_cost_marked(*cost, unpriced, 0)
+                ),
+                cost_total_style(unpriced),
             ));
         }
     } else {
         project_line.push(Span::styled(
             "no spend this month yet",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         ));
     }
 
@@ -1746,9 +1760,9 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
         state.daily_costs.iter().copied().collect();
     let spark = render_spark_line(today, 30, |d| cost_by_date.get(&d).copied().unwrap_or(0.0));
     let trend_line = vec![
-        Span::styled("  Daily $   ", Style::default().fg(theme::DIM)),
+        Span::styled("  Daily $   ", Style::default().fg(theme::LABEL)),
         Span::styled(spark, Style::default().fg(theme::PRIMARY)),
-        Span::styled("  past 30 days", Style::default().fg(theme::DIM)),
+        Span::styled("  past 30 days", Style::default().fg(theme::LABEL)),
     ];
 
     vec![
@@ -1843,28 +1857,28 @@ pub(crate) fn activity_header_lines(
     let (delta_text, delta_color) = if prev_tokens > 0 {
         (
             format!("→ prev {} tok", crate::format_number(prev_tokens)),
-            theme::DIM,
+            theme::META,
         )
     } else {
-        ("→ prev —".to_string(), theme::DIM)
+        ("→ prev —".to_string(), theme::META)
     };
 
     let summary = vec![
-        Span::styled("  Streak ", Style::default().fg(theme::DIM)),
+        Span::styled("  Streak ", Style::default().fg(theme::LABEL)),
         Span::styled(
             format!("{streak}d"),
             Style::default()
                 .fg(theme::PRIMARY)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" · This week ", Style::default().fg(theme::DIM)),
+        Span::styled(" · This week ", Style::default().fg(theme::LABEL)),
         Span::styled(
             crate::format_number(this_tokens),
             Style::default().fg(theme::PRIMARY),
         ),
         Span::styled(
             format!(" tok · {this_sess} sess · {this_days}/7d  "),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         ),
         Span::styled(delta_text, Style::default().fg(delta_color)),
     ];
@@ -1873,7 +1887,7 @@ pub(crate) fn activity_header_lines(
     let dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let mut dow_line: Vec<Span> = vec![Span::styled(
         "  Day-of-week (all-time)  ",
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::LABEL),
     )];
     for (i, name) in dow_names.iter().enumerate() {
         let bar = if dow_tokens[i] == 0 {
@@ -1886,7 +1900,7 @@ pub(crate) fn activity_header_lines(
         };
         dow_line.push(Span::styled(
             format!("{name} "),
-            Style::default().fg(theme::LABEL_MUTED),
+            Style::default().fg(theme::TIME),
         ));
         dow_line.push(Span::styled(
             format!("{bar}  "),
@@ -1922,11 +1936,11 @@ pub(crate) fn activity_header_lines(
                 .sum::<u64>() as f64
         });
         vec![
-            Span::styled("  Weekly tokens ", Style::default().fg(theme::DIM)),
+            Span::styled("  Weekly tokens ", Style::default().fg(theme::LABEL)),
             Span::styled(spark, Style::default().fg(theme::PRIMARY)),
             Span::styled(
                 format!("  past {TREND_WEEKS} weeks"),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             ),
         ]
     } else {
@@ -1934,9 +1948,9 @@ pub(crate) fn activity_header_lines(
             daily_tokens.get(&d).copied().unwrap_or(0) as f64
         });
         vec![
-            Span::styled("  Daily tokens ", Style::default().fg(theme::DIM)),
+            Span::styled("  Daily tokens ", Style::default().fg(theme::LABEL)),
             Span::styled(spark, Style::default().fg(theme::PRIMARY)),
-            Span::styled("  past 30 days", Style::default().fg(theme::DIM)),
+            Span::styled("  past 30 days", Style::default().fg(theme::LABEL)),
         ]
     };
 
@@ -1956,7 +1970,7 @@ pub(crate) fn activity_header_lines(
         .map(|(name, count)| (name.clone(), *count));
     let mut top_line: Vec<Span> = vec![Span::styled(
         "  This week  ",
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::LABEL),
     )];
     if let Some((name, tokens)) = top_project {
         let label = state.project_label(&name);
@@ -1968,11 +1982,11 @@ pub(crate) fn activity_header_lines(
     } else {
         top_line.push(Span::styled(
             "no activity yet",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         ));
     }
     if let Some((name, count)) = top_tool {
-        top_line.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+        top_line.push(Span::styled(" · ", Style::default().fg(theme::LABEL)));
         let short = crate::aggregator::format_tool_short(&name);
         top_line.push(Span::styled(short, Style::default().fg(theme::SUCCESS)));
         top_line.push(Span::styled(
@@ -1998,6 +2012,7 @@ pub(crate) struct WeeklyBucket {
     pub end_label: String,
     pub tokens: u64,
     pub cost: f64,
+    pub unpriced: bool,
     pub active_days: usize,
 }
 
@@ -2034,11 +2049,16 @@ pub(crate) fn weekly_activity(state: &AppState) -> Vec<WeeklyBucket> {
                 end_label: end.format("%m-%d").to_string(),
                 tokens: 0,
                 cost: 0.0,
+                unpriced: false,
                 active_days: 0,
             }
         });
         entry.tokens += tokens;
         entry.cost += cost;
+        entry.unpriced |= group
+            .sessions
+            .iter()
+            .any(|s| s.has_unpriced_model(CostCalculator::global()));
         entry.active_days += 1;
     }
 
@@ -2084,7 +2104,7 @@ fn push_month_divider_line(
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled("── ", Style::default().fg(theme::SEPARATOR)),
-        Span::styled(label, Style::default().fg(theme::LABEL_MUTED)),
+        Span::styled(label, Style::default().fg(theme::TIME)),
         Span::styled(format!(" {trail}"), Style::default().fg(theme::SEPARATOR)),
     ]));
 }
@@ -2176,16 +2196,14 @@ fn detail_panel_costs(
 
         let tokens = day_tok.get(date).copied().unwrap_or(0);
 
-        let rank_color = if is_empty { theme::FAINT } else { theme::DIM };
-        let date_color = if is_empty {
-            theme::FAINT
-        } else {
-            theme::LABEL_MUTED
-        };
+        let rank_color = if is_empty { theme::FAINT } else { theme::LABEL };
+        let date_color = if is_empty { theme::FAINT } else { theme::TIME };
+        let unpriced =
+            !is_empty && super::any_unpriced(&state.daily_groups, |g, _| g.date == *date);
         let cost_span_style = if is_empty {
             Style::default().fg(theme::FAINT)
         } else {
-            cost_style(cost)
+            cost_style_marked(cost, unpriced)
         };
 
         body.push(Line::from(vec![
@@ -2197,7 +2215,7 @@ fn detail_panel_costs(
             Span::raw(" "),
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
-                format!(" {}", super::format_cost(cost_display, 2)),
+                format!(" {}", super::format_cost_marked(cost_display, unpriced, 2)),
                 cost_span_style,
             ),
             Span::styled(
@@ -2226,9 +2244,18 @@ fn detail_panel_projects(
     let cursor = scroll;
     let selected_path = projects.get(cursor).map_or("", |(name, _)| name.as_str());
     let sort_label = state.dashboard_projects_sort.label();
-    let title = format!(" ◈ {selected_path}  · {sort_label} (s) ");
+    // Named like the other detail popups; the cursor row's full path follows
+    // because the rows show only the short project name.
+    let title = format!(" Projects · {selected_path}  · {sort_label} (s) ");
     let mut lines: Vec<Line> = Vec::new();
-    let max_tokens = projects.first().map_or(1, |(_, s)| s.work_tokens);
+    // Largest row, not the first: under the recent sort the first row can be
+    // small, which would overfill every bar below it.
+    let max_tokens = projects
+        .iter()
+        .map(|(_, s)| s.work_tokens)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let bar_width = 12usize;
     let name_width = content_width.saturating_sub(8);
     let spark_width = content_width.saturating_sub(10);
@@ -2332,6 +2359,7 @@ fn detail_panel_projects(
         let basename = name.rsplit('/').next().unwrap_or(name.as_str());
         let display_name = super::truncate_with_ellipsis(basename, name_width);
         let cost = project_cost.get(name.as_str()).copied().unwrap_or(0.0);
+        let unpriced = super::any_unpriced(&state.daily_groups, |_, s| &s.project_name == *name);
         let active_days = project_active_days.get(name.as_str()).copied().unwrap_or(0);
         let date_range = match (
             project_first_date.get(name.as_str()),
@@ -2351,12 +2379,12 @@ fn detail_panel_projects(
                 .fg(theme::TEXT_BRIGHT)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::SECONDARY)
+            Style::default().fg(theme::PROJECT)
         };
         let row_start = lines.len();
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(theme::PRIMARY)),
-            Span::styled(format!("{:>3}. ", i + 1), Style::default().fg(theme::DIM)),
+            Span::styled(format!("{:>3}. ", i + 1), Style::default().fg(theme::LABEL)),
             Span::styled(display_name, name_style),
         ]));
         lines.push(Line::from(vec![
@@ -2364,18 +2392,21 @@ fn detail_panel_projects(
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
                 format!(" {}", crate::format_number(stats.work_tokens)),
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(theme::TOKENS),
             ),
             Span::styled(
                 format!("  {} ses", stats.sessions),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::META),
             ),
             Span::styled(
-                format!("  {}", super::format_cost(cost, 0)),
-                super::cost_style(cost),
+                format!("  {}", super::format_cost_marked(cost, unpriced, 0)),
+                cost_total_style(unpriced),
             ),
-            Span::styled(format!("  {active_days}d"), Style::default().fg(theme::DIM)),
-            Span::styled(format!("  {date_range}"), Style::default().fg(theme::DIM)),
+            Span::styled(
+                format!("  {active_days}d"),
+                Style::default().fg(theme::META),
+            ),
+            Span::styled(format!("  {date_range}"), Style::default().fg(theme::TIME)),
         ]));
         if let Some(values) = all_resampled.get(name.as_str())
             && values.iter().any(|&v| v > 0)
@@ -2398,7 +2429,7 @@ fn detail_panel_projects(
         // border. `Paragraph` styles trailing area with the widget
         // style, not the line style, so explicit padding is needed.
         if is_selected {
-            let bg = theme::FAINT;
+            let bg = theme::SELECTED_BG;
             let sel_style = Style::default().bg(bg);
             for line in lines[row_start..row_end].iter_mut() {
                 let width = super::spans_width(&line.spans);
@@ -2496,7 +2527,9 @@ fn detail_panel_models(
     state.sort_models(&mut models);
 
     let total_tokens: u64 = models.iter().map(|(_, t, _)| *t).sum();
-    let max_tokens = models.first().map_or(1, |(_, t, _)| *t);
+    // Largest row, not the first: under the recent sort the first row can be
+    // small, which would overfill every bar below it.
+    let max_tokens = models.iter().map(|(_, t, _)| *t).max().unwrap_or(1).max(1);
     let bar_width = 15usize;
     let name_width = content_width.saturating_sub(50);
     let items_visible = visible_height / 3;
@@ -2568,13 +2601,16 @@ fn detail_panel_models(
         };
 
         let mut name_spans = vec![
-            Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
+            Span::styled(
+                format!("  {:>3}. ", i + 1),
+                Style::default().fg(theme::LABEL),
+            ),
             Span::styled(
                 format!("{display_name:<name_width$}"),
                 Style::default().fg(if unknown {
                     theme::WARNING
                 } else {
-                    theme::PRIMARY
+                    super::model_color(&display_name)
                 }),
             ),
         ];
@@ -2605,12 +2641,12 @@ fn detail_panel_models(
                 Style::default().fg(theme::PRIMARY),
             ),
             Span::styled(format!(" {pct:>3}"), Style::default().fg(bar_color)),
-            Span::styled(date_range, Style::default().fg(theme::DIM)),
+            Span::styled(date_range, Style::default().fg(theme::TIME)),
         ]));
         let info_color = if unknown {
             theme::WARNING
         } else {
-            theme::LABEL_MUTED
+            theme::VALUE
         };
         lines.push(Line::from(vec![
             Span::raw("       "),
@@ -2628,7 +2664,7 @@ fn detail_panel_models(
                         p.cache_write_1h_cost_per_mtok,
                         p.cache_read_cost_per_mtok,
                     ),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::META),
                 ),
             ]));
         }
@@ -2718,7 +2754,7 @@ fn detail_panel_ecosystem(
             "  Total: {} calls",
             crate::format_number(grand_total as u64)
         ),
-        Style::default().fg(theme::LABEL_MUTED),
+        Style::default().fg(theme::TOKENS),
     )]));
 
     let bar_width = 12usize;
@@ -2811,7 +2847,7 @@ fn detail_panel_ecosystem(
 
     // Build tab spans in main-tabs style:
     //   active: reversed color block (TEXT_DARK on PRIMARY, BOLD)
-    //   inactive: `N:` prefix in FAINT + label in section color (DIM for empty)
+    //   inactive: `N:` prefix in FAINT + label in section color (LABEL for empty)
     //   click areas recorded per-tab (absolute coords within popup)
     let mut tab_spans: Vec<Span> = vec![Span::raw("  ")];
     // The tab bar renders as the next line, so its absolute y is the top
@@ -2848,10 +2884,10 @@ fn detail_panel_ecosystem(
                     .add_modifier(Modifier::BOLD),
             ));
         } else if empty {
-            // Dim, no shortcut prefix
+            // Subdued label, no shortcut prefix
             let text = label_core.clone();
             tab_width = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
-            tab_spans.push(Span::styled(text, Style::default().fg(theme::DIM)));
+            tab_spans.push(Span::styled(text, Style::default().fg(theme::LABEL)));
         } else {
             // `N:` prefix (FAINT) + label (section color)
             let prefix = format!("{}:", i + 1);
@@ -2892,7 +2928,7 @@ fn detail_panel_ecosystem(
     if !tab_has_rows(active) {
         lines.push(Line::from(vec![Span::styled(
             "  (no data in this section)",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         )]));
     } else if active == 0 {
         // Tools tab: unified list of tool groups. "Built-in" is a
@@ -3022,7 +3058,7 @@ fn detail_panel_ecosystem(
                 rows.len(),
                 crate::format_number(total_calls as u64)
             ),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::META),
         )]));
         if total_calls > 0 && builtin_total > 0 && mcp_total > 0 {
             // Route through format_pct so a genuinely-small non-zero share
@@ -3039,7 +3075,7 @@ fn detail_panel_ecosystem(
                     ),
                     Style::default().fg(theme::CAT_BUILTIN),
                 ),
-                Span::styled(" · ", Style::default().fg(theme::DIM)),
+                Span::styled(" · ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     format!("MCP {} ({mcp_pct})", crate::format_number(mcp_total as u64),),
                     Style::default().fg(theme::CAT_MCP),
@@ -3049,7 +3085,7 @@ fn detail_panel_ecosystem(
         if stale_count > 0 {
             lines.push(Line::from(vec![Span::styled(
                 format!("  ⚠ {stale_count} stale (≥30d)"),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             )]));
         }
 
@@ -3185,7 +3221,7 @@ fn detail_panel_ecosystem(
                     .bg(theme::PRIMARY)
                     .add_modifier(Modifier::BOLD)
             } else if is_inactive {
-                Style::default().fg(theme::LABEL_SUBTLE)
+                Style::default().fg(theme::SUBDUED)
             } else {
                 Style::default().fg(row_color)
             };
@@ -3193,31 +3229,35 @@ fn detail_panel_ecosystem(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {arrow} "),
-                    Style::default().fg(if expanded { row_color } else { theme::DIM }),
+                    Style::default().fg(if expanded { row_color } else { theme::LABEL }),
                 ),
-                Span::styled(format!("{:>2}. ", i + 1), Style::default().fg(theme::DIM)),
+                Span::styled(format!("{:>2}. ", i + 1), Style::default().fg(theme::LABEL)),
                 Span::styled(format!("{display_name:<group_name_width$}"), name_style),
                 Span::raw(" "),
                 Span::styled(bar, Style::default().fg(bar_color)),
                 Span::styled(
                     format!(" {:>5}", crate::format_number(agg.calls as u64)),
-                    Style::default().fg(theme::LABEL_MUTED),
+                    Style::default().fg(theme::VALUE),
                 ),
-                Span::styled(format!(" {pct_str:>3}"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(" {pct_str:>3}"), Style::default().fg(theme::META)),
                 Span::styled(
                     format!(
                         " · {tool_count} tool{}",
                         if tool_count == 1 { "" } else { "s" }
                     ),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::META),
                 ),
                 Span::styled(
                     format!(" · {sessions:>3} ses"),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::META),
                 ),
                 Span::styled(
                     format!(" · {last_used_str}"),
-                    Style::default().fg(if is_stale { theme::WARNING } else { theme::DIM }),
+                    Style::default().fg(if is_stale {
+                        theme::WARNING
+                    } else {
+                        theme::TIME
+                    }),
                 ),
                 Span::styled(
                     if is_stale { " ⚠" } else { "" },
@@ -3273,18 +3313,21 @@ fn detail_panel_ecosystem(
                     };
                     lines.push(Line::from(vec![
                         Span::raw("       "),
-                        Span::styled(format!("{:>2}. ", ti + 1), Style::default().fg(theme::DIM)),
+                        Span::styled(
+                            format!("{:>2}. ", ti + 1),
+                            Style::default().fg(theme::LABEL),
+                        ),
                         Span::styled(format!("{t_name:<tool_name_width$}"), t_name_style),
                         Span::raw(" "),
                         Span::styled(t_bar, Style::default().fg(bar_color)),
                         Span::styled(
                             format!(" {:>5}", crate::format_number(*tcalls as u64)),
-                            Style::default().fg(theme::LABEL_MUTED),
+                            Style::default().fg(theme::VALUE),
                         ),
-                        Span::styled(format!(" {t_pct:>3}"), Style::default().fg(theme::DIM)),
+                        Span::styled(format!(" {t_pct:>3}"), Style::default().fg(theme::META)),
                         Span::styled(
                             format!(" · {t_ses:>3} ses"),
-                            Style::default().fg(theme::DIM),
+                            Style::default().fg(theme::META),
                         ),
                     ]));
                 }
@@ -3324,7 +3367,7 @@ fn detail_panel_ecosystem(
                 display_uniq,
                 crate::format_number(sec.total as u64)
             ),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::META),
         )]));
         // True max — `items` may be sorted by recency (not call count), so
         // `first()` is NOT necessarily the largest. Using it as the bar
@@ -3360,7 +3403,7 @@ fn detail_panel_ecosystem(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {:>3}. ", row_idx + 1),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::LABEL),
                 ),
                 Span::styled(
                     format!("{display_name:<name_width$}"),
@@ -3368,15 +3411,12 @@ fn detail_panel_ecosystem(
                 ),
                 Span::raw(" "),
                 Span::styled(bar, Style::default().fg(bar_color)),
-                Span::styled(
-                    format!(" {count:>4}"),
-                    Style::default().fg(theme::LABEL_MUTED),
-                ),
-                Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
-                Span::styled(format!(" · {ses:>3} ses"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(" {count:>4}"), Style::default().fg(theme::VALUE)),
+                Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::META)),
+                Span::styled(format!(" · {ses:>3} ses"), Style::default().fg(theme::META)),
                 Span::styled(
                     format!(" · {last_used_str}"),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::TIME),
                 ),
             ]));
             row_idx += 1;
@@ -3389,18 +3429,18 @@ fn detail_panel_ecosystem(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {:>3}. ", row_idx + 1),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::LABEL),
                 ),
                 Span::styled(
                     format!("{display_name:<name_width$}"),
-                    Style::default().fg(theme::LABEL_SUBTLE),
+                    Style::default().fg(theme::SUBDUED),
                 ),
                 Span::raw(" "),
                 Span::styled(bar_empty.clone(), Style::default().fg(theme::SEPARATOR)),
-                Span::styled("    0", Style::default().fg(theme::DIM)),
-                Span::styled("  0%", Style::default().fg(theme::DIM)),
-                Span::styled("   ·   0 ses", Style::default().fg(theme::DIM)),
-                Span::styled(" · never", Style::default().fg(theme::DIM)),
+                Span::styled("    0", Style::default().fg(theme::SUBDUED)),
+                Span::styled("  0%", Style::default().fg(theme::SUBDUED)),
+                Span::styled("   ·   0 ses", Style::default().fg(theme::SUBDUED)),
+                Span::styled(" · never", Style::default().fg(theme::SUBDUED)),
             ]));
             row_idx += 1;
         }
@@ -3443,7 +3483,7 @@ fn detail_panel_languages(
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             "  File types touched by tool calls (Read, Edit, Write, etc.)",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )),
         Line::from(""),
     ];
@@ -3507,16 +3547,12 @@ fn detail_panel_languages(
         let bar = crate::text::hbar(filled, bar_width);
         let pct_str = crate::text::format_pct(count as u64, total_usage as u64);
         let name_label = super::truncate_with_ellipsis(&display_name, name_width);
-        let name_color = if is_known {
-            theme::LABEL_MUTED
-        } else {
-            theme::DIM
-        };
+        let name_color = if is_known { theme::VALUE } else { theme::LABEL };
 
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {:>3}. ", rank + 1),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             ),
             Span::styled(
                 format!("{name_label:<name_width$}"),
@@ -3528,7 +3564,7 @@ fn detail_panel_languages(
                 format!(" {:>6}", crate::format_number(count as u64)),
                 Style::default().fg(theme::TEXT_BRIGHT),
             ),
-            Span::styled(format!(" {pct_str:>4}"), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {pct_str:>4}"), Style::default().fg(theme::META)),
         ]));
 
         if is_known && let Some(exts) = ext_by_lang.get(name.as_str()) {
@@ -3555,7 +3591,7 @@ fn detail_panel_languages(
                 if needed > max_line_width && !at_start {
                     lines.push(Line::from(Span::styled(
                         current_line.clone(),
-                        Style::default().fg(theme::DIM),
+                        Style::default().fg(theme::LABEL),
                     )));
                     *current_line = format!("{indent}{part}");
                 } else {
@@ -3585,7 +3621,7 @@ fn detail_panel_languages(
             if current_line.len() > indent.len() {
                 lines.push(Line::from(Span::styled(
                     current_line,
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::LABEL),
                 )));
             }
         }
@@ -3594,7 +3630,7 @@ fn detail_panel_languages(
     if entries.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No language data available",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         )));
     }
     (title, lines)
@@ -3621,10 +3657,13 @@ fn detail_panel_activity_weekly(
         let bar_color = theme::ramp_color(theme::RAMP_TEAL, intensity);
         let bar = crate::text::hbar(filled, bar_width);
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
+            Span::styled(
+                format!("  {:>3}. ", i + 1),
+                Style::default().fg(theme::LABEL),
+            ),
             Span::styled(
                 format!("{} ({}–{})", w.label, w.start_label, w.end_label),
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(theme::TIME),
             ),
             Span::raw(" "),
             Span::styled(bar, Style::default().fg(bar_color)),
@@ -3633,12 +3672,12 @@ fn detail_panel_activity_weekly(
                 Style::default().fg(theme::PRIMARY),
             ),
             Span::styled(
-                format!(" {:>6}", format_cost(w.cost, 0)),
-                cost_style(w.cost),
+                format!(" {:>6}", super::format_cost_marked(w.cost, w.unpriced, 0)),
+                cost_total_style(w.unpriced),
             ),
             Span::styled(
                 format!(" {}d", w.active_days),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::META),
             ),
         ]));
     }
@@ -3748,7 +3787,7 @@ fn detail_panel_activity_daily(
         let (rank_color, date_color, work_color) = if is_empty {
             (theme::FAINT, theme::FAINT, theme::FAINT)
         } else {
-            (theme::DIM, theme::LABEL_MUTED, theme::PRIMARY)
+            (theme::LABEL, theme::TIME, theme::PRIMARY)
         };
 
         body.push(Line::from(vec![
@@ -3825,14 +3864,14 @@ fn detail_panel_hourly(
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {:>2}:00-{:>2}:00 ", hour, hour + 1),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::TIME),
             ),
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
                 format!(" {:>9}", crate::format_number(tokens)),
                 Style::default().fg(theme::PRIMARY),
             ),
-            Span::styled(format!(" {pct:>4}"), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {pct:>4}"), Style::default().fg(theme::META)),
         ]));
     }
     (title, lines)
@@ -4037,10 +4076,10 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 } else {
                     " ↑↓: scroll  q: close "
                 },
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             ),
             Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
-            Span::styled(position_info, Style::default().fg(theme::DIM)),
+            Span::styled(position_info, Style::default().fg(theme::META)),
         ])));
 
     frame.render_widget(popup, popup_area);

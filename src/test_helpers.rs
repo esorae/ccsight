@@ -23,6 +23,7 @@ pub mod helpers {
             day_input_tokens: 0,
             day_output_tokens: 0,
             day_user_msgs: 0,
+            day_prompts: 0,
             day_assistant_msgs: 0,
             day_tokens_by_model: HashMap::new(),
             day_hourly_activity: HashMap::new(),
@@ -37,6 +38,7 @@ pub mod helpers {
             first_user_message: None,
             model: None,
             is_subagent: false,
+            parent_path: None,
             is_continued: false,
             line_churn: Default::default(),
         }
@@ -119,6 +121,7 @@ pub mod helpers {
             live_active: Vec::new(),
             live_paused: Vec::new(),
             live_selected: 0,
+            last_input_at: None,
             live_scroll: 0,
             live_paused_scroll: 0,
             live_has_snapshot_history: false,

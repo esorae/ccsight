@@ -378,16 +378,14 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
         }
         KeyCode::Char('C') => {
             let no_loading_panes = state.panes.iter().all(|p| !p.loading);
-            if no_loading_panes
-                && state.panes.len() < MAX_PANES
-                && let Some(group) = state.daily_groups.get(state.selected_day)
-            {
-                let sessions: Vec<_> = group.user_sessions().collect();
-                if let Some(session) = sessions.get(state.selected_session) {
-                    state
-                        .panes
-                        .push(ConversationPane::load_from(&session.file_path));
-                    state.active_pane_index = Some(state.panes.len() - 1);
+            if no_loading_panes && let Some(group) = state.daily_groups.get(state.selected_day) {
+                let path = group
+                    .user_sessions()
+                    .nth(state.selected_session)
+                    .map(|s| s.file_path.clone());
+                if let Some(path) = path
+                    && open_or_focus_pane(state, &path)
+                {
                     state.conv_list_mode = ConvListMode::Day;
                     state.show_conversation = true;
                     state.active_popup = crate::ActivePopup::None;
@@ -447,6 +445,29 @@ fn copy_resume_command(state: &mut AppState, jsonl_path: &std::path::Path) {
         }
         None => state.toast("Resume dir unknown — use the `claude --resume` picker"),
     }
+}
+
+/// Open `path` in a new pane, or focus the pane already showing it — a second
+/// pane of one transcript scrolls and searches identically, so it adds nothing.
+/// A full set of panes says so rather than ignoring the key. Returns whether a
+/// pane now shows `path`.
+fn open_or_focus_pane(state: &mut AppState, path: &std::path::Path) -> bool {
+    if let Some(i) = state
+        .panes
+        .iter()
+        .position(|p| p.file_path.as_deref() == Some(path))
+    {
+        state.active_pane_index = Some(i);
+        state.toast(format!("Already open in pane {}", i + 1));
+        return true;
+    }
+    if state.panes.len() >= MAX_PANES {
+        state.toast(format!("{MAX_PANES} panes open — X closes the focused one"));
+        return false;
+    }
+    state.panes.push(ConversationPane::load_from(path));
+    state.active_pane_index = Some(state.panes.len() - 1);
+    true
 }
 
 /// Open the `TitleEdit` popup for `session`, prefilled with its current title
@@ -767,6 +788,11 @@ pub(crate) fn handle_conversation_key(
         // Pairs with `C` (open a pane). Esc no longer removes panes, so this
         // is the only way to drop one without closing the whole view.
         KeyCode::Char('X') => {
+            if state.active_pane_index.is_none() && !state.panes.is_empty() {
+                // The list has focus; say which key reaches a pane instead of
+                // letting the close key do nothing.
+                state.toast("Focus a pane (1-4) to close it".to_string());
+            }
             if let Some(idx) = state.active_pane_index {
                 state.panes.remove(idx);
                 if state.panes.is_empty() {
@@ -885,13 +911,11 @@ pub(crate) fn handle_conversation_key(
             // without escaping the conversation view first).
             let no_loading = state.panes.iter().all(|p| !p.loading);
             if no_loading
-                && state.panes.len() < MAX_PANES
                 // Mode-aware, like the digit keys: the day list's Nth session
                 // is a different one while Pinned / Live is showing.
                 && let Some(file_path) = get_conv_session_file(state, state.selected_session)
             {
-                state.panes.push(ConversationPane::load_from(&file_path));
-                state.active_pane_index = Some(state.panes.len() - 1);
+                open_or_focus_pane(state, &file_path);
             }
         }
         KeyCode::BackTab if state.active_pane_index.is_none() => {
@@ -1072,14 +1096,12 @@ pub(crate) fn handle_conversation_key(
         KeyCode::Char('n') => {
             if let Some(idx) = state.active_pane_index
                 && let Some(pane) = state.panes.get_mut(idx)
-            {
-                if let Some(&(next_pos, _)) = pane
+                && let Some(&(next_pos, _)) = pane
                     .message_lines
                     .iter()
                     .find(|&&(pos, _)| pos > pane.scroll + 2)
-                {
-                    pane.scroll = next_pos;
-                }
+            {
+                pane.scroll = next_pos;
             }
         }
         KeyCode::Char('N') => {
@@ -1588,15 +1610,15 @@ pub(crate) fn handle_default_key(
             let no_loading = state.panes.iter().all(|p| !p.loading);
             if state.tab == Tab::Daily
                 && no_loading
-                && state.panes.len() < MAX_PANES
                 && let Some(group) = state.daily_groups.get(state.selected_day)
             {
-                let sessions: Vec<_> = group.user_sessions().collect();
-                if let Some(session) = sessions.get(state.selected_session) {
-                    state
-                        .panes
-                        .push(ConversationPane::load_from(&session.file_path));
-                    state.active_pane_index = Some(state.panes.len() - 1);
+                let path = group
+                    .user_sessions()
+                    .nth(state.selected_session)
+                    .map(|s| s.file_path.clone());
+                if let Some(path) = path
+                    && open_or_focus_pane(state, &path)
+                {
                     state.conv_list_mode = ConvListMode::Day;
                     state.show_conversation = true;
                 }
@@ -1878,7 +1900,7 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
                 state.mcp_selected_tool = None;
             }
         }
-        // Tab/BackTab + ←/→ + h/l all cycle the Tool Usage section.
+        // Tab/BackTab + ←/→ + h/l all cycle the Ecosystem section.
         // Forward (Tab / Right / l) advances; backward (BackTab /
         // Left / h) retreats. Mirrors number keys 1-4.
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') if state.dashboard_panel == 3 => {
@@ -1975,6 +1997,7 @@ pub(crate) fn handle_search_mode_key(
             state.search_selected = 0;
             state.search_task = None;
             state.searching = false;
+            crate::supersede_content_scan();
             state.search_history.reset_cursor();
             if let Some((tab, day, session, show_conv)) = state.search_saved_state.take() {
                 state.tab = tab;
@@ -2024,6 +2047,7 @@ pub(crate) fn handle_search_mode_key(
                 // (navigation keys don't consume the selection's text).
                 pane.search_select_all = true;
                 pane.search_current = 0;
+                pane.search_seed_day = result.message_date;
                 // Messages load async; the draw recomputes matches once they
                 // land and this flag then peeks + centers the first hit.
                 pane.pending_search_scroll = true;
@@ -2442,6 +2466,41 @@ mod tests {
         assert!(state.panes.is_empty());
     }
 
+    // A second pane of the transcript already on screen scrolls and searches
+    // identically; `C` on it must focus the open pane instead of adding one.
+    #[test]
+    fn capital_c_focuses_the_pane_already_showing_the_session() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let mut s = make_session("~/proj", None, None);
+        s.file_path = std::path::PathBuf::from("/tmp/test/open.jsonl");
+        let day = chrono::Local::now().date_naive();
+        let mut state =
+            crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(day, vec![s])]);
+        state.show_conversation = true;
+        state.conv_list_mode = ConvListMode::Day;
+        let mut open = conv_test_pane(&["a"]);
+        open.file_path = Some(std::path::PathBuf::from("/tmp/test/open.jsonl"));
+        state.panes = vec![conv_test_pane(&["b"]), open];
+        state.active_pane_index = None; // the list has focus, cursor on the session
+        state.selected_session = 0;
+
+        // The real session lookup: `conv_key` stubs it out to `None`.
+        handle_conversation_key(
+            &mut state,
+            KeyEvent::from(KeyCode::Char('C')),
+            noop,
+            noop,
+            crate::get_conv_session_file,
+            crate::get_conv_session_count,
+        );
+        assert_eq!(state.panes.len(), 2, "a duplicate pane was opened");
+        assert_eq!(
+            state.active_pane_index,
+            Some(1),
+            "the open pane was not focused"
+        );
+    }
+
     // Pairs with `C`. Esc no longer removes panes, so without this key a
     // second pane could only be dropped by closing the whole view.
     #[test]
@@ -2530,6 +2589,7 @@ mod tests {
             snippet: Some("…".to_string()),
             match_type: crate::search::SearchMatchType::Content,
             session_path: None,
+            message_date: None,
         }];
         fn opener(state: &mut AppState) {
             state.panes.push(crate::ConversationPane::default());

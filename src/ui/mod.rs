@@ -30,10 +30,17 @@ fn resolved_title<'a>(
     titles: &'a std::collections::HashMap<std::path::PathBuf, String>,
     s: &'a SessionInfo,
 ) -> Option<&'a str> {
-    titles
-        .get(&s.file_path)
-        .map(String::as_str)
-        .or_else(|| s.display_title())
+    let cached = titles.get(&s.file_path).map(String::as_str);
+    // A title the user set wins: on disk (`custom_title`), or a rename only the
+    // cache holds so far (it then differs from the slice's own title).
+    let user_named =
+        s.custom_title.is_some() || cached.is_some_and(|t| Some(t) != s.display_title());
+    // Otherwise ccsight's own generation calls keep their row but not their
+    // prompt: the prompt text as a title reads like the user's work.
+    if !user_named && let Some(label) = s.ccsight_generated() {
+        return Some(label);
+    }
+    cached.or_else(|| s.display_title())
 }
 
 pub mod theme {
@@ -41,8 +48,6 @@ pub mod theme {
 
     // Base: Terracotta orange
     pub const PRIMARY: Color = Color::Rgb(218, 119, 86);
-    // Muted sand
-    pub const SECONDARY: Color = Color::Rgb(168, 154, 140);
     // Sage green (warm)
     pub const SUCCESS: Color = Color::Rgb(130, 166, 110);
     // Amber gold
@@ -61,22 +66,55 @@ pub mod theme {
 
     // Neutral tones
     pub const WARM: Color = Color::Rgb(175, 145, 125);
-    pub const MUTED: Color = Color::Rgb(130, 120, 110);
-    pub const DIM: Color = Color::Rgb(140, 130, 120);
+    /// Barely above the background: fills, empty-state filler, decoration,
+    /// and shortcut / rank digits kept quiet on purpose. Never for text that
+    /// is meant to be read.
     pub const FAINT: Color = Color::Rgb(55, 50, 48);
     pub const BORDER: Color = Color::Rgb(90, 85, 80);
     pub const SEPARATOR: Color = Color::Rgb(60, 55, 50);
-
-    // Text colors
     pub const TEXT_BRIGHT: Color = Color::Rgb(240, 235, 230);
     pub const TEXT_DARK: Color = Color::Rgb(30, 28, 26);
-    pub const LABEL_MUTED: Color = Color::Rgb(150, 145, 140);
-    pub const LABEL_SUBTLE: Color = Color::Rgb(125, 120, 115);
+
+    // Text grays stay private: two grays a few points apart read as one, so
+    // picking by shade forks the same role across screens. Callers pick the
+    // role below; a new role gets a name here, not a new gray.
+    const GRAY_META: Color = Color::Rgb(125, 120, 115);
+    const GRAY_LABEL: Color = Color::Rgb(140, 130, 120);
+    const GRAY_VALUE: Color = Color::Rgb(168, 154, 140);
+
+    /// Clock times, dates, durations and "N ago".
+    pub const TIME: Color = GRAY_META;
+    /// A time inside the last few minutes.
+    pub const TIME_RECENT: Color = ACCENT;
+    pub const TOKENS: Color = PRIMARY;
+    /// A grand total, month-to-date or forecast (`cost_total_style`).
+    pub const COST_TOTAL: Color = WARM;
+    pub const PROJECT: Color = WARM;
+    pub const SESSION_ID: Color = GRAY_META;
+    pub const TITLE: Color = TEXT_BRIGHT;
+    /// Quoted message text: last prompt, previews, snippets.
+    pub const SNIPPET: Color = GRAY_LABEL;
+    /// Counts, percentages and other figures beside the main number.
+    pub const META: Color = GRAY_META;
+    /// Field names, captions, footer action words, inline hints.
+    pub const LABEL: Color = GRAY_LABEL;
+    /// A field's value; brighter than its `LABEL`.
+    pub const VALUE: Color = GRAY_VALUE;
+    /// Section headings inside a popup (caller adds bold).
+    pub const HEADER: Color = PRIMARY;
+    /// Empty, loading and truncated-content notices.
+    pub const PLACEHOLDER: Color = GRAY_LABEL;
+    /// A row kept for completeness that must not compete with its neighbours.
+    pub const SUBDUED: Color = GRAY_META;
+    pub const SELECTED_BG: Color = FAINT;
 
     // Model colors
     pub const MODEL_OPUS: Color = Color::Rgb(170, 120, 200);
     pub const MODEL_SONNET: Color = Color::Rgb(100, 160, 210);
     pub const MODEL_HAIKU: Color = Color::Rgb(130, 190, 160);
+    /// Fable and Mythos, the top tier. Lighter and yellower than `WARNING`'s
+    /// amber so a priced top-tier name never reads as an unpriced one.
+    pub const MODEL_FABLE: Color = Color::Rgb(240, 205, 110);
 
     // Special elements
     pub const BRANCH: Color = Color::Rgb(120, 140, 170);
@@ -101,7 +139,7 @@ pub mod theme {
     pub const CAT_BUILTIN: Color = SUCCESS;
     pub const CAT_MCP: Color = ACCENT;
     pub const CAT_SKILLS: Color = WARNING;
-    pub const CAT_COMMANDS: Color = SECONDARY;
+    pub const CAT_COMMANDS: Color = GRAY_VALUE;
     pub const CAT_SUBAGENTS: Color = LINK;
 
     // PRIMARY color base values for dynamic intensity
@@ -117,10 +155,6 @@ pub mod theme {
             (PRIMARY_B * intensity) as u8,
         )
     }
-
-    /// Highlighted-row background shared by the list popups (filter /
-    /// project); one constant so the "current row" color can't fork.
-    pub const SELECTION_BG: Color = Color::Rgb(40, 50, 60);
 
     /// `(base, per-channel range)` for the intensity ramps behind category
     /// bar charts: `ramp_color` = base + range × intensity per channel.
@@ -257,25 +291,83 @@ pub(crate) use crate::aggregator::{
     aggregate_monthly_costs, aggregate_monthly_tokens, aggregate_weekday_avg,
 };
 
-pub fn cost_style(cost: f64) -> Style {
-    // Five-tier scale tuned for daily spend on Anthropic API. Wider bands
-    // than the original three-cutoff scheme so heavy-usage days don't all
-    // collapse into the same color; the top tier surfaces unusually large
-    // days at a glance without further inspection.
-    let c = cost.max(0.0);
-    let color = if c > 300.0 {
-        theme::CRITICAL
-    } else if c > 100.0 {
-        theme::DANGER
-    } else if c > 60.0 {
-        theme::ERROR
-    } else if c > 20.0 {
-        theme::WARNING
-    } else {
-        theme::SUCCESS
-    };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
+/// Whether any session matching `pick` used a model without a price — the
+/// figure summed over them is then a lower bound and must carry the mark.
+pub(crate) fn any_unpriced(
+    groups: &[crate::aggregator::DailyGroup],
+    pick: impl Fn(&crate::aggregator::DailyGroup, &SessionInfo) -> bool,
+) -> bool {
+    let calculator = crate::aggregator::CostCalculator::global();
+    groups
+        .iter()
+        .flat_map(|g| g.sessions.iter().map(move |s| (g, s)))
+        .any(|(g, s)| pick(g, s) && s.has_unpriced_model(calculator))
 }
+
+/// [`any_unpriced`] over one `"YYYY-MM"` month.
+pub(crate) fn month_unpriced(groups: &[crate::aggregator::DailyGroup], key: &str) -> bool {
+    use chrono::Datelike;
+    let Some((y, m)) = key
+        .split_once('-')
+        .and_then(|(y, m)| Some((y.parse::<i32>().ok()?, m.parse::<u32>().ok()?)))
+    else {
+        return false;
+    };
+    any_unpriced(groups, |g, _| g.date.year() == y && g.date.month() == m)
+}
+
+/// Cost colors live in one module so the per-day tier scale can't be called
+/// bare: an unpriced figure has to be marked, and a multi-day sum has to use
+/// the total color instead of tiers it always tops.
+mod cost_color {
+    use super::{Modifier, Style, theme};
+
+    /// Five tiers tuned for one day's or one session's spend.
+    fn tier(cost: f64) -> Style {
+        let c = cost.max(0.0);
+        let color = if c > 300.0 {
+            theme::CRITICAL
+        } else if c > 100.0 {
+            theme::DANGER
+        } else if c > 60.0 {
+            theme::ERROR
+        } else if c > 20.0 {
+            theme::WARNING
+        } else {
+            theme::SUCCESS
+        };
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    }
+
+    /// Style companion to [`super::format_cost_marked`]: unknown-pricing
+    /// figures render in the warning color instead of the tier scale, which
+    /// would paint a fake zero as cheap green.
+    pub(crate) fn cost_style_marked(cost: f64, unpriced: bool) -> Style {
+        if unpriced {
+            Style::default().fg(theme::WARNING)
+        } else {
+            tier(cost)
+        }
+    }
+
+    /// A grand total, month-to-date or forecast figure.
+    pub(crate) fn cost_total_style(unpriced: bool) -> Style {
+        let color = if unpriced {
+            theme::WARNING
+        } else {
+            theme::COST_TOTAL
+        };
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cost_style(cost: f64) -> Style {
+        tier(cost)
+    }
+}
+#[cfg(test)]
+use cost_color::cost_style;
+pub(crate) use cost_color::{cost_style_marked, cost_total_style};
 
 /// Cost display that surfaces unknown pricing instead of a silent $0: "$?"
 /// when the whole figure is unknown, `format_cost` + "*" when only part of
@@ -289,17 +381,6 @@ pub(crate) fn format_cost_marked(cost: f64, unpriced: bool, precision: usize) ->
         "$?".to_string()
     } else {
         format!("{}*", format_cost(cost, precision))
-    }
-}
-
-/// Style companion to [`format_cost_marked`]: unknown-pricing figures render
-/// in the warning color (matching the Models panel's unpriced mark) instead
-/// of the cost scale, which would paint a fake zero as cheap green.
-pub(crate) fn cost_style_marked(cost: f64, unpriced: bool) -> Style {
-    if unpriced {
-        Style::default().fg(theme::WARNING)
-    } else {
-        cost_style(cost)
     }
 }
 
@@ -339,7 +420,7 @@ pub(crate) fn help_bar(pairs: &[(&str, &str)]) -> Line<'static> {
             format!(":{action} ")
         };
         spans.push(Span::styled(key_txt, Style::default().fg(theme::PRIMARY)));
-        spans.push(Span::styled(action_txt, Style::default().fg(theme::DIM)));
+        spans.push(Span::styled(action_txt, Style::default().fg(theme::LABEL)));
     }
     Line::from(spans)
 }
@@ -398,8 +479,10 @@ pub fn model_color(model: &str) -> Color {
         theme::MODEL_SONNET
     } else if m.contains("haiku") {
         theme::MODEL_HAIKU
+    } else if m.contains("fable") || m.contains("mythos") {
+        theme::MODEL_FABLE
     } else {
-        theme::LABEL_MUTED
+        theme::LABEL
     }
 }
 
@@ -433,7 +516,7 @@ fn draw_scrollbar(frame: &mut Frame, area: Rect, scroll: usize, total: usize, vi
         } else {
             "░"
         };
-        let span = Span::styled(ch, Style::default().fg(theme::DIM));
+        let span = Span::styled(ch, Style::default().fg(theme::LABEL));
         frame.render_widget(Paragraph::new(span), Rect::new(scrollbar_x, y, 1, 1));
     }
 }
@@ -465,6 +548,27 @@ fn syntect_to_ratatui_color(color: syntect::highlighting::Color) -> Color {
     Color::Rgb(color.r, color.g, color.b) // lint-ok: raw-rgb — syntect conversion
 }
 
+/// Turn counts split by who produced them. Claude Code files every tool
+/// result under the user role, so a bare user-message count reads as hundreds
+/// of turns for a session of a few dozen prompts.
+fn turns_text(prompts: u64, assistant: u64, user_role: u64) -> String {
+    format!(
+        "you:{prompts}  AI:{assistant}  tool/system:{}",
+        user_role.saturating_sub(prompts)
+    )
+}
+
+/// `line` recoloured subdued — for a row kept for completeness that should
+/// not compete with the rows around it, yet stays readable.
+fn subdued_line(line: Line<'_>) -> Line<'_> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|sp| sp.style(Style::default().fg(theme::SUBDUED)))
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// Display width of a composed span run. Callers that decide layout from the
 /// text they just built must measure the built spans, never a second copy of
 /// the same literals: two copies drift apart silently.
@@ -484,7 +588,7 @@ fn progress_spans(done: usize, total: usize) -> Vec<Span<'static>> {
     }
     vec![Span::styled(
         format!("{done} / {total} files"),
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::META),
     )]
 }
 
@@ -535,7 +639,7 @@ fn highlight_xml_tags(line: &str) -> Line<'static> {
                 }
                 spans.push(Span::styled(
                     tag.to_string(),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::LABEL),
                 ));
                 last = i + end + 1;
                 i = last;
@@ -567,7 +671,7 @@ fn highlight_code_line(
         (
             Some(Span::styled(
                 prefix.to_string(),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             )),
             code,
         )
@@ -643,7 +747,7 @@ pub fn render_tool_result_with_highlighting(
         if content.lines().count() > 50 {
             lines.push(Line::from(Span::styled(
                 format!("... ({} more lines)", content.lines().count() - 50),
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::PLACEHOLDER),
             )));
             wrap_flags.push(false);
         }
@@ -652,7 +756,7 @@ pub fn render_tool_result_with_highlighting(
         for line in wrapped.into_iter().take(30) {
             lines.push(Line::from(Span::styled(
                 line,
-                Style::default().fg(theme::SECONDARY),
+                Style::default().fg(theme::VALUE),
             )));
         }
         wrap_flags.extend(flags.into_iter().take(30));
@@ -687,7 +791,7 @@ pub fn render_text_with_highlighting(
             TextSegment::Code { lang, content } => {
                 lines.push(Line::from(Span::styled(
                     format!("```{}", lang.as_deref().unwrap_or("")),
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::LABEL),
                 )));
                 wrap_flags.push(false);
 
@@ -706,14 +810,14 @@ pub fn render_text_with_highlighting(
                 if content.lines().count() > 30 {
                     lines.push(Line::from(Span::styled(
                         format!("... ({} more lines)", content.lines().count() - 30),
-                        Style::default().fg(theme::DIM),
+                        Style::default().fg(theme::PLACEHOLDER),
                     )));
                     wrap_flags.push(false);
                 }
 
                 lines.push(Line::from(Span::styled(
                     "```",
-                    Style::default().fg(theme::DIM),
+                    Style::default().fg(theme::LABEL),
                 )));
                 wrap_flags.push(false);
             }
@@ -806,6 +910,18 @@ fn query_char_ranges(text: &str, query_lower: &str) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+fn first_match_from_day(
+    messages: &[crate::conversation::ConversationMessage],
+    matches: &[(usize, usize)],
+    day: chrono::NaiveDate,
+) -> Option<usize> {
+    matches.iter().position(|&(m, _)| {
+        messages[m]
+            .timestamp_utc
+            .is_some_and(|t| t.with_timezone(&chrono::Local).date_naive() >= day)
+    })
 }
 
 /// Post-edit refresh shared by every pane-search text mutation (typing,
@@ -981,7 +1097,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         // Elegant color palette
         let primary = theme::PRIMARY;
         let warm = theme::WARM;
-        let dim = theme::DIM;
+        let dim = theme::LABEL;
         let faint = theme::FAINT;
 
         // Logo with creative animation. Lines are padded to a common width so
@@ -1239,7 +1355,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             }),
             Line::from(make_starfield(17)),
             Line::from(""),
-            Line::from(Span::styled("press q to quit", Style::default().fg(faint))),
+            Line::from(Span::styled("press q to quit", Style::default().fg(dim))),
         ];
         let loading = Paragraph::new(loading_text)
             .block(Block::default().borders(Borders::NONE))
@@ -1415,7 +1531,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             // panes, so this is the sole hint for dropping one.
             pairs.push(("X", "close-pane"));
         }
-        pairs.push(("H/L", "day"));
+        // Day stepping only moves the Day list; Live / Pinned lists ignore it.
+        if state.conv_list_mode == crate::ConvListMode::Day {
+            pairs.push(("H/L", "day"));
+        }
         // Drop least-essential hints (rightmost first) until the bar fits, so a
         // narrow terminal trims gracefully instead of raw-cutting mid-hint. The
         // first two (Esc/back, ↑↓/msg) are always kept; `?` shows the full list.
@@ -1451,6 +1570,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                     &state.project_labels,
                     &state.session_titles,
                     &cumulative,
+                    crate::aggregator::day_subagent_spend(session, &state.original_daily_groups),
                     None,
                     state.session_detail_recent.as_deref(),
                     state.resume_dir(&session.file_path).as_deref(),
@@ -1563,7 +1683,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let soft = theme::WARM;
-    let dim = theme::DIM;
+    let dim = theme::LABEL;
 
     let mut spans = vec![
         Span::styled("  ◈  ", Style::default().fg(theme::PRIMARY)),
@@ -1597,14 +1717,14 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
                 cache.cached_files,
                 cache.cached_files + cache.parsed_files
             ),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::META),
         ));
     }
 
     if state.index_build_task.is_some() {
         spans.push(Span::styled(
             "  ·  building search index...",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         ));
     }
 
@@ -1644,14 +1764,14 @@ fn draw_retention_warning(frame: &mut Frame, area: Rect, state: &AppState) {
 
         let content = vec![
             Line::from(Span::styled(line1, Style::default().fg(theme::WARNING))),
-            Line::from(Span::styled(line2, Style::default().fg(theme::DIM))),
+            Line::from(Span::styled(line2, Style::default().fg(theme::LABEL))),
             Line::from(vec![
-                Span::styled("  Docs: ", Style::default().fg(theme::DIM)),
+                Span::styled("  Docs: ", Style::default().fg(theme::LABEL)),
                 Span::styled(
                     "https://code.claude.com/docs/en/settings",
                     Style::default().fg(theme::LINK),
                 ),
-                Span::styled("  |  x to dismiss", Style::default().fg(theme::DIM)),
+                Span::styled("  |  x to dismiss", Style::default().fg(theme::LABEL)),
             ]),
         ];
 
@@ -1665,7 +1785,7 @@ fn draw_retention_warning(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let dim = theme::DIM;
+    let dim = theme::LABEL;
 
     // Tab label count = latest day in the current view (= today, or the
     // latest day inside an active date filter). Counted the way the Daily
@@ -1792,7 +1912,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 .bg(theme::PRIMARY)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::DIM)
+            Style::default().fg(theme::LABEL)
         };
         all_spans.push(Span::raw(" ".repeat(gap)));
         all_spans.push(Span::styled(filter_label, filter_style));
@@ -1805,7 +1925,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 .bg(theme::PRIMARY)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::DIM)
+            Style::default().fg(theme::LABEL)
         };
         all_spans.push(Span::styled(project_label, project_style));
 
@@ -1820,7 +1940,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
         let help_x = right_x + filter_width + project_width + pin_width;
         let help_area = Rect::new(help_x, area.y, help_width, 1);
         state.layout.help_trigger = Some(help_area);
-        all_spans.push(Span::styled(help_label, Style::default().fg(theme::DIM)));
+        all_spans.push(Span::styled(help_label, Style::default().fg(theme::LABEL)));
     } else {
         state.layout.filter_popup_area_trigger = None;
         state.layout.project_popup_area_trigger = None;
@@ -1899,12 +2019,12 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
         };
         active_lines.push(Line::from(Span::styled(
             placeholder,
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         )));
     } else {
         active_lines.push(Line::from(Span::styled(
             format!("  🟢 {busy_n} busy · ◉ {today_n} today · ○ {older_n} older"),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::META),
         )));
         for (display_rank, s) in active_visible.iter().enumerate() {
             let selected = display_rank == state.live_selected;
@@ -1948,7 +2068,7 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if paused_count == 0 {
         paused_lines.push(Line::from(Span::styled(
             "  No paused sessions",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         )));
     } else {
         let mut info_spans = Vec::new();
@@ -1963,7 +2083,7 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
         }
         info_spans.push(Span::styled(
             "last 24h + prior-run snapshot",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         ));
         paused_lines.push(Line::from(info_spans));
         for (display_rank, s) in paused_visible.iter().enumerate() {
@@ -2087,7 +2207,7 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 format!(" Active now ({active_count}) "),
                 Style::default().fg(theme::PRIMARY),
             ),
-            Span::styled(" ← earlier snapshots ", Style::default().fg(theme::DIM)),
+            Span::styled(" ← earlier snapshots ", Style::default().fg(theme::LABEL)),
         ]))
     } else {
         active_block.title(Span::styled(
@@ -2166,7 +2286,7 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ("Space", "pin"),
             ("y", "copy-resume"),
             ("t", "title"),
-            ("←→", "date"),
+            ("←→", "snapshot"),
             ("v", "layout"),
             ("/", "search"),
             ("m", "pins"),
@@ -2261,26 +2381,30 @@ fn draw_live_past(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 .fg(theme::PRIMARY)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("{age_label}  · "), Style::default().fg(theme::DIM)),
+        Span::styled(
+            format!("{age_label} · ages as of then · "),
+            Style::default().fg(theme::TIME),
+        ),
     ];
     if past_visible.is_empty() {
         header_spans.push(Span::styled(
             "frozen snapshot",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         ));
     } else {
         // Diff vs the current alive set: ● still-live, · ended, + new since.
-        header_spans.push(Span::styled("vs now: ", Style::default().fg(theme::DIM)));
+        header_spans.push(Span::styled("vs now: ", Style::default().fg(theme::LABEL)));
         header_spans.push(Span::styled(
-            format!("{still_live_n} live"),
+            format!("● {still_live_n} live"),
             Style::default().fg(theme::SUCCESS),
         ));
-        header_spans.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+        // Two spaces, not ` · `: the ended count opens with its own `·` glyph.
+        header_spans.push(Span::raw("  "));
         header_spans.push(Span::styled(
-            format!("{ended_n} ended"),
-            Style::default().fg(theme::FAINT),
+            format!("· {ended_n} ended"),
+            Style::default().fg(theme::SUBDUED),
         ));
-        header_spans.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+        header_spans.push(Span::styled(" · ", Style::default().fg(theme::LABEL)));
         header_spans.push(Span::styled(
             format!("{new_since_n} new"),
             Style::default().fg(theme::ACCENT),
@@ -2290,7 +2414,7 @@ fn draw_live_past(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if past_visible.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No snapshot for this date (ccsight didn't run, or all sessions outside retention)",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::PLACEHOLDER),
         )));
     }
     for (display_rank, s) in past_visible.iter().enumerate() {
@@ -2343,11 +2467,11 @@ fn draw_live_past(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // back to the live `now` view, not "today" — today snapshots also exist.
     let mut title_spans = vec![Span::styled(title_str, Style::default().fg(theme::ACCENT))];
     if offset < total {
-        title_spans.push(Span::styled(" ← older ", Style::default().fg(theme::DIM)));
+        title_spans.push(Span::styled(" ← older ", Style::default().fg(theme::LABEL)));
     }
     title_spans.push(Span::styled(
         "→ newer · T now ",
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::LABEL),
     ));
     let body = ratatui::widgets::Paragraph::new(lines)
         .scroll((state.live_scroll as u16, 0))
@@ -2382,11 +2506,9 @@ fn draw_live_past(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ("Space", "pin"),
             ("y", "copy-resume"),
             ("t", "title"),
-            ("←→", "date"),
+            ("←→", "snapshot"),
             ("T", "now"),
             ("/", "search"),
-            ("●", "live"),
-            ("·", "ended"),
         ],
     );
     frame.render_widget(ratatui::widgets::Paragraph::new(help_line), chunks[1]);
@@ -2525,7 +2647,11 @@ fn render_live_row<'a>(
     let session_meta = path.and_then(|p| meta_map.get(p)).copied();
     let cumulative = path.and_then(|p| state.live_cumulative.get(p));
     let last = live_session_last_activity(state, s, now);
-    let secs = (now - last).num_seconds().max(0);
+    // A frozen row's age is measured back from its snapshot: against the wall
+    // clock every row of an old snapshot reads as the same stale span.
+    let snapshot_at = past_diff.and_then(|_| state.live_past_snapshot_meta.map(|(t, _)| t));
+    let age_ref = snapshot_at.unwrap_or(now);
+    let secs = (age_ref - last).num_seconds().max(0);
 
     // Active section: three tiers — busy / today / older. `is_today` is the
     // single source of truth shared with the sort logic in `discover_live`.
@@ -2538,26 +2664,28 @@ fn render_live_row<'a>(
         if still_live {
             ("● ", theme::SUCCESS)
         } else {
-            ("· ", theme::FAINT)
+            ("· ", theme::SUBDUED)
         }
     } else if !is_active_section {
         if s.was_recently_live {
             ("⟳ ", theme::ACCENT)
         } else {
-            ("⏸ ", theme::DIM)
+            ("⏸ ", theme::LABEL)
         }
     } else if s.status.as_deref() == Some("busy") {
         ("🟢", theme::SUCCESS)
     } else if crate::infrastructure::live_sessions::is_today(last, now) {
         ("◉ ", theme::WARNING)
     } else {
-        ("○ ", theme::LABEL_MUTED)
+        ("○ ", theme::LABEL)
     };
-    // Polling cadence is coarser than 1s; collapse sub-minute to fixed.
-    // Glyph carries the staleness tier (busy / today / older / paused); the
-    // age column carries "time since the last conversation entry"
-    // (see `live_session_last_activity` for the source precedence).
-    let age = if secs < 60 {
+    // Polling cadence is coarser than 1s; collapse sub-minute to fixed. The
+    // age is "time since the last conversation entry" — the transcript's
+    // newest, so a session that kept going past its snapshot has no
+    // as-of-then age to show.
+    let age = if snapshot_at.is_some_and(|t| last > t) {
+        "continued".to_string()
+    } else if secs < 60 {
         "just now".to_string()
     } else if secs < 3600 {
         format!("{}m ago", secs / 60)
@@ -2605,20 +2733,21 @@ fn render_live_row<'a>(
         })
     });
 
-    // Live rows are session-centric: cost/tokens are the full lifetime total
-    // (summed over every day the session appears) via unfiltered groups, not
-    // just the latest day's slice — so a long session reads its true spend.
-    // Always render the column (even at 0) so the model column aligns.
-    let tokens_total: u64 = cumulative.map_or(0, |c| c.input_tokens + c.output_tokens);
+    // Live rows are session-centric: cost/tokens are the lifetime total over
+    // unfiltered groups, subagents included as on the Daily row. The column
+    // renders even at 0 so the model column aligns.
+    let tokens_total: u64 = cumulative.map_or(0, |c| {
+        c.input_tokens + c.output_tokens + c.subagents.work_tokens
+    });
     let tokens_str = crate::format_number(tokens_total);
 
-    let session_cost: f64 = cumulative.map_or(0.0, |c| c.cost);
-    let session_unpriced = cumulative.is_some_and(|c| c.unpriced);
+    let (session_cost, session_unpriced) =
+        cumulative.map_or((0.0, false), SessionCumulative::cost_with_subagents);
     let cost_str = format_cost_marked(session_cost, session_unpriced, 0);
 
     let model_field = session_meta.and_then(|m| m.model.as_ref());
     let model_short = model_field.map(|m| crate::aggregator::normalize_model_name(m));
-    let model_clr = model_field.map_or(theme::LABEL_MUTED, |m| model_color(m));
+    let model_clr = model_field.map_or(theme::LABEL, |m| model_color(m));
 
     // Pin + continued/new glyph pair, identical to Daily's pattern.
     let is_pinned = s
@@ -2675,7 +2804,7 @@ fn render_live_row<'a>(
     line1_spans.push(Span::styled(glyph, Style::default().fg(glyph_color)));
     line1_spans.push(Span::styled(
         format!(" {age:>9}  "),
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::TIME),
     ));
     // "Started → last" range. Prefer the JSONL's first entry; for a
     // just-spawned session with no JSONL yet, fall back to pid.json's
@@ -2686,10 +2815,13 @@ fn render_live_row<'a>(
         .map(|m| m.session_first_timestamp)
         .or(s.started_at);
     if let Some(start) = range_start {
-        let range = format_session_range(start, last, now);
+        // A frozen row's range ends where the snapshot saw it, not at the
+        // transcript's newest entry.
+        let range_end = snapshot_at.map_or(last, |t| last.min(t));
+        let range = format_session_range(start, range_end, age_ref);
         line1_spans.push(Span::styled(
             format!("{range}  "),
-            Style::default().fg(theme::LABEL_MUTED),
+            Style::default().fg(theme::TIME),
         ));
     }
     line1_spans.push(Span::styled(
@@ -2735,7 +2867,7 @@ fn render_live_row<'a>(
         let width = unicode_width::UnicodeWidthStr::width(display.as_str());
         line1_spans.push(Span::styled(
             format!("  {display}"),
-            Style::default().fg(theme::LABEL_MUTED),
+            Style::default().fg(theme::SESSION_ID),
         ));
         width + 2
     } else {
@@ -2743,7 +2875,7 @@ fn render_live_row<'a>(
         let width = unicode_width::UnicodeWidthStr::width(display.as_str());
         line1_spans.push(Span::styled(
             format!("  {display}"),
-            Style::default().fg(theme::LABEL_MUTED),
+            Style::default().fg(theme::SESSION_ID),
         ));
         width + 2
     };
@@ -2780,21 +2912,21 @@ fn render_live_row<'a>(
     let (msg_text, msg_style) = if let Some(m) = last_msg {
         (
             truncate_with_ellipsis(&m, max_summary_chars),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::SNIPPET),
         )
     } else {
         ("—".to_string(), Style::default().fg(theme::FAINT))
     };
     let mut line3 = Line::from(vec![
-        Span::styled("     ❯ ", Style::default().fg(theme::LABEL_MUTED)),
+        Span::styled("     ❯ ", Style::default().fg(theme::LABEL)),
         Span::styled(msg_text, msg_style),
     ]);
 
-    // Selection bg (FAINT, matches Daily). Three layers: per-span patch
+    // Selection bg (SELECTED_BG, matches Daily). Three layers: per-span patch
     // (BOLD transitions leave holes), padding span (trailing cells use
     // widget style not Line::style), Line::style as fallback.
     if is_selected {
-        let bg = theme::FAINT;
+        let bg = theme::SELECTED_BG;
         let sel_style = Style::default().bg(bg);
         let line1_width = spans_width(&line1.spans);
         let line2_width = spans_width(&line2.spans);
@@ -2828,7 +2960,7 @@ fn render_live_row<'a>(
     if past_diff == Some(false) && !is_selected {
         for line in [&mut line1, &mut line2, &mut line3] {
             for span in &mut line.spans {
-                span.style = span.style.fg(theme::FAINT);
+                span.style = span.style.fg(theme::SUBDUED);
             }
         }
     }
@@ -2838,12 +2970,14 @@ fn render_live_row<'a>(
 
 fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if state.daily_groups.is_empty() {
-        let empty = Paragraph::new("No sessions").block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::BORDER))
-                .title(Span::styled(" Daily ", Style::default().fg(theme::PRIMARY))),
-        );
+        let empty = Paragraph::new("No sessions")
+            .style(Style::default().fg(theme::PLACEHOLDER))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::BORDER))
+                    .title(Span::styled(" Daily ", Style::default().fg(theme::PRIMARY))),
+            );
         frame.render_widget(empty, area);
         return;
     }
@@ -3036,7 +3170,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 }
             }
             timeline_lines.push(Line::from(vec![
-                Span::styled(y_label, Style::default().fg(theme::DIM)),
+                Span::styled(y_label, Style::default().fg(theme::META)),
                 Span::styled(row_chars, Style::default().fg(theme::PRIMARY)),
             ]));
         }
@@ -3047,7 +3181,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             "0  6  12  18  24"
         };
         timeline_lines.push(
-            Line::from(Span::styled(time_label, Style::default().fg(theme::DIM)))
+            Line::from(Span::styled(time_label, Style::default().fg(theme::TIME)))
                 .alignment(ratatui::layout::Alignment::Center),
         );
 
@@ -3070,16 +3204,16 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 Line::from(vec![
                     Span::styled(
                         format!("active:{active_hours}h"),
-                        Style::default().fg(theme::DIM),
+                        Style::default().fg(theme::TIME),
                     ),
                     Span::styled(peak_info, Style::default().fg(theme::WARM)),
-                    Span::styled(" ", Style::default().fg(theme::DIM)),
+                    Span::styled(" ", Style::default().fg(theme::LABEL)),
                     Span::styled(
                         crate::format_number(total_day_tokens),
                         Style::default().fg(theme::PRIMARY),
                     ),
-                    Span::styled(sub_suffix, Style::default().fg(theme::DIM)),
-                    Span::styled(" ", Style::default().fg(theme::DIM)),
+                    Span::styled(sub_suffix, Style::default().fg(theme::META)),
+                    Span::styled(" ", Style::default().fg(theme::LABEL)),
                     Span::styled(
                         format_cost_marked(total_day_cost, day_unpriced, 0),
                         cost_style_marked(total_day_cost, day_unpriced),
@@ -3320,6 +3454,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let inner_width = sessions_chunk.width.saturating_sub(2) as usize;
     let info_btn_width = 3usize;
 
+    let subagents_by_parent = group.subagent_spend_by_parent();
     let items: Vec<ListItem> = sessions
         .iter()
         .enumerate()
@@ -3327,24 +3462,28 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             let start_time = s.day_first_timestamp.with_timezone(&Local).format("%H:%M");
             let end_time = s.day_last_timestamp.with_timezone(&Local).format("%H:%M");
             let time_str = format!("{start_time}–{end_time}");
+            // Subagent transcripts are hidden from this list, so their spend
+            // rides on the row of the session that launched them.
+            let subagents = subagents_by_parent
+                .get(s.file_path.as_path())
+                .copied()
+                .unwrap_or_default();
             let session_tokens: u64 = s
                 .day_tokens_by_model
                 .values()
                 .map(super::aggregator::stats::TokenStats::work_tokens)
-                .sum();
+                .sum::<u64>()
+                + subagents.work_tokens;
             let tokens_str = crate::format_number(session_tokens);
-            let session_cost: f64 = s.cost(session_calculator);
-            let session_unpriced = s.has_unpriced_model(session_calculator);
+            let session_cost: f64 = s.cost(session_calculator) + subagents.cost;
+            let session_unpriced = s.has_unpriced_model(session_calculator) || subagents.unpriced;
             let cost_str = format_cost_marked(session_cost, session_unpriced, 0);
 
             let model_short = s.model.as_ref().map_or_else(
                 || "?".to_string(),
                 |m| crate::aggregator::normalize_model_name(m),
             );
-            let model_clr = s
-                .model
-                .as_ref()
-                .map_or(theme::LABEL_MUTED, |m| model_color(m));
+            let model_clr = s.model.as_ref().map_or(theme::LABEL, |m| model_color(m));
 
             let is_selected = i == state.selected_session;
             let is_updating = state.updating_session == Some((state.selected_day, i));
@@ -3366,7 +3505,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             let time_style = if is_recent {
                 Style::default().fg(theme::ACCENT)
             } else {
-                Style::default().fg(theme::LABEL_SUBTLE)
+                Style::default().fg(theme::TIME)
             };
 
             let branch_short = s.git_branch.as_ref().map(|b| {
@@ -3437,7 +3576,9 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             } else if let Some(ref title) = s.custom_title {
                 vec![
                     Span::raw("  "),
-                    Span::styled(title.clone(), Style::default().fg(theme::DIM)),
+                    // A user-set title reads a step below an AI summary, so
+                    // rows still awaiting a summary stand out.
+                    Span::styled(title.clone(), Style::default().fg(theme::LABEL)),
                 ]
             } else {
                 vec![
@@ -3446,15 +3587,22 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 ]
             };
             let line2 = Line::from(line2_spans);
+            // ccsight's own generation calls stay listed but set back, so the
+            // user's own sessions read first.
+            let (line1, line2) = if s.ccsight_generated().is_some() {
+                (subdued_line(line1), subdued_line(line2))
+            } else {
+                (line1, line2)
+            };
 
             let has_summary = s.summary.is_some();
             let item = ListItem::new(vec![line1, line2]);
             if is_updating {
                 item.style(Style::default().bg(theme::WARNING).fg(theme::TEXT_DARK))
             } else if is_selected {
-                item.style(Style::default().bg(theme::FAINT))
+                item.style(Style::default().bg(theme::SELECTED_BG))
             } else if !has_summary {
-                item.style(Style::default().fg(theme::DIM))
+                item.style(Style::default().fg(theme::LABEL))
             } else {
                 item
             }
@@ -3489,14 +3637,14 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                     Style::default().fg(theme::PRIMARY),
                 ),
                 Span::styled(
-                    format!("new: {new_count}"),
+                    format!("· new: {new_count}"),
                     Style::default()
                         .fg(theme::SUCCESS)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
-                    format!("continued: {continued_count}"),
+                    format!("» continued: {continued_count}"),
                     Style::default()
                         .fg(theme::PRIMARY)
                         .add_modifier(Modifier::BOLD),
@@ -3736,7 +3884,7 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
                                 Style::default().fg(theme::PRIMARY),
                             )),
                     )
-                    .style(Style::default().fg(theme::DIM));
+                    .style(Style::default().fg(theme::LABEL));
                 frame.render_widget(empty, area);
                 return;
             }
@@ -3798,13 +3946,13 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
             } else if pane_idx.is_some() {
                 Style::default().fg(theme::WARM)
             } else {
-                Style::default().fg(theme::DIM)
+                Style::default().fg(theme::LABEL)
             };
 
             let time_style = if sd.is_recent {
-                Style::default().fg(theme::ACCENT)
+                Style::default().fg(theme::TIME_RECENT)
             } else {
-                Style::default().fg(theme::PRIMARY)
+                Style::default().fg(theme::TIME)
             };
 
             let state_color = if sd.is_continued {
@@ -3835,14 +3983,22 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
             line1_spans.push(Span::styled(proj_display, style));
             let line1 = Line::from(line1_spans);
 
-            let summary_text = sd.summary.as_deref().unwrap_or("—");
+            let (summary_text, summary_color) = sd
+                .summary
+                .as_deref()
+                .map_or(("—", theme::FAINT), |t| (t, theme::TITLE));
             let summary_display = truncate_with_ellipsis(summary_text, summary_max_len);
             let line2 = Line::from(vec![
                 Span::raw("   "),
-                Span::styled(summary_display, Style::default().fg(theme::DIM)),
+                Span::styled(summary_display, Style::default().fg(summary_color)),
             ]);
 
-            ListItem::new(vec![line1, line2])
+            let item = ListItem::new(vec![line1, line2]);
+            if is_selected {
+                item.style(Style::default().bg(theme::SELECTED_BG))
+            } else {
+                item
+            }
         })
         .collect();
 
@@ -3858,25 +4014,25 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
         if area.width >= 36 {
             let mut spans = vec![
                 Span::styled(" ↑↓", Style::default().fg(theme::PRIMARY)),
-                Span::styled(":sel ", Style::default().fg(theme::DIM)),
+                Span::styled(":sel ", Style::default().fg(theme::LABEL)),
                 Span::styled("Sp", Style::default().fg(theme::PRIMARY)),
-                Span::styled(":pin ", Style::default().fg(theme::DIM)),
+                Span::styled(":pin ", Style::default().fg(theme::LABEL)),
                 Span::styled("S-Tab", Style::default().fg(theme::PRIMARY)),
-                Span::styled(format!(":{mode_label}"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(":{mode_label}"), Style::default().fg(theme::LABEL)),
             ];
             if state.conv_list_mode == crate::ConvListMode::Day {
                 spans.extend_from_slice(&[
                     Span::styled(" H/L", Style::default().fg(theme::PRIMARY)),
-                    Span::styled(":day", Style::default().fg(theme::DIM)),
+                    Span::styled(":day", Style::default().fg(theme::LABEL)),
                 ]);
             }
             Line::from(spans)
         } else {
             Line::from(vec![
                 Span::styled(" Sp", Style::default().fg(theme::PRIMARY)),
-                Span::styled(":pin ", Style::default().fg(theme::DIM)),
+                Span::styled(":pin ", Style::default().fg(theme::LABEL)),
                 Span::styled("S-Tab", Style::default().fg(theme::PRIMARY)),
-                Span::styled(format!(":{mode_label}"), Style::default().fg(theme::DIM)),
+                Span::styled(format!(":{mode_label}"), Style::default().fg(theme::LABEL)),
             ])
         }
     } else {
@@ -3929,6 +4085,15 @@ fn reposition_scroll_for_selection(
     }
 }
 
+fn scope_day_label(day_first: chrono::DateTime<chrono::Utc>) -> String {
+    let day = day_first.with_timezone(&chrono::Local).date_naive();
+    if day == chrono::Local::now().date_naive() {
+        "today".to_string()
+    } else {
+        day.format("%m-%d").to_string()
+    }
+}
+
 fn draw_conversation_pane(
     frame: &mut Frame,
     area: Rect,
@@ -3975,7 +4140,7 @@ fn draw_conversation_pane(
     let draw_block = |frame: &mut Frame, scroll_info: &str, pane: &ConversationPane| {
         let msg_count = pane.message_lines.len();
         let msg_indicator = if msg_count > 0 {
-            format!(" [{}/{}] ", pane.selected_message + 1, msg_count)
+            format!(" msg {}/{} ", pane.selected_message + 1, msg_count)
         } else {
             String::new()
         };
@@ -4038,14 +4203,14 @@ fn draw_conversation_pane(
         } else if msg_indicator.is_empty() {
             scroll_info.to_string()
         } else {
-            format!("{} | {}", msg_indicator.trim(), scroll_info)
+            format!("{} · {}", msg_indicator.trim(), scroll_info.trim())
         };
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(title, Style::default().fg(theme::PRIMARY)))
             .title_bottom(Line::from(Span::styled(
                 bottom_text,
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             )))
             .border_style(Style::default().fg(if pane.search_mode {
                 theme::WARM
@@ -4057,12 +4222,12 @@ fn draw_conversation_pane(
 
     if pane.messages.is_empty() {
         if pane.loading {
-            let loading = Paragraph::new("Loading…");
+            let loading = Paragraph::new("Loading…").style(Style::default().fg(theme::PLACEHOLDER));
             frame.render_widget(loading, inner);
             draw_block(frame, "", pane);
         } else if pane.file_path.is_none() {
             let hint = Paragraph::new("Select a session (Enter)")
-                .style(Style::default().fg(theme::DIM))
+                .style(Style::default().fg(theme::PLACEHOLDER))
                 .alignment(ratatui::layout::Alignment::Center);
             let centered_area = Rect {
                 x: inner.x,
@@ -4073,7 +4238,8 @@ fn draw_conversation_pane(
             frame.render_widget(hint, centered_area);
             draw_block(frame, "", pane);
         } else {
-            let empty = Paragraph::new("No messages found");
+            let empty =
+                Paragraph::new("No messages found").style(Style::default().fg(theme::PLACEHOLDER));
             frame.render_widget(empty, inner);
             draw_block(frame, "", pane);
         }
@@ -4090,6 +4256,13 @@ fn draw_conversation_pane(
     // must mutate `expanded` before the render signature is taken.
     if pane.search_mode {
         update_pane_search_matches(pane);
+    }
+    if pane.pending_search_scroll
+        && !pane.messages.is_empty()
+        && let Some(day) = pane.search_seed_day.take()
+        && let Some(i) = first_match_from_day(&pane.messages, &pane.search_matches, day)
+    {
+        pane.search_current = i;
     }
     // Peek: auto-expand the row holding the current match (for tool runs
     // that's the group head, not the matched message itself); collapse the
@@ -4325,7 +4498,7 @@ fn draw_conversation_pane(
         spans.push(Span::styled(counter, Style::default().fg(theme::PRIMARY)));
         spans.push(Span::styled(
             "  Enter: next  ⇧Enter: prev  Esc: close",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), search_area);
     }
@@ -4341,8 +4514,10 @@ fn draw_conversation_pane(
     } else {
         ""
     };
+    // Named, because the bar beside it is also `n/m`: a message index next to
+    // a line offset reads as two of the same thing.
     let scroll_info = format!(
-        " {} {}/{} ",
+        " {}line {}/{} ",
         scroll_indicator,
         scroll + 1,
         max_scroll.max(1) + 1
@@ -4378,9 +4553,10 @@ fn draw_conversation_pane(
         } else {
             format!("{duration_mins}m")
         };
-        let work_tokens = session.work_tokens();
-        let cost: f64 = session.cost(calculator);
-        let unpriced = session.has_unpriced_model(calculator);
+        let subagents = crate::aggregator::day_subagent_spend(session, all_groups);
+        let work_tokens = session.work_tokens() + subagents.work_tokens;
+        let cost: f64 = session.cost(calculator) + subagents.cost;
+        let unpriced = session.has_unpriced_model(calculator) || subagents.unpriced;
 
         let summary = resolved_title(session_titles, session).unwrap_or("—");
         // Reserve 4 cells at the right edge for the [i] button (3) +
@@ -4419,18 +4595,45 @@ fn draw_conversation_pane(
             .take(8)
             .collect();
 
+        // Duration, tokens and cost are this day's slice; naming the day (and
+        // the lifetime total when the session spans several) keeps a
+        // continued session from reading as if it cost only today's share.
+        let day_label = scope_day_label(session.day_first_timestamp);
+        let cumulative =
+            crate::aggregator::compute_session_cumulative(&session.file_path, all_groups);
+        let (all_days_cost, all_days_unpriced) = cumulative.cost_with_subagents();
+        let all_days = (cumulative.days > 1).then(|| {
+            format!(
+                "  Σ{}d {}",
+                cumulative.days,
+                format_cost_marked(all_days_cost, all_days_unpriced, 0)
+            )
+        });
         let mut line2_spans: Vec<Span> = vec![
-            Span::styled(format!(" {dur}"), Style::default().fg(theme::LABEL_SUBTLE)),
+            Span::styled(format!(" {day_label}"), Style::default().fg(theme::ACCENT)),
+            Span::styled(format!(" {dur}"), Style::default().fg(theme::TIME)),
             Span::styled(
                 format!("  {}", crate::format_number(work_tokens)),
-                Style::default().fg(theme::PRIMARY),
+                Style::default().fg(theme::TOKENS),
             ),
             Span::styled(
                 format!("  {}", format_cost_marked(cost, unpriced, 0)),
                 cost_style_marked(cost, unpriced),
             ),
-            Span::styled(format!("  {short_id}"), Style::default().fg(theme::FAINT)),
         ];
+        if let Some(all_days) = &all_days {
+            // A lower-bound total reads as a warning, as every marked cost does.
+            let color = if all_days_unpriced {
+                theme::WARNING
+            } else {
+                theme::META
+            };
+            line2_spans.push(Span::styled(all_days.clone(), Style::default().fg(color)));
+        }
+        line2_spans.push(Span::styled(
+            format!("  {short_id}"),
+            Style::default().fg(theme::SESSION_ID),
+        ));
         if !session.day_tool_usage.is_empty() {
             let mut tools: Vec<_> = session.day_tool_usage.iter().collect();
             // Tiebreaker: alphabetical by name (HashMap iteration order
@@ -4439,7 +4642,10 @@ fn draw_conversation_pane(
             // Width budget must measure the SAME string the row renders —
             // the unpriced mark is one column wider than the plain form, and
             // an underestimate lets the tool list overrun the pane.
-            let prefix_width = dur.len()
+            let prefix_width = day_label.chars().count()
+                + 1
+                + all_days.as_deref().map_or(0, |s| s.chars().count())
+                + dur.len()
                 + crate::format_number(work_tokens).len()
                 + format_cost_marked(cost, unpriced, 0).len()
                 + short_id.len()
@@ -4453,7 +4659,7 @@ fn draw_conversation_pane(
                     break;
                 }
                 used += part.len();
-                line2_spans.push(Span::styled(part, Style::default().fg(theme::DIM)));
+                line2_spans.push(Span::styled(part, Style::default().fg(theme::LABEL)));
             }
         }
         let line2 = Line::from(line2_spans);
@@ -4545,7 +4751,7 @@ fn render_conversation_lines(
                         format!("[Tools: {} calls] ", tool_uses.len()),
                         Style::default().fg(theme::PRIMARY).bold(),
                     ),
-                    Span::styled("▼", Style::default().fg(theme::LABEL_SUBTLE)),
+                    Span::styled("▼", Style::default().fg(theme::META)),
                 ]));
                 push_line!(Line::from(""));
 
@@ -4611,7 +4817,7 @@ fn render_conversation_lines(
                             Style::default().fg(theme::PRIMARY),
                         ),
                         Span::styled(status_icon, Style::default().fg(status_color)),
-                        Span::styled(" ▶", Style::default().fg(theme::LABEL_SUBTLE)),
+                        Span::styled(" ▶", Style::default().fg(theme::META)),
                     ],
                     line_max_width
                 )));
@@ -4619,16 +4825,17 @@ fn render_conversation_lines(
 
             push_line!(Line::from(Span::styled(
                 "─".repeat(line_max_width),
-                Style::default().fg(theme::LABEL_SUBTLE),
+                Style::default().fg(theme::SEPARATOR),
             )));
             continue;
         }
 
         message_positions.push((lines.len(), i));
-        let (role_style, role_icon) = if msg.role == "user" {
-            (Style::default().fg(theme::SUCCESS).bold(), "👤")
-        } else {
-            (Style::default().fg(theme::MUTED).bold(), "🤖")
+        let (role_style, role_icon) = match msg.role.as_str() {
+            "user" => (Style::default().fg(theme::SUCCESS).bold(), "👤"),
+            "recap" => (Style::default().fg(theme::WARM).bold(), "📝"),
+            "meta" => (Style::default().fg(theme::META).bold(), "⚙"),
+            _ => (Style::default().fg(theme::LABEL).bold(), "🤖"),
         };
 
         let mut header_spans = vec![
@@ -4640,19 +4847,19 @@ fn render_conversation_lines(
         if let Some(ref ts) = msg.timestamp {
             header_spans.push(Span::styled(
                 format!("  {ts}"),
-                Style::default().fg(theme::LABEL_SUBTLE),
+                Style::default().fg(theme::TIME),
             ));
         }
 
         if let Some(ref model) = msg.model {
             header_spans.push(Span::styled(
                 format!("  [{}]", crate::aggregator::normalize_model_name(model)),
-                Style::default().fg(theme::SECONDARY),
+                Style::default().fg(model_color(model)),
             ));
         }
 
-        // Per-turn response latency = gap from the previous user message's
-        // timestamp. Goes BEFORE tokens so the eye picks up "how long did
+        // Per-turn response latency = gap from the entry that prompted it: a
+        // typed prompt, an injected note or a compaction recap. Goes BEFORE tokens so the eye picks up "how long did
         // this turn take" before parsing through cache numbers. Only
         // meaningful for assistant turns; user turns include the human's
         // thinking time which doesn't belong on the row.
@@ -4663,7 +4870,7 @@ fn render_conversation_lines(
                 .iter()
                 .take(i)
                 .rev()
-                .find(|m| m.role == "user")
+                .find(|m| matches!(m.role.as_str(), "user" | "meta" | "recap"))
                 .and_then(|m| m.timestamp_utc);
             if let Some(prev_ts) = prev_user_ts {
                 let gap = (this_ts - prev_ts).num_seconds();
@@ -4677,7 +4884,7 @@ fn render_conversation_lines(
                     };
                     header_spans.push(Span::styled(
                         format!("  Δ{label}"),
-                        Style::default().fg(theme::DIM),
+                        Style::default().fg(theme::TIME),
                     ));
                 }
             }
@@ -4691,9 +4898,10 @@ fn render_conversation_lines(
                 crate::aggregator::CostCalculator::global().calculate_cost(usage, Some(model))
             && cost > 0.0
         {
+            // `calculate_cost` returned a figure, so the model is priced.
             header_spans.push(Span::styled(
                 format!("  {}", format_cost(cost, 2)),
-                cost_style(cost),
+                cost_style_marked(cost, false),
             ));
         }
 
@@ -4738,7 +4946,7 @@ fn render_conversation_lines(
             if line_count >= max_lines {
                 push_line!(Line::from(Span::styled(
                     "  ... (truncated)".to_string(),
-                    Style::default().fg(theme::LABEL_SUBTLE),
+                    Style::default().fg(theme::PLACEHOLDER),
                 )));
                 break;
             }
@@ -4783,7 +4991,7 @@ fn render_conversation_lines(
                         }
                         lines.push(Line::from(Span::styled(
                             format!("  {wrapped_line}"),
-                            Style::default().fg(theme::DIM),
+                            Style::default().fg(theme::LABEL),
                         )));
                         wrap_flags.push(flag);
                         line_count += 1;
@@ -4835,7 +5043,7 @@ fn render_conversation_lines(
 
         push_line!(Line::from(Span::styled(
             "─".repeat(width.saturating_sub(2) as usize),
-            Style::default().fg(theme::LABEL_SUBTLE),
+            Style::default().fg(theme::SEPARATOR),
         )));
         i += 1;
     }
@@ -4860,7 +5068,7 @@ fn render_conversation_lines(
             0,
             Line::from(Span::styled(
                 format!("... ({first_kept_msg} earlier messages)"),
-                Style::default().fg(theme::LABEL_SUBTLE),
+                Style::default().fg(theme::PLACEHOLDER),
             )),
         );
         wrap_flags.insert(0, false);
@@ -4937,10 +5145,14 @@ fn render_compact_lines(
     let header_prefix = |is_open: bool, msg: &ConversationMessage| {
         let (role_label, role_style) = if msg.role == "user" {
             ("You", Style::default().fg(theme::SUCCESS).bold())
+        } else if msg.role == "recap" {
+            // Written by Claude Code when it compacted the context: a summary
+            // of everything above, not something the user said.
+            ("Recap", Style::default().fg(theme::WARM).bold())
         } else if msg.role == "assistant" {
-            ("AI ", Style::default().fg(theme::MUTED).bold())
+            ("AI ", Style::default().fg(theme::LABEL).bold())
         } else {
-            ("·  ", Style::default().fg(theme::DIM))
+            ("·  ", Style::default().fg(theme::META))
         };
         let time = msg
             .timestamp_utc
@@ -4950,13 +5162,13 @@ fn render_compact_lines(
         let (caret, caret_style) = if is_open {
             ("▾", Style::default().fg(theme::PRIMARY))
         } else {
-            ("▸", Style::default().fg(theme::LABEL_SUBTLE))
+            ("▸", Style::default().fg(theme::META))
         };
         let lead = format!("{caret} {time} {role_label} ");
         let prefix_w = unicode_width::UnicodeWidthStr::width(lead.as_str());
         let spans = vec![
             Span::styled(format!("{caret} "), caret_style),
-            Span::styled(format!("{time} "), Style::default().fg(theme::LABEL_SUBTLE)),
+            Span::styled(format!("{time} "), Style::default().fg(theme::TIME)),
             Span::styled(format!("{role_label} "), role_style),
         ];
         (spans, prefix_w)
@@ -5100,9 +5312,9 @@ fn render_compact_lines(
                             lines.push(Line::from(vec![
                                 Span::styled(
                                     format!("{BODY_INDENT}↳ "),
-                                    Style::default().fg(theme::LABEL_SUBTLE),
+                                    Style::default().fg(theme::META),
                                 ),
-                                Span::styled(short, Style::default().fg(theme::DIM)),
+                                Span::styled(short, Style::default().fg(theme::LABEL)),
                                 Span::styled(format!(" {icon}"), Style::default().fg(c)),
                             ]));
                         }
@@ -5124,7 +5336,7 @@ fn render_compact_lines(
         let budget = inner.saturating_sub(prefix_w).max(8);
         row.push(Span::styled(
             truncate_with_ellipsis(&summary, budget),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::SNIPPET),
         ));
         lines.push(Line::from(row));
         wrap_flags.push(false);
@@ -5144,7 +5356,7 @@ fn render_compact_lines(
                     let (wrapped, _) = wrap_text_with_continuation(t, text_w);
                     for (wi, wl) in wrapped.iter().enumerate() {
                         let style = if dim {
-                            Style::default().fg(theme::FAINT)
+                            Style::default().fg(theme::THINKING)
                         } else {
                             Style::default()
                         };
@@ -5178,11 +5390,8 @@ fn render_compact_lines(
                         ("✓", theme::SUCCESS)
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{BODY_INDENT}↳ "),
-                            Style::default().fg(theme::LABEL_SUBTLE),
-                        ),
-                        Span::styled(short, Style::default().fg(theme::DIM)),
+                        Span::styled(format!("{BODY_INDENT}↳ "), Style::default().fg(theme::META)),
+                        Span::styled(short, Style::default().fg(theme::LABEL)),
                         Span::styled(format!(" {icon}"), Style::default().fg(c)),
                     ]));
                     wrap_flags.push(false);
@@ -5241,7 +5450,7 @@ fn draw_summary(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if !state.generating_summary {
         block = block.title_bottom(Span::styled(
             format!(" {actions} "),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         ));
     }
 
@@ -5409,7 +5618,7 @@ fn summary_line(raw: &str) -> Line<'static> {
         None => (indent.to_string(), trimmed),
     };
 
-    let mut spans = vec![Span::styled(prefix, Style::default().fg(theme::DIM))];
+    let mut spans = vec![Span::styled(prefix, Style::default().fg(theme::LABEL))];
     spans.extend(bold_runs(body));
     Line::from(spans)
 }
@@ -5487,6 +5696,54 @@ fn churn_line(
     ])
 }
 
+/// The Tokens row's share run by subagents, which the row's own figures leave
+/// out; empty when the session launched none.
+fn subagent_tokens_span(
+    subagents: crate::aggregator::SubagentSpend,
+    label_style: Style,
+) -> Span<'static> {
+    if subagents.count == 0 {
+        return Span::raw("");
+    }
+    Span::styled(
+        format!(
+            "  + subagents work:{}",
+            crate::format_number(subagents.work_tokens)
+        ),
+        label_style,
+    )
+}
+
+/// The popup's Cost row: the session plus the subagents it launched, split
+/// out only when there are any.
+fn cost_line(
+    total: f64,
+    total_unpriced: bool,
+    own: f64,
+    own_unpriced: bool,
+    subagents: crate::aggregator::SubagentSpend,
+    label_style: Style,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("  Cost      ", label_style),
+        Span::styled(
+            format_cost_marked(total, total_unpriced, 2),
+            cost_style_marked(total, total_unpriced),
+        ),
+    ];
+    if subagents.count > 0 {
+        spans.push(Span::styled(
+            format!(
+                "  (session {} + subagents {})",
+                format_cost_marked(own, own_unpriced, 2),
+                format_cost_marked(subagents.cost, subagents.unpriced, 2)
+            ),
+            label_style,
+        ));
+    }
+    Line::from(spans)
+}
+
 fn draw_session_detail(
     frame: &mut Frame,
     area: Rect,
@@ -5497,6 +5754,7 @@ fn draw_session_detail(
     project_labels: &std::collections::HashMap<String, String>,
     session_titles: &std::collections::HashMap<std::path::PathBuf, String>,
     cumulative: &SessionCumulative,
+    day_subagents: crate::aggregator::SubagentSpend,
     // `(pid, status, started_at)` to append as a "Process" row. Set only
     // when the popup is opened from the Live tab; daily-tab opens pass None.
     live_extra: Option<&(u32, String, String)>,
@@ -5541,8 +5799,10 @@ fn draw_session_detail(
     let total_tokens = work_tokens + cache_write + cache_read;
 
     let calculator = crate::aggregator::CostCalculator::global();
-    let cost: f64 = session.cost(calculator);
-    let unpriced = session.has_unpriced_model(calculator);
+    let own_cost: f64 = session.cost(calculator);
+    let own_unpriced = session.has_unpriced_model(calculator);
+    let cost = own_cost + day_subagents.cost;
+    let unpriced = own_unpriced || day_subagents.unpriced;
 
     let model_name = session.model.as_ref().map_or_else(
         || "?".to_string(),
@@ -5558,9 +5818,9 @@ fn draw_session_detail(
     let model_clr = session
         .model
         .as_ref()
-        .map_or(theme::LABEL_MUTED, |m| model_color(m));
+        .map_or(theme::LABEL, |m| model_color(m));
 
-    let label_style = Style::default().fg(theme::DIM);
+    let label_style = Style::default().fg(theme::LABEL);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -5579,7 +5839,7 @@ fn draw_session_detail(
         .unwrap_or_else(|| shorten_project(&session.project_name).to_string());
     header.push(Span::styled(
         project_label,
-        Style::default().fg(theme::WARM).bold(),
+        Style::default().fg(theme::PROJECT).bold(),
     ));
     if let Some(ref branch) = session.git_branch {
         let short = branch.split('/').next_back().unwrap_or(branch);
@@ -5622,13 +5882,9 @@ fn draw_session_detail(
                     let glyph_style = if is_user {
                         Style::default().fg(theme::PRIMARY)
                     } else {
-                        Style::default().fg(theme::DIM)
+                        Style::default().fg(theme::LABEL)
                     };
-                    let text_style = if is_user {
-                        Style::default().fg(theme::LABEL_SUBTLE)
-                    } else {
-                        Style::default().fg(theme::DIM)
-                    };
+                    let text_style = Style::default().fg(theme::SNIPPET);
                     let glyph = if is_user { "❯" } else { "⬡" };
                     lines.push(Line::from(vec![
                         Span::styled(format!("    {glyph} "), glyph_style),
@@ -5658,7 +5914,7 @@ fn draw_session_detail(
     };
     lines.push(Line::from(vec![
         Span::styled("  Time      ", label_style),
-        Span::styled(time_display, Style::default().fg(theme::LABEL_SUBTLE)),
+        Span::styled(time_display, Style::default().fg(theme::VALUE)),
     ]));
 
     // Multi-day span line: only render when the session is active on more
@@ -5681,7 +5937,7 @@ fn draw_session_detail(
                     "started {started} · {days} days · {total_dur} total",
                     days = cumulative.days
                 ),
-                Style::default().fg(theme::LABEL_SUBTLE),
+                Style::default().fg(theme::VALUE),
             ),
         ]));
     }
@@ -5713,7 +5969,7 @@ fn draw_session_detail(
     if dir_value.chars().count() <= dir_avail {
         lines.push(Line::from(vec![
             Span::styled(dir_label, label_style),
-            Span::styled(dir_value, Style::default().fg(theme::LABEL_SUBTLE)),
+            Span::styled(dir_value, Style::default().fg(theme::VALUE)),
         ]));
     } else {
         let cont_indent: String = std::iter::repeat_n(' ', dir_label.chars().count()).collect();
@@ -5740,7 +5996,7 @@ fn draw_session_detail(
             };
             lines.push(Line::from(vec![
                 Span::styled(prefix, label_style),
-                Span::styled(chunk.clone(), Style::default().fg(theme::LABEL_SUBTLE)),
+                Span::styled(chunk.clone(), Style::default().fg(theme::VALUE)),
             ]));
         }
     }
@@ -5761,14 +6017,14 @@ fn draw_session_detail(
         .unwrap_or_else(|| "-".to_string());
     lines.push(Line::from(vec![
         Span::styled("  ID        ", label_style),
-        Span::styled(session_id.clone(), Style::default().fg(theme::LABEL_SUBTLE)),
+        Span::styled(session_id.clone(), Style::default().fg(theme::VALUE)),
     ]));
     lines.push(Line::from(vec![Span::styled("  Resume    ", label_style)]));
     let acc_style = Style::default().fg(theme::ACCENT);
     if is_cowork {
         lines.push(Line::from(vec![Span::styled(
             "    (Cowork — re-open from Claude Desktop)",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )]));
     } else if let Some(dir) = resume_dir {
         // The same verified dir the `y` copy uses — display and clipboard
@@ -5797,7 +6053,7 @@ fn draw_session_detail(
         // rather than print a cd that silently fails to find the session.
         lines.push(Line::from(vec![Span::styled(
             "    (resume dir unknown — use the `claude --resume` picker)",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )]));
     }
     lines.push(Line::from(""));
@@ -5826,9 +6082,10 @@ fn draw_session_detail(
     lines.push(Line::from(vec![
         Span::styled("  Turns     ", label_style),
         Span::styled(
-            format!(
-                "user:{} assistant:{}",
-                session.day_user_msgs, session.day_assistant_msgs
+            turns_text(
+                session.day_prompts,
+                session.day_assistant_msgs,
+                session.day_user_msgs,
             ),
             Style::default().fg(theme::PRIMARY),
         ),
@@ -5859,14 +6116,16 @@ fn draw_session_detail(
             ),
             label_style,
         ),
+        subagent_tokens_span(day_subagents, label_style),
     ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Cost      ", label_style),
-        Span::styled(
-            format_cost_marked(cost, unpriced, 2),
-            cost_style_marked(cost, unpriced),
-        ),
-    ]));
+    lines.push(cost_line(
+        cost,
+        unpriced,
+        own_cost,
+        own_unpriced,
+        day_subagents,
+        label_style,
+    ));
 
     if multi_day {
         lines.push(Line::from(""));
@@ -5874,9 +6133,10 @@ fn draw_session_detail(
         lines.push(Line::from(vec![
             Span::styled("  Turns     ", label_style),
             Span::styled(
-                format!(
-                    "user:{} assistant:{}",
-                    cumulative.user_msgs, cumulative.assistant_msgs
+                turns_text(
+                    cumulative.prompts,
+                    cumulative.assistant_msgs,
+                    cumulative.user_msgs,
                 ),
                 Style::default().fg(theme::PRIMARY),
             ),
@@ -5908,14 +6168,17 @@ fn draw_session_detail(
                 ),
                 label_style,
             ),
+            subagent_tokens_span(cumulative.subagents, label_style),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled("  Cost      ", label_style),
-            Span::styled(
-                format_cost_marked(cumulative.cost, cumulative.unpriced, 2),
-                cost_style_marked(cumulative.cost, cumulative.unpriced),
-            ),
-        ]));
+        let (total, total_unpriced) = cumulative.cost_with_subagents();
+        lines.push(cost_line(
+            total,
+            total_unpriced,
+            cumulative.cost,
+            cumulative.unpriced,
+            cumulative.subagents,
+            label_style,
+        ));
     }
 
     lines.push(Line::from(""));
@@ -5998,7 +6261,7 @@ fn draw_session_detail(
 
     let block = popup_block(" Session Detail ").title_bottom(Line::from(Span::styled(
         footer,
-        Style::default().fg(theme::DIM),
+        Style::default().fg(theme::LABEL),
     )));
 
     // Clamp scroll to keep at least one line of body content visible. Inner height excludes
@@ -6043,6 +6306,7 @@ fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         &state.project_labels,
         &state.session_titles,
         &cumulative,
+        crate::aggregator::day_subagent_spend(&session, &state.original_daily_groups),
         live_extra.as_ref(),
         state.session_detail_recent.as_deref(),
         state.resume_dir(&session.file_path).as_deref(),
@@ -6133,7 +6397,7 @@ fn draw_breakdown_detail_popup(
         let display_text = format!(" {name} ({info}) {pct_str}");
 
         lines.push(Line::from(vec![
-            Span::styled(format!(" {label}"), Style::default().fg(theme::DIM)),
+            Span::styled(format!(" {label}"), Style::default().fg(theme::LABEL)),
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(display_text, Style::default().fg(theme::TEXT_BRIGHT)),
         ]));
@@ -6153,7 +6417,7 @@ fn draw_breakdown_detail_popup(
         popup_block(&format!(" Breakdown ({total_items}) ")).title_bottom(Line::from(vec![
             Span::styled(
                 " ↑↓: scroll  b/Esc: close ",
-                Style::default().fg(theme::DIM),
+                Style::default().fg(theme::LABEL),
             ),
             Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
         ])),
@@ -6203,12 +6467,12 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         let style = if is_selected {
             Style::default()
                 .fg(theme::TEXT_BRIGHT)
-                .bg(theme::SELECTION_BG)
+                .bg(theme::SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if is_current {
             Style::default().fg(theme::PRIMARY)
         } else {
-            Style::default().fg(theme::SECONDARY)
+            Style::default().fg(theme::VALUE)
         };
 
         lines.push(Line::from(Span::styled(text, style)));
@@ -6231,12 +6495,12 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
     let custom_style = if is_custom_selected {
         Style::default()
             .fg(theme::TEXT_BRIGHT)
-            .bg(theme::SELECTION_BG)
+            .bg(theme::SELECTED_BG)
             .add_modifier(Modifier::BOLD)
     } else if is_custom_current {
         Style::default().fg(theme::PRIMARY)
     } else {
-        Style::default().fg(theme::SECONDARY)
+        Style::default().fg(theme::VALUE)
     };
     lines.push(Line::from(Span::styled(custom_label, custom_style)));
 
@@ -6247,7 +6511,7 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         } else {
             theme::TEXT_BRIGHT
         };
-        let mut spans = vec![Span::styled("   ", Style::default().fg(theme::DIM))];
+        let mut spans = vec![Span::styled("   ", Style::default().fg(theme::LABEL))];
         spans.extend(filter_input.render_spans(
             "> ",
             Style::default().fg(input_color),
@@ -6270,7 +6534,7 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
 
     let popup = Paragraph::new(lines).block(
         popup_block(" Filter Period ")
-            .title_bottom(Line::from(footer).style(Style::default().fg(theme::DIM))),
+            .title_bottom(Line::from(footer).style(Style::default().fg(theme::LABEL))),
     );
 
     frame.render_widget(popup, popup_area);
@@ -6306,7 +6570,7 @@ fn draw_title_edit_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppSt
     let popup = Paragraph::new(lines).block(
         popup_block(" Edit session title ").title_bottom(
             Line::from(" Enter: save  ·  ^R: AI generate  ·  Esc: cancel ")
-                .style(Style::default().fg(theme::DIM)),
+                .style(Style::default().fg(theme::LABEL)),
         ),
     );
     frame.render_widget(popup, popup_area);
@@ -6369,12 +6633,12 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
             let style = if is_selected {
                 Style::default()
                     .fg(theme::TEXT_BRIGHT)
-                    .bg(theme::SELECTION_BG)
+                    .bg(theme::SELECTED_BG)
                     .add_modifier(Modifier::BOLD)
             } else if is_current {
                 Style::default().fg(theme::PRIMARY)
             } else {
-                Style::default().fg(theme::SECONDARY)
+                Style::default().fg(theme::PROJECT)
             };
             lines.push(Line::from(Span::styled(text, style)));
         } else if let Some((name, tokens, last_date)) = sorted.get(i - 1).copied() {
@@ -6424,12 +6688,12 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
             let style = if is_selected {
                 Style::default()
                     .fg(theme::TEXT_BRIGHT)
-                    .bg(theme::SELECTION_BG)
+                    .bg(theme::SELECTED_BG)
                     .add_modifier(Modifier::BOLD)
             } else if is_current {
                 Style::default().fg(theme::PRIMARY)
             } else {
-                Style::default().fg(theme::SECONDARY)
+                Style::default().fg(theme::PROJECT)
             };
             lines.push(Line::from(Span::styled(text, style)));
         }
@@ -6439,7 +6703,7 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
 
     let popup = Paragraph::new(lines).block(
         popup_block(" Filter Project ")
-            .title_bottom(Line::from(footer).style(Style::default().fg(theme::DIM))),
+            .title_bottom(Line::from(footer).style(Style::default().fg(theme::LABEL))),
     );
 
     frame.render_widget(popup, popup_area);
@@ -6626,20 +6890,18 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     let mut project_unpriced = false;
     let mut unpriced_models: std::collections::HashSet<String> = std::collections::HashSet::new();
     for group in &state.daily_groups {
+        let mut by_parent = None;
         for session in &group.sessions {
-            if session.is_subagent || session.project_name != path {
+            if session.project_name != path {
                 continue;
             }
-            unique_sessions.insert(session.file_path.clone());
-            session_day_count += 1;
-            active_days_set.insert(group.date);
+            // Money, tokens and models include subagents, as the Projects
+            // panel and Overview do; session counts and turns stay the user's.
             let sess_tokens = session.work_tokens();
-            total_tokens += sess_tokens;
-            total_turns += session.day_user_msgs;
-            project_churn.add(session.line_churn);
             let sess_cost: f64 = session.cost(calculator);
-            total_cost += sess_cost;
             let sess_unpriced = session.has_unpriced_model(calculator);
+            total_tokens += sess_tokens;
+            total_cost += sess_cost;
             project_unpriced |= sess_unpriced;
             for (model, tokens) in &session.day_tokens_by_model {
                 let c = calculator.calculate_cost(tokens, Some(model));
@@ -6649,21 +6911,35 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
                 }
                 *model_cost.entry(normalized).or_insert(0.0) += c.unwrap_or(0.0);
             }
+            *daily_tokens.entry(group.date).or_insert(0) += sess_tokens;
+            *daily_cost.entry(group.date).or_insert(0.0) += sess_cost;
+            if session.is_subagent {
+                continue;
+            }
+            unique_sessions.insert(session.file_path.clone());
+            session_day_count += 1;
+            active_days_set.insert(group.date);
+            total_turns += session.day_prompts;
+            project_churn.add(session.line_churn);
             for (tool, count) in &session.day_tool_usage {
                 *tool_count.entry(tool.clone()).or_insert(0) += count;
             }
-            *daily_tokens.entry(group.date).or_insert(0) += sess_tokens;
-            *daily_cost.entry(group.date).or_insert(0.0) += sess_cost;
             first_seen = Some(first_seen.map_or(group.date, |d| d.min(group.date)));
             last_seen = Some(last_seen.map_or(group.date, |d| d.max(group.date)));
             let duration = (session.day_last_timestamp - session.day_first_timestamp)
                 .num_minutes()
                 .max(1);
+            // The row folds in its subagents so it matches the Daily row.
+            let subagents = by_parent
+                .get_or_insert_with(|| group.subagent_spend_by_parent())
+                .get(session.file_path.as_path())
+                .copied()
+                .unwrap_or_default();
             sessions_rev.push((
                 group.date,
-                sess_tokens,
-                sess_cost,
-                sess_unpriced,
+                sess_tokens + subagents.work_tokens,
+                sess_cost + subagents.cost,
+                sess_unpriced || subagents.unpriced,
                 session.model.clone(),
                 session.file_path.clone(),
                 session.git_branch.clone(),
@@ -6675,7 +6951,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     sessions_rev.sort_by_key(|s| std::cmp::Reverse(s.0));
 
     let label = state.project_label(&path);
-    let label_dim = Style::default().fg(theme::DIM);
+    let label_dim = Style::default().fg(theme::LABEL);
     let primary_bold = Style::default().fg(theme::PRIMARY).bold();
 
     // No leading blank: the title is rendered on the top border line, so a
@@ -6712,19 +6988,19 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         Span::styled("  Cost  ", label_dim),
         Span::styled(
             format_cost_marked(total_cost, project_unpriced, 2),
-            cost_style_marked(total_cost, project_unpriced),
+            cost_total_style(project_unpriced),
         ),
         Span::styled("   Tokens ", label_dim),
         Span::styled(crate::format_number(total_tokens), primary_bold),
         Span::styled("   Sessions ", label_dim),
         Span::styled(format!("{unique_session_count}"), primary_bold),
         Span::styled(session_day_suffix, label_dim),
-        Span::styled("   Turns ", label_dim),
+        Span::styled("   Prompts ", label_dim),
         Span::styled(crate::format_number(total_turns), primary_bold),
     ]));
     content.push(Line::from(vec![
         Span::styled("  Range ", label_dim),
-        Span::styled(span, Style::default().fg(theme::LABEL_SUBTLE)),
+        Span::styled(span, Style::default().fg(theme::VALUE)),
         Span::styled("   Active ", label_dim),
         Span::styled(format!("{active_days}d"), primary_bold),
     ]));
@@ -6789,7 +7065,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
                 Span::styled(format!("  {name:<14}"), Style::default().fg(clr)),
                 Span::styled(
                     format!("{} ", format_cost_marked(*cost, unknown, 0)),
-                    cost_style_marked(*cost, unknown),
+                    cost_total_style(unknown),
                 ),
                 Span::styled(pct_str, label_dim),
             ]));
@@ -6844,7 +7120,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     )));
     content.push(Line::from(vec![Span::styled(
         "      date       branch   duration   tokens     cost      model",
-        Style::default().fg(theme::LABEL_SUBTLE),
+        Style::default().fg(theme::LABEL),
     )]));
     for (i, (date, tokens, cost, unpriced, model, file_path, branch, duration_mins)) in
         sessions_rev.iter().take(10).enumerate()
@@ -6869,7 +7145,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
             Span::styled(format!("  {:>2}. ", i + 1), label_dim),
             Span::styled(
                 date.format("%Y-%m-%d").to_string(),
-                Style::default().fg(theme::LABEL_MUTED),
+                Style::default().fg(theme::TIME),
             ),
             Span::styled(branch_short, Style::default().fg(theme::BRANCH)),
             Span::styled(format!("  {dur_str:>6}  "), label_dim),
@@ -6883,7 +7159,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
             ),
             Span::styled(
                 format!("  [{model_short}]"),
-                Style::default().fg(theme::SECONDARY),
+                Style::default().fg(model_color(&model_short)),
             ),
         ]));
         // Session UUID below the summary row so it's available for `claude -r`
@@ -6894,7 +7170,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
             .unwrap_or("?");
         content.push(Line::from(Span::styled(
             format!("      {session_id}"),
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::SESSION_ID),
         )));
     }
     if sessions_rev.len() > 10 {
@@ -6937,7 +7213,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     let block = popup_block(&title).title_bottom(Line::from(vec![
         Span::styled(
             " ↑↓: scroll  Enter/q: back ",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         ),
         Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
         Span::styled(position_chip, Style::default().fg(theme::PRIMARY)),
@@ -6967,12 +7243,13 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let mut content = vec![
         Line::from(Span::styled(
             "  Global",
-            Style::default().fg(theme::PRIMARY).bold(),
+            Style::default().fg(theme::HEADER).bold(),
         )),
         Line::from("  Tab / 1-4     Switch tabs (Dashboard/Live/Daily/Insights)"),
         Line::from("  /             Search sessions (inline filters supported)"),
         Line::from("                ↑↓ navigate results · ↑ recalls history while empty"),
-        Line::from("                filter:live|paused|busy|today|week|month  filter:date:Y-M-D"),
+        Line::from("                filter:live|paused|busy|today|week|month"),
+        Line::from("                filter:date:Y-M-D"),
         Line::from("                project:NAME · branch:NAME · model:NAME"),
         Line::from("  f             Open period filter"),
         Line::from("  p             Open project filter"),
@@ -6983,8 +7260,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  Popups        d/u page · g/G top/end scroll everywhere"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Dashboard ", Style::default().fg(theme::WARM).bold()),
-            Span::styled("(Tab 1)", Style::default().fg(theme::DIM)),
+            Span::styled("  Dashboard ", Style::default().fg(theme::HEADER).bold()),
+            Span::styled("(Tab 1)", Style::default().fg(theme::LABEL)),
         ]),
         Line::from("  ←/→ h/l       Switch panels"),
         Line::from("  ↑/↓ j/k       Scroll panel content"),
@@ -6995,8 +7272,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  Models/Languages: s toggles sort (recent ↔ tokens)"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  Tool Usage detail popup",
-            Style::default().fg(theme::WARM).bold(),
+            "  Ecosystem detail popup",
+            Style::default().fg(theme::HEADER).bold(),
         )]),
         Line::from("  ←/→ h/l Tab   Switch section (Tools/Skills/Commands/Subagents)"),
         Line::from("  1-4           Jump to section"),
@@ -7008,8 +7285,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  s             Toggle sort (recent ↔ calls), all sections"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Live ", Style::default().fg(theme::WARM).bold()),
-            Span::styled("(Tab 2)", Style::default().fg(theme::DIM)),
+            Span::styled("  Live ", Style::default().fg(theme::HEADER).bold()),
+            Span::styled("(Tab 2)", Style::default().fg(theme::LABEL)),
         ]),
         Line::from("  ↑/↓ j/k       Select session (busy → today → older → paused)"),
         Line::from("  Enter         Open conversation in pane"),
@@ -7021,12 +7298,13 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  T             Jump back to the live now view"),
         Line::from("  v             Cycle pane layout (split / active / paused)"),
         Line::from("  /             Search, pre-filtered to filter:live"),
-        Line::from("  Glyphs        🟢 busy · ◉ today · ○ older · ⏸ paused · ⟳ alive in prior run"),
-        Line::from("                * pinned · » multi-day session · · single-day session"),
+        Line::from("  Glyphs        🟢 busy · ◉ today · ○ older"),
+        Line::from("                ⏸ paused · ⟳ alive in prior run"),
+        Line::from("                past snapshot: ● still live now · · ended since"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Daily ", Style::default().fg(theme::WARM).bold()),
-            Span::styled("(Tab 3)", Style::default().fg(theme::DIM)),
+            Span::styled("  Daily ", Style::default().fg(theme::HEADER).bold()),
+            Span::styled("(Tab 3)", Style::default().fg(theme::LABEL)),
         ]),
         Line::from("  ←/→ h/l       Navigate days"),
         Line::from("  ↑/↓ j/k       Select session (or scroll breakdown)"),
@@ -7038,17 +7316,19 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  Space         Pin / unpin session"),
         Line::from("  s / S         Session / Day summary (AI)"),
         Line::from("                in popup: r regenerate · t write resume title"),
+        Line::from("  Glyphs        · started this day · » continued from an earlier day"),
+        Line::from("                * pinned  (same marks on Live and the conversation list)"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Insights ", Style::default().fg(theme::WARM).bold()),
-            Span::styled("(Tab 4)", Style::default().fg(theme::DIM)),
+            Span::styled("  Insights ", Style::default().fg(theme::HEADER).bold()),
+            Span::styled("(Tab 4)", Style::default().fg(theme::LABEL)),
         ]),
         Line::from("  ←/→ h/l       Switch panel"),
         Line::from("  Enter / i     Open detail popup (scroll and ←/→ live there)"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Conversation ", Style::default().fg(theme::WARM).bold()),
-            Span::styled("(from Daily / Live)", Style::default().fg(theme::DIM)),
+            Span::styled("  Conversation ", Style::default().fg(theme::HEADER).bold()),
+            Span::styled("(from Daily / Live)", Style::default().fg(theme::LABEL)),
         ]),
         Line::from("  ↑/↓ j/k       Select message"),
         Line::from("  Enter         Expand / collapse message (compact view)"),
@@ -7070,7 +7350,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from(""),
         Line::from(Span::styled(
             "  CLI Options ",
-            Style::default().fg(theme::WARM).bold(),
+            Style::default().fg(theme::HEADER).bold(),
         )),
     ];
     let inner_w = popup_width.saturating_sub(4) as usize;
@@ -7095,7 +7375,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from(""),
         Line::from(Span::styled(
             "  Note ",
-            Style::default().fg(theme::PRIMARY).bold(),
+            Style::default().fg(theme::HEADER).bold(),
         )),
         Line::from("  Tokens = input + output (excludes cache); also called \"work tokens\""),
         Line::from("  Costs  = estimated from API pricing"),
@@ -7247,7 +7527,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         .border_style(Style::default().fg(theme::PRIMARY))
         .title_bottom(Line::from(Span::styled(
             " ↑↓: results  ↑(empty): history  Enter: open  Esc: close ",
-            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::LABEL),
         )));
 
     if state.search_results.is_empty() {
@@ -7257,11 +7537,18 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                       project:NAME · branch:NAME · model:NAME"
         } else if state.searching {
             "Searching content..."
+        } else if state.loading {
+            // Nothing is searchable before the first load lands.
+            "Loading sessions — results appear once they are read"
+        } else if state.search_index.is_none() && state.index_build_task.is_some() {
+            // The title says `[Indexing...]` on the same condition; "No
+            // results" here would claim an answer the index has not given.
+            "Indexing — content matches appear once the index is ready"
         } else {
             "No results found"
         };
         let text = Paragraph::new(no_results)
-            .style(Style::default().fg(theme::LABEL_SUBTLE))
+            .style(Style::default().fg(theme::PLACEHOLDER))
             .block(results_block);
         frame.render_widget(text, inner[1]);
     } else {
@@ -7315,7 +7602,9 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                 };
 
                 let selected = i == state.search_selected;
-                let sel_style = Style::default().bg(theme::FAINT).fg(theme::TEXT_BRIGHT);
+                let sel_style = Style::default()
+                    .bg(theme::SELECTED_BG)
+                    .fg(theme::TEXT_BRIGHT);
                 let pinned = state.pins.is_pinned(&session.file_path);
                 let model_short = session
                     .model
@@ -7382,7 +7671,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                     if selected {
                         sel_style
                     } else {
-                        Style::default().fg(theme::DIM)
+                        Style::default().fg(theme::LABEL)
                     },
                 ));
                 let line1 = Line::from(line1_spans);
@@ -7394,7 +7683,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                 let base2 = if selected {
                     sel_style
                 } else {
-                    Style::default().fg(theme::LABEL_MUTED)
+                    Style::default().fg(theme::SNIPPET)
                 };
                 let line2 = if !snippet_text.is_empty() {
                     let snip = truncate_with_ellipsis(snippet_text, inner_w.saturating_sub(4));
@@ -7416,7 +7705,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                     let pv_base = if selected {
                         sel_style
                     } else {
-                        Style::default().fg(theme::DIM)
+                        Style::default().fg(theme::SNIPPET)
                     };
                     let mut spans = vec![Span::styled("    ".to_string(), pv_base)];
                     spans.extend(highlight_terms(
@@ -7517,6 +7806,179 @@ mod tests {
         // keys may be advertised.
         assert!(!searching.contains("q:quit"), "got {searching:?}");
         assert!(searching.contains("Esc:back"), "got {searching:?}");
+    }
+
+    // While the index is still being built an empty result list is not an
+    // answer; the body must say so, as the title's `[Indexing...]` does.
+    #[test]
+    fn search_body_says_indexing_rather_than_no_results_while_the_index_builds() {
+        let mut state = create_test_state();
+        state.search_mode = true;
+        state.search_input.set("needle".to_string());
+        state.search_results.clear();
+        state.searching = false;
+        state.search_index = None;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        state.index_build_task = Some(rx);
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("Indexing"), "{text}");
+        assert!(
+            !text.contains("No results found"),
+            "claimed an answer mid-build"
+        );
+
+        state.index_build_task = None;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(
+            text.contains("No results found"),
+            "a finished empty search says so"
+        );
+
+        state.loading = true;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("Loading sessions"), "{text}");
+    }
+
+    // `this mo` sums subagents; the model shares under it must be taken over
+    // the same sessions, or a model used mostly through subagents reads small.
+    #[test]
+    fn daily_costs_top_models_include_subagent_spend() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        let today = chrono::Local::now().date_naive();
+        let user = make_session_with_tokens("proj", 1_000, 1_000, "claude-opus-5");
+        let mut sub = make_session_with_tokens("proj", 4_000_000, 4_000_000, "claude-sonnet-4-6");
+        sub.is_subagent = true;
+        sub.file_path = std::path::PathBuf::from("/tmp/test/sub.jsonl");
+        let mut state = make_test_app_state(vec![make_daily_group(today, vec![user, sub])]);
+        state.loading = false;
+        state.daily_costs = vec![(today, 100.0)];
+        state.dashboard_panel = 0;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        let text = render_to_text(&mut state, 140, 45);
+        let line = text
+            .lines()
+            .find(|l| l.contains("Top models"))
+            .expect("the Top models line renders");
+        let sonnet = line.find("Sonnet").expect("subagent-only model missing");
+        let opus = line.find("Opus").unwrap_or(usize::MAX);
+        assert!(
+            sonnet < opus,
+            "the larger, subagent-only model must lead: {line}"
+        );
+    }
+
+    #[test]
+    fn an_unpriced_model_marks_only_the_months_it_was_used_in() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        let today = chrono::Local::now().date_naive();
+        let old = today - chrono::Duration::days(70);
+        let mut state = make_test_app_state(vec![
+            make_daily_group(
+                today,
+                vec![make_session_with_tokens(
+                    "proj",
+                    1_000_000,
+                    0,
+                    "claude-opus-4-6",
+                )],
+            ),
+            make_daily_group(
+                old,
+                vec![make_session_with_tokens(
+                    "proj",
+                    1_000,
+                    0,
+                    "claude-future-x",
+                )],
+            ),
+        ]);
+        state.loading = false;
+        state.daily_costs = vec![(today, 5.0), (old, 0.0)];
+        state
+            .models_without_pricing
+            .insert("claude-future-x".to_string());
+        state.dashboard_panel = 0;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        let text = render_to_text(&mut state, 140, 45);
+        let line = text
+            .lines()
+            .find(|l| l.contains("this mo:"))
+            .expect("the month summary renders");
+        assert!(!line.contains('*'), "this month is fully priced: {line}");
+    }
+
+    #[test]
+    fn month_unpriced_looks_only_at_the_named_month() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let day = |m: u32| chrono::NaiveDate::from_ymd_opt(2026, m, 10).unwrap(); // lint-ok: date-literal
+        let groups = vec![
+            make_daily_group(
+                day(2),
+                vec![make_session_with_tokens("p", 1, 0, "claude-opus-4-6")],
+            ),
+            make_daily_group(
+                day(1),
+                vec![make_session_with_tokens("p", 1, 0, "claude-future-x")],
+            ),
+        ];
+        assert!(month_unpriced(&groups, "2026-01"));
+        assert!(!month_unpriced(&groups, "2026-02"));
+        assert!(!month_unpriced(&groups, "not-a-month"));
+    }
+
+    #[test]
+    fn the_today_vs_average_popup_chart_grows_with_the_terminal() {
+        // The popup's chart rows sit between the y-axis `│` and the `└` axis.
+        let chart_rows = |w: u16, h: u16| {
+            let mut state = create_test_state();
+            state.tab = crate::Tab::Insights;
+            state.insights_panel = 1;
+            state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
+            let text = render_popup_text(&mut state, w, h);
+            let axis = text
+                .lines()
+                .position(|l| l.contains("└──"))
+                .expect("x axis");
+            let top = text
+                .lines()
+                .position(|l| l.contains("Today vs Average"))
+                .expect("title");
+            axis - top - 1
+        };
+        let small = chart_rows(80, 24);
+        let large = chart_rows(140, 45);
+        assert!(small >= 8, "keeps the floor: {small}");
+        assert!(
+            large > small + 10,
+            "fills the taller popup: {small} → {large}"
+        );
+    }
+
+    #[test]
+    fn a_rename_of_a_ccsight_generated_session_shows_the_new_name() {
+        let mut s = crate::test_helpers::helpers::make_session("p", None, None);
+        let (prompt, label) = crate::summary::GENERATED_PROMPTS[0];
+        s.first_user_message = Some(format!("{prompt} …"));
+        let own = s.display_title().map(str::to_string);
+        let mut titles = std::collections::HashMap::new();
+        if let Some(t) = &own {
+            titles.insert(s.file_path.clone(), t.clone());
+        }
+        assert_eq!(
+            resolved_title(&titles, &s),
+            Some(label),
+            "unrenamed keeps its label"
+        );
+        titles.insert(s.file_path.clone(), "my name".to_string());
+        assert_eq!(
+            resolved_title(&titles, &s),
+            Some("my name"),
+            "the rename was hidden"
+        );
     }
 
     #[test]
@@ -7790,6 +8252,122 @@ mod tests {
             timestamp_utc: None,
             usage: None,
         }
+    }
+
+    // `H/L` steps the Day list only; advertising it over a Live or Pinned list
+    // names a key that does nothing there.
+    #[test]
+    fn the_conversation_footer_offers_day_stepping_only_over_the_day_list() {
+        let mut state = create_test_state();
+        state.show_conversation = true;
+        state.conv_list_mode = crate::ConvListMode::Day;
+        let footer = |state: &mut AppState| {
+            render_to_text(state, 140, 45)
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(footer(&mut state).contains("H/L:day"));
+        state.conv_list_mode = crate::ConvListMode::Live;
+        assert!(
+            !footer(&mut state).contains("H/L:day"),
+            "dead key advertised"
+        );
+    }
+
+    #[test]
+    fn the_pane_header_names_its_day_and_adds_the_all_days_total_when_continued() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let mut newest = make_session("proj", Some("continued"), Some("main"));
+        newest.day_first_timestamp = chrono::Utc::now();
+        newest.day_last_timestamp = newest.day_first_timestamp;
+        let mut older = newest.clone();
+        older.day_first_timestamp -= chrono::Duration::days(1);
+        let single = make_session("proj", Some("single"), Some("topic"));
+        let groups = vec![
+            make_daily_group(today, vec![newest.clone(), single.clone()]),
+            make_daily_group(today - chrono::Duration::days(1), vec![older]),
+        ];
+        let header = |path: &std::path::Path| {
+            let mut state = make_test_app_state(groups.clone());
+            state.show_conversation = true;
+            state.active_pane_index = Some(0);
+            state.panes = vec![crate::ConversationPane {
+                file_path: Some(path.to_path_buf()),
+                messages: std::sync::Arc::new(vec![conv_msg(
+                    "user",
+                    vec![ConversationBlock::Text("hello".into())],
+                )]),
+                ..Default::default()
+            }];
+            render_to_text(&mut state, 140, 45)
+        };
+        let text = header(&newest.file_path);
+        assert!(text.contains(" today "), "day scope missing: {text}");
+        assert!(text.contains("Σ2d"), "all-days total missing: {text}");
+        assert!(
+            !header(&single.file_path).contains('Σ'),
+            "single-day session"
+        );
+    }
+
+    #[test]
+    fn a_seeded_search_starts_on_the_day_the_hit_was_written() {
+        let mut state = create_test_state();
+        state.show_conversation = true;
+        state.active_pane_index = Some(0);
+        let now = chrono::Utc::now();
+        let at = |days_back: i64, text: &str| {
+            let mut m = conv_msg("user", vec![ConversationBlock::Text(text.into())]);
+            m.timestamp_utc = Some(now - chrono::Duration::days(days_back));
+            m
+        };
+        let mut pane = crate::ConversationPane {
+            messages: std::sync::Arc::new(vec![
+                at(5, "old target"),
+                at(5, "old target again"),
+                at(0, "fresh target"),
+            ]),
+            ..Default::default()
+        };
+        pane.search_mode = true;
+        pane.search_input.set("target".to_string());
+        pane.pending_search_scroll = true;
+        pane.search_seed_day = Some(now.with_timezone(&chrono::Local).date_naive());
+        state.panes = vec![pane];
+        let _ = render_to_text(&mut state, 120, 35);
+        let pane = &state.panes[0];
+        assert_eq!(pane.search_matches[pane.search_current].0, 2);
+        assert_eq!(pane.search_seed_day, None, "the seed applies once");
+    }
+
+    #[test]
+    fn reply_latency_counts_from_an_injected_note_not_the_last_typed_prompt() {
+        let mut state = create_test_state();
+        state.show_conversation = true;
+        state.active_pane_index = Some(0);
+        let t0 = chrono::Utc::now() - chrono::Duration::days(1);
+        let at = |role: &str, secs: i64, text: &str| {
+            let mut m = conv_msg(role, vec![ConversationBlock::Text(text.into())]);
+            m.timestamp_utc = Some(t0 + chrono::Duration::seconds(secs));
+            m
+        };
+        let resumed = 23 * 3600;
+        let mut pane = crate::ConversationPane {
+            messages: std::sync::Arc::new(vec![
+                at("user", 0, "typed"),
+                at("meta", resumed, "Continue from where you left off."),
+                at("assistant", resumed + 5, "reply"),
+            ]),
+            ..Default::default()
+        };
+        pane.compact = false;
+        state.panes = vec![pane];
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("Δ5s"), "{text}");
+        assert!(!text.contains("Δ23h"), "{text}");
     }
 
     #[test]
@@ -8352,6 +8930,34 @@ mod tests {
     }
 
     #[test]
+    fn text_roles_keep_their_brightness_order() {
+        let luma = |c: Color| match c {
+            Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b), // lint-ok: raw-rgb — a pattern, not a color
+            _ => panic!("theme colors are RGB"),
+        };
+        // Unread filler < secondary figures < labels < values < titles: a value
+        // that renders darker than its own label reads as the less important.
+        let ladder = [
+            theme::FAINT,
+            theme::META,
+            theme::LABEL,
+            theme::VALUE,
+            theme::TITLE,
+        ];
+        for pair in ladder.windows(2) {
+            assert!(
+                luma(pair[0]) < luma(pair[1]),
+                "{:?} !< {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(theme::TIME, theme::META);
+        assert_eq!(theme::SESSION_ID, theme::META);
+        assert_eq!(theme::PLACEHOLDER, theme::LABEL);
+    }
+
+    #[test]
     fn model_color_accepts_normalized_display_names() {
         // The project-detail popup keys its model map by `normalize_model_name`,
         // so the colour lookup sees "Opus 5", not the raw id.
@@ -8364,7 +8970,7 @@ mod tests {
             );
             assert_ne!(
                 model_color(&display),
-                theme::LABEL_MUTED,
+                theme::LABEL,
                 "{display} fell through to the unpriced/unknown colour"
             );
         }
@@ -8374,6 +8980,14 @@ mod tests {
     fn test_model_color_sonnet() {
         assert_eq!(model_color("claude-sonnet-4"), theme::MODEL_SONNET);
         assert_eq!(model_color("sonnet"), theme::MODEL_SONNET);
+        for m in [
+            "claude-fable-5-1",
+            "Fable 5",
+            "claude-mythos-5-1",
+            "Mythos 5",
+        ] {
+            assert_eq!(model_color(m), theme::MODEL_FABLE, "{m}");
+        }
     }
 
     #[test]
@@ -8384,7 +8998,7 @@ mod tests {
 
     #[test]
     fn test_model_color_unknown() {
-        assert_eq!(model_color("unknown-model"), theme::LABEL_MUTED);
+        assert_eq!(model_color("unknown-model"), theme::LABEL);
     }
 
     #[test]
@@ -8670,6 +9284,7 @@ mod tests {
             day_input_tokens: 5000,
             day_output_tokens: 1000,
             day_user_msgs: 0,
+            day_prompts: 0,
             day_assistant_msgs: 0,
             day_tokens_by_model,
             day_hourly_activity: std::collections::HashMap::new(),
@@ -8685,6 +9300,7 @@ mod tests {
             last_user_message: None,
             first_user_message: None,
             is_subagent: false,
+            parent_path: None,
             is_continued: false,
             line_churn: Default::default(),
         };
@@ -9937,6 +10553,87 @@ mod tests {
     }
 
     #[test]
+    fn a_recent_sort_scales_model_bars_by_the_largest_model() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        let today = chrono::Local::now().date_naive();
+        // The most recent model is the smallest, so it sorts first under Recency.
+        let groups = vec![
+            make_daily_group(
+                today,
+                vec![make_session_with_tokens("p", 100, 0, "claude-sonnet-4-6")],
+            ),
+            make_daily_group(
+                today - chrono::Duration::days(3),
+                vec![make_session_with_tokens("p", 10_000, 0, "claude-opus-4-6")],
+            ),
+        ];
+        let mut state = make_test_app_state(groups);
+        for (model, input) in [("Sonnet 4.6", 100), ("Opus 4.6", 10_000)] {
+            state.aggregated_model_tokens.insert(
+                model.to_string(),
+                crate::aggregator::stats::TokenStats {
+                    input_tokens: input,
+                    ..Default::default()
+                },
+            );
+        }
+        state.dashboard_models_sort = crate::RankSort::Recency;
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_panel = 2;
+        let text = render_to_text(&mut state, 140, 45);
+        let full = "█".repeat(15);
+        let full_bars = text.lines().filter(|l| l.contains(&full)).count();
+        assert_eq!(
+            full_bars, 1,
+            "only the largest model fills its bar:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_recent_sort_scales_project_bars_by_the_largest_project() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let groups = vec![
+            make_daily_group(today, vec![make_session("small", None, None)]),
+            make_daily_group(
+                today - chrono::Duration::days(3),
+                vec![make_session("big", None, None)],
+            ),
+        ];
+        let mut state = make_test_app_state(groups);
+        state.stats.project_stats.clear();
+        for (name, work) in [("small", 100), ("big", 10_000)] {
+            state.stats.project_stats.insert(
+                name.to_string(),
+                crate::aggregator::stats::ProjectStats {
+                    sessions: 1,
+                    tokens: work,
+                    work_tokens: work,
+                },
+            );
+        }
+        // Recency ranks by `project_list`; the smaller project is the newer one.
+        state.project_list = vec![
+            ("small".to_string(), 100, today),
+            ("big".to_string(), 10_000, today - chrono::Duration::days(3)),
+        ];
+        state.dashboard_projects_sort = crate::RankSort::Recency;
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_panel = 1;
+        let text = render_to_text(&mut state, 140, 45);
+        let full = "█".repeat(12);
+        let full_bars = text.lines().filter(|l| l.contains(&full)).count();
+        assert_eq!(
+            full_bars, 1,
+            "only the largest project fills its bar:\n{text}"
+        );
+    }
+
+    #[test]
     fn test_models_detail_unknown_model_shows_warning_badge() {
         // Regression: unknown model families (no pricing entry) must show a "no pricing"
         // warning so the user is not silently undercharged in the cost summary.
@@ -10147,6 +10844,7 @@ mod tests {
             day_input_tokens: 100000,
             day_output_tokens: 100000,
             day_user_msgs: 0,
+            day_prompts: 0,
             day_assistant_msgs: 0,
             day_tokens_by_model: std::collections::HashMap::new(),
             day_hourly_activity: std::collections::HashMap::new(),
@@ -10162,6 +10860,7 @@ mod tests {
             last_user_message: None,
             first_user_message: None,
             is_subagent: true,
+            parent_path: None,
             is_continued: false,
             line_churn: Default::default(),
         };
@@ -10598,6 +11297,7 @@ mod tests {
             day_input_tokens: 1000,
             day_output_tokens: 200,
             day_user_msgs: 1,
+            day_prompts: 1,
             day_assistant_msgs: 1,
             day_tokens_by_model: tokens.clone(),
             day_hourly_activity: Default::default(),
@@ -10613,6 +11313,7 @@ mod tests {
             last_user_message: None,
             first_user_message: None,
             is_subagent: false,
+            parent_path: None,
             is_continued: false,
             line_churn: Default::default(),
         };
@@ -10961,7 +11662,7 @@ mod tests {
             "Enter:view",
             "Space:pin",
             "y:copy-resume",
-            "←→:date",
+            "←→:snapshot",
             "m:pins",
         ] {
             assert!(text.contains(key), "Live footer missing {key:?}: {text}");
@@ -11184,8 +11885,8 @@ mod tests {
             "past footer missing t:title: {text}"
         );
         assert!(
-            text.contains("←→:date"),
-            "past footer missing ←→:date: {text}"
+            text.contains("←→:snapshot"),
+            "past footer missing ←→:snapshot: {text}"
         );
         // Title bar advertises the time-travel directions so `←/→` is
         // discoverable rather than hidden in the footer.
@@ -11222,12 +11923,94 @@ mod tests {
         ];
         let text = render_to_text(&mut state, 140, 50);
         assert!(text.contains("vs now:"), "missing diff summary: {text}");
-        assert!(text.contains("1 live"), "expected 1 still-live: {text}");
-        assert!(text.contains("1 ended"), "expected 1 ended: {text}");
+        // Each count carries its row glyph, so the header doubles as the legend.
+        assert!(text.contains("● 1 live"), "expected 1 still-live: {text}");
+        assert!(text.contains("· 1 ended"), "expected 1 ended: {text}");
         assert!(text.contains("1 new"), "expected 1 new-since: {text}");
         // Still-live rows carry the `●` diff glyph (unambiguous — the ended `·`
         // collides with the continued-session marker, so assert on `●`).
         assert!(text.contains("●"), "still-live glyph ● missing: {text}");
+    }
+
+    #[test]
+    fn past_view_row_ages_count_back_from_the_snapshot() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Live;
+        state.live_view_snapshot_offset = 1;
+        state.live_past_snapshot_total = 1;
+        let captured_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        let snap_date = captured_at.with_timezone(&chrono::Local).date_naive();
+        state.live_past_snapshot_meta = Some((captured_at, snap_date));
+        state.live_past_sessions = vec![
+            live_session_fixture("idle", "/Users/me/a", None, 3 * 3600 + 120),
+            live_session_fixture("kept-going", "/Users/me/b", None, 1800),
+        ];
+        let text = render_to_text(&mut state, 140, 50);
+        assert!(
+            text.contains("1h ago"),
+            "idle row counts from the snapshot: {text}"
+        );
+        assert!(!text.contains("3h ago"), "wall-clock age leaked: {text}");
+        assert!(text.contains("continued"), "post-snapshot activity: {text}");
+    }
+
+    #[test]
+    fn the_daily_session_header_names_the_row_glyphs_it_counts() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Daily;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("· new: "), "{text}");
+        assert!(text.contains("» continued: "), "{text}");
+    }
+
+    #[test]
+    fn a_session_row_and_its_detail_carry_the_subagents_it_launched() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let mut parent = make_session_with_tokens("proj", 1_000_000, 0, "claude-opus-4-6");
+        parent.file_path = std::path::PathBuf::from("/p/slug/pid.jsonl");
+        let mut sub = make_session_with_tokens("proj", 1_000_000, 0, "claude-opus-4-6");
+        sub.file_path = std::path::PathBuf::from("/p/slug/pid/subagents/agent-a.jsonl");
+        sub.is_subagent = true;
+        sub.parent_path = Some(parent.file_path.clone());
+        let calculator = crate::aggregator::CostCalculator::global();
+        let own = parent.cost(calculator);
+        let groups = vec![make_daily_group(
+            chrono::Local::now().date_naive(),
+            vec![parent, sub],
+        )];
+        let mut state = crate::test_helpers::helpers::make_test_app_state(groups.clone());
+        state.original_daily_groups = groups;
+        state.tab = crate::Tab::Daily;
+        let row = render_to_text(&mut state, 140, 45);
+        let total = format_cost(2.0 * own, 0);
+        assert!(
+            row.contains(&format!(" proj  2.00M {total} ")),
+            "row sums the subagent's tokens and cost: {row}"
+        );
+
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "proj".to_string(),
+            scroll: 0,
+        };
+        let project = render_popup_text(&mut state, 140, 45);
+        assert!(
+            project.contains(&format!(
+                "Cost  {}   Tokens 2.00M",
+                format_cost(2.0 * own, 2)
+            )),
+            "project total carries the subagent: {project}"
+        );
+
+        state.active_popup = crate::ActivePopup::Detail;
+        let popup = render_popup_text(&mut state, 140, 45);
+        let split = format!(
+            "(session {} + subagents {})",
+            format_cost(own, 2),
+            format_cost(own, 2)
+        );
+        assert!(popup.contains(&split), "{split}: {popup}");
+        assert!(popup.contains("+ subagents work:1.00M"), "{popup}");
+        assert!(popup.contains(&format_cost(2.0 * own, 2)), "{popup}");
     }
 
     #[test]
@@ -11275,6 +12058,7 @@ mod tests {
             snippet: Some("…run-queue locks in scheduler order but the…".to_string()),
             match_type: crate::search::SearchMatchType::Content,
             session_path: Some("/tmp/test.jsonl".to_string()),
+            message_date: None,
         }];
 
         let text = render_to_text(&mut state, 140, 45);
@@ -11335,6 +12119,7 @@ mod tests {
             snippet: None,
             match_type: crate::search::SearchMatchType::GitBranch,
             session_path: Some("/tmp/test.jsonl".to_string()),
+            message_date: None,
         }];
 
         let buffer = render_buffer(&mut state, 140, 45);

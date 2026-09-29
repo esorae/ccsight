@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // Bump on changes to: parser output, aggregator field semantics
 // (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
-const CACHE_VERSION: u32 = 39;
+const CACHE_VERSION: u32 = 43;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {
@@ -52,6 +52,9 @@ pub struct CachedDailyStats {
     /// bump forces a rebuild that populates real values.
     #[serde(default)]
     pub user_msgs: u64,
+    /// The share of `user_msgs` someone typed.
+    #[serde(default)]
+    pub prompts: u64,
     #[serde(default)]
     pub assistant_msgs: u64,
 }
@@ -174,6 +177,15 @@ impl Cache {
         }
     }
 
+    /// These contents with saving disabled, for tests that drive the real
+    /// load path over real data: `save` refuses the placeholder path, so the
+    /// developer's cache is read but never rewritten.
+    #[cfg(test)]
+    pub(crate) fn read_only(mut self) -> Self {
+        self.cache_path = PathBuf::from("/dev/null");
+        self
+    }
+
     pub fn new_empty() -> Self {
         Self {
             cache_path: PathBuf::from("/dev/null"), // Fallback path, won't be saved
@@ -280,6 +292,14 @@ pub fn get_file_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_only_cache_refuses_to_save() {
+        let path = std::env::temp_dir().join(format!("ccsight-ro-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(Cache::empty_at(path.clone()).read_only().save().is_err());
+        assert!(!path.exists(), "a read-only cache wrote its file");
+    }
     use crate::aggregator::TokenStats;
 
     #[test]

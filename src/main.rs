@@ -241,6 +241,25 @@ fn main() -> io::Result<()> {
     result
 }
 
+/// File paths of one day's user sessions, in the order `selected_session`
+/// counts them.
+fn day_session_paths(state: &AppState, day: usize) -> Vec<PathBuf> {
+    state.daily_groups.get(day).map_or_else(Vec::new, |g| {
+        g.user_sessions().map(|s| s.file_path.clone()).collect()
+    })
+}
+
+/// Session ids of the Live rows in display order — active, then paused, the
+/// order `live_selected` counts in.
+fn live_row_keys(state: &AppState) -> Vec<String> {
+    state
+        .live_active
+        .iter()
+        .chain(&state.live_paused)
+        .map(|s| s.session_id.clone())
+        .collect()
+}
+
 fn poll_live_sessions_task(state: &mut AppState) {
     if let Some(ref rx) = state.live_sessions_task {
         match rx.try_recv() {
@@ -265,12 +284,24 @@ fn poll_live_sessions_task(state: &mut AppState) {
                             .or_insert_with(|| s.cwd.clone());
                     }
                 }
+                // Captured before the lists are replaced: rows are re-found by
+                // session id, as a position alone would name whichever session
+                // moved into it.
+                let prev_keys = live_row_keys(state);
                 state.live_active = active;
                 state.live_paused = paused;
                 // The discovery thread sorts paused by jsonl_mtime, which
                 // clusters on bulk touches. Re-sort here, where the aggregation
                 // is available, by the real last-activity the age column shows.
                 crate::ui::sort_paused_by_recency(state);
+                if state
+                    .last_input_at
+                    .is_some_and(|t| t.elapsed() < crate::state::LIVE_ORDER_HOLD)
+                {
+                    let id = |s: &infrastructure::live_sessions::LiveSession| s.session_id.clone();
+                    crate::state::hold_order(&mut state.live_active, &prev_keys, id);
+                    crate::state::hold_order(&mut state.live_paused, &prev_keys, id);
+                }
                 state.live_last_update = Some(std::time::Instant::now());
                 // Refresh the time-travel-hint flag once per poll (the poll
                 // thread just ran `save_if_changed`) instead of re-scanning
@@ -278,9 +309,23 @@ fn poll_live_sessions_task(state: &mut AppState) {
                 state.live_has_snapshot_history =
                     !infrastructure::live_snapshots::LiveSnapshot::load_recent().is_empty();
                 state.live_sessions_task = None;
-                state.live_selected = state
-                    .live_selected
-                    .min((state.live_active.len() + state.live_paused.len()).saturating_sub(1));
+                // A past snapshot's cursor indexes a different list.
+                if state.live_view_snapshot_offset == 0 {
+                    let next_keys = live_row_keys(state);
+                    let followed =
+                        crate::state::follow_selection(&prev_keys, state.live_selected, &next_keys);
+                    // The session may have crossed into the pane the current
+                    // view hides; stay on a row that is on screen.
+                    let (lo, hi) = live_selectable_range(state);
+                    state.live_selected = followed.clamp(lo, hi.saturating_sub(1).max(lo));
+                    if state.conv_list_mode == crate::ConvListMode::Live {
+                        state.selected_session = crate::state::follow_selection(
+                            &prev_keys,
+                            state.selected_session,
+                            &next_keys,
+                        );
+                    }
+                }
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 state.live_sessions_task = None;
@@ -341,6 +386,11 @@ fn poll_index_build_task(state: &mut AppState) {
                 state.search_index = Some(index);
                 state.last_index_build = Some(std::time::Instant::now());
                 state.needs_draw = true;
+                // The popup promised content matches once the index lands;
+                // re-query so they appear without an edit to the query.
+                if state.search_mode && !state.search_preview_mode {
+                    start_content_search(state);
+                }
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // Builder failed without sending; clear the flag so the
@@ -442,7 +492,29 @@ fn poll_data_reload_task(state: &mut AppState) {
                 // and turn into a thread storm.
                 state.last_data_update = Some(std::time::Instant::now());
                 if let Ok(data) = result {
+                    // Named by date and path, not position: a new day enters
+                    // at the head of the list, and a session written to
+                    // re-sorts to the top of its day, so the same indices
+                    // would point at a different day or session.
+                    let prev_days: Vec<NaiveDate> =
+                        state.daily_groups.iter().map(|g| g.date).collect();
+                    let prev_sessions = day_session_paths(state, state.selected_day);
+                    let (prev_day, prev_session) = (state.selected_day, state.selected_session);
                     state.apply_loaded_data(data);
+                    let next_days: Vec<NaiveDate> =
+                        state.daily_groups.iter().map(|g| g.date).collect();
+                    state.selected_day =
+                        crate::state::follow_selection(&prev_days, prev_day, &next_days);
+                    if state.conv_list_mode == crate::ConvListMode::Day
+                        && prev_days.get(prev_day) == next_days.get(state.selected_day)
+                    {
+                        let next_sessions = day_session_paths(state, state.selected_day);
+                        state.selected_session = crate::state::follow_selection(
+                            &prev_sessions,
+                            prev_session,
+                            &next_sessions,
+                        );
+                    }
 
                     // The Recent-conversation preview is keyed by path only,
                     // so without this a reopened detail popup would keep the
@@ -496,28 +568,56 @@ fn poll_search_task(state: &mut AppState) {
         match rx.try_recv() {
             Ok(content_results) => {
                 if *query == state.search_input.text {
-                    let path_lookup: std::collections::HashMap<String, (usize, usize)> = state
-                        .daily_groups
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(day_idx, group)| {
-                            group
-                                .user_sessions()
-                                .enumerate()
-                                .map(move |(session_idx, session)| {
-                                    (
-                                        session.file_path.to_string_lossy().into_owned(),
-                                        (day_idx, session_idx),
-                                    )
-                                })
-                        })
-                        .collect();
+                    // Every day a session occupies, newest first (groups run
+                    // newest-first), so the period filter can pick a day it covers.
+                    let mut path_lookup: std::collections::HashMap<String, Vec<(usize, usize)>> =
+                        std::collections::HashMap::new();
+                    for (day_idx, group) in state.daily_groups.iter().enumerate() {
+                        for (session_idx, session) in group.user_sessions().enumerate() {
+                            path_lookup
+                                .entry(session.file_path.to_string_lossy().into_owned())
+                                .or_default()
+                                .push((day_idx, session_idx));
+                        }
+                    }
                     let (filters, _) = crate::search::parse_search_query(&state.search_input.text);
                     let ctx_owned = build_search_filter_ctx(state);
                     let ctx = ctx_owned.as_ref();
+                    let day_in_period = |day_idx: usize| {
+                        state.daily_groups.get(day_idx).is_some_and(|g| {
+                            crate::search::period_matches_for_filter(
+                                g.date,
+                                filters.period,
+                                ctx.today,
+                            )
+                        })
+                    };
+                    // Sessions already listed, built once: a fetch returns up
+                    // to thousands of hits, and a per-hit scan of the list
+                    // runs on the render thread.
+                    let mut shown: std::collections::HashSet<std::path::PathBuf> = state
+                        .search_results
+                        .iter()
+                        .filter_map(|r| {
+                            state.daily_groups.get(r.day_idx).and_then(|g| {
+                                g.user_sessions()
+                                    .nth(r.session_idx)
+                                    .map(|s| s.file_path.clone())
+                            })
+                        })
+                        .collect();
                     for mut result in content_results {
                         if let Some(path) = result.session_path.as_ref() {
-                            let Some(&(day_idx, session_idx)) = path_lookup.get(path) else {
+                            let is_message_day = |day_idx: usize| {
+                                result.message_date.is_some_and(|m| {
+                                    state.daily_groups.get(day_idx).is_some_and(|g| g.date == m)
+                                })
+                            };
+                            let Some((day_idx, session_idx)) =
+                                path_lookup.get(path).and_then(|days| {
+                                    crate::search::hit_position(days, day_in_period, is_message_day)
+                                })
+                            else {
                                 continue;
                             };
                             result.day_idx = day_idx;
@@ -547,16 +647,7 @@ fn poll_search_task(state: &mut AppState) {
                         // Dedupe by file_path so a multi-day session doesn't
                         // appear once per day. perform_search deduped its own
                         // output; this catches tantivy hits that arrive after.
-                        let already = state.search_results.iter().any(|r| {
-                            let other = state.daily_groups.get(r.day_idx).and_then(|g| {
-                                g.sessions
-                                    .iter()
-                                    .filter(|s| !s.is_subagent)
-                                    .nth(r.session_idx)
-                            });
-                            other.is_some_and(|o| o.file_path == session.file_path)
-                        });
-                        if !already {
+                        if shown.insert(session.file_path.clone()) {
                             state.search_results.push(result);
                         }
                     }
@@ -910,6 +1001,13 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                 Ok(result) => result?,
                 Err(_) => continue,
             };
+            // Only input the reader directs counts toward `LIVE_ORDER_HOLD`:
+            // a bare pointer move or a resize is not steering the list.
+            if matches!(ev, Event::Key(_))
+                || matches!(ev, Event::Mouse(m) if !matches!(m.kind, MouseEventKind::Moved))
+            {
+                state.last_input_at = Some(Instant::now());
+            }
             match ev {
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -1364,10 +1462,16 @@ pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
 }
 
 fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
-    let files = FileDiscovery::find_jsonl_files_with_limit(limit)?;
-    let file_count = files.len();
     let cache = crate::infrastructure::Cache::load()
         .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
+    load_data_with(limit, cache)
+}
+
+/// `load_data` over a caller-supplied cache: the aggregation saves whatever
+/// cache it is handed, so a test passes one that cannot write back.
+fn load_data_with(limit: usize, cache: crate::infrastructure::Cache) -> anyhow::Result<LoadedData> {
+    let files = FileDiscovery::find_jsonl_files_with_limit(limit)?;
+    let file_count = files.len();
     // Thread the stats-updated cache into the grouper: cold-start misses are
     // parsed once (by stats) and become grouper cache hits.
     let (stats, cache_stats, cache) = StatsAggregator::aggregate_with_shared_cache(&files, cache);
@@ -1523,9 +1627,30 @@ impl SearchFilterCtxOwned {
     }
 }
 
+/// Bumped whenever a search starts or ends, so a file scan left behind by a
+/// newer keystroke, the index path, or Esc stops at its next file instead of
+/// reading every transcript to completion.
+static CONTENT_SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn supersede_content_scan() -> u64 {
+    CONTENT_SCAN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
+
+/// Days a content match's message must fall in: the view's period filter
+/// narrowed by the query's own `filter:` period.
+fn message_date_bounds(state: &AppState) -> (Option<NaiveDate>, Option<NaiveDate>) {
+    let (filters, _) = crate::search::parse_search_query(&state.search_input.text);
+    let today = chrono::Local::now().date_naive();
+    crate::search::intersect_bounds(
+        state.period_filter.date_range(),
+        crate::search::period_bounds(filters.period, today),
+    )
+}
+
 pub(crate) fn start_content_search(state: &mut AppState) {
     state.search_task = None;
     state.searching = false;
+    let generation = supersede_content_scan();
 
     // The tantivy index only knows about message content — filter tokens
     // (`filter:live`, `project:X` etc.) would be matched as literal text
@@ -1544,13 +1669,17 @@ pub(crate) fn start_content_search(state: &mut AppState) {
 
     if let Some(ref index) = state.search_index {
         // Off-UI-thread to keep typing responsive. Receiver path remaps
-        // session_path → current daily_groups (see L617 lookup).
+        // session_path → current daily_groups (`poll_search_task`).
         let index = std::sync::Arc::clone(index);
+        let (from, to) = message_date_bounds(state);
         let (tx, rx) = mpsc::channel();
         state.searching = true;
         state.search_task = Some((rx, task_key.clone()));
         std::thread::spawn(move || {
-            let results = index.search(&query, 200, 50);
+            // The TUI's project / pin / `project:` / `filter:live` filters all
+            // run on the results, so fetch past what one screen shows.
+            let results =
+                index.search_between(&query, crate::search::FILTERED_INDEX_FETCH, 50, from, to);
             let _ = tx.send(results);
         });
         return;
@@ -1574,7 +1703,9 @@ pub(crate) fn start_content_search(state: &mut AppState) {
 
     let (tx, rx) = mpsc::channel();
     state.searching = true;
-    state.search_task = Some((rx, query.clone()));
+    // The full input, as on the index path: the receiver compares against it,
+    // so a filter-stripped key would drop every result of a filtered query.
+    state.search_task = Some((rx, task_key));
 
     std::thread::spawn(move || {
         let mut results = Vec::new();
@@ -1583,7 +1714,12 @@ pub(crate) fn start_content_search(state: &mut AppState) {
 
         for (day_idx, sessions) in &groups_data {
             for (session_idx, file_path) in sessions {
-                if searched >= max_files {
+                // A keystroke starts a newer scan; this one's result would be
+                // discarded, and each scan reads whole transcripts.
+                if searched >= max_files
+                    || CONTENT_SCAN_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+                        != generation
+                {
                     break;
                 }
                 if let Some(snippet) = search::search_session_content(file_path, &query) {
@@ -1595,6 +1731,7 @@ pub(crate) fn start_content_search(state: &mut AppState) {
                         // Indices computed against current daily_groups,
                         // remap-on-filter not needed.
                         session_path: None,
+                        message_date: None,
                     });
                 }
                 searched += 1;
@@ -1641,9 +1778,19 @@ fn start_index_build(state: &mut AppState) {
         let early = move |idx: infrastructure::SearchIndex| {
             let _ = early_tx.send(Arc::new(idx));
         };
-        if let Ok(index) = infrastructure::SearchIndex::update_or_build_with_early(&groups, &early)
-        {
-            let _ = tx.send(Arc::new(index));
+        match infrastructure::SearchIndex::update_or_build_with_early(&groups, &early) {
+            Ok(index) => {
+                let _ = tx.send(Arc::new(index));
+            }
+            // Another ccsight holding the writer lock blocks the catch-up,
+            // not the reading: the existing index is still searchable, and
+            // hits are remapped by path, so its staleness only misses the
+            // newest messages. Without this, search falls to a file scan.
+            Err(_) => {
+                if let Some((index, _)) = infrastructure::SearchIndex::open_for_read(&groups) {
+                    let _ = tx.send(Arc::new(index));
+                }
+            }
         }
     });
 }

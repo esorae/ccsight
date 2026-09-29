@@ -1288,11 +1288,12 @@ if [ -n "$INTENSITY_INLINE" ]; then
     ERRORS=$((ERRORS + 1))
 fi
 
-# 47. Raw `Color::Rgb(...)` outside the theme palette. Ad-hoc colors fork
+# 47. Raw `Color::Rgb(...)` or a named terminal color (`Color::DarkGray`…)
+# outside the theme palette. Ad-hoc colors fork
 # the design system; new hues belong in `ui/mod.rs::theme` (const or ramp).
 # Sanctioned constructors carry `lint-ok: raw-rgb` on the same or next line.
-RAW_RGB=$(grep -rn 'Color::Rgb(' src/ 2>/dev/null \
-    | grep -v 'pub const' \
+RAW_RGB=$(grep -rnE 'Color::Rgb\(|Color::(Black|Red|Green|Yellow|Blue|Magenta|Cyan|Gray|DarkGray|White|Indexed|Light[A-Za-z]+)\b' src/ 2>/dev/null \
+    | grep -vE '(pub )?const [A-Z_]+: Color = ' \
     | grep -v 'lint-ok: raw-rgb' || true)
 if [ -n "$RAW_RGB" ]; then
     # A multi-line construction may carry the marker on the following line;
@@ -1304,7 +1305,7 @@ if [ -n "$RAW_RGB" ]; then
     done)
 fi
 if [ -n "$RAW_RGB" ]; then
-    echo "ERROR: raw Color::Rgb outside the theme palette — add the color to ui/mod.rs::theme (const or ramp), or mark a genuine constructor with 'lint-ok: raw-rgb':"
+    echo "ERROR: raw Color::Rgb / named Color outside the theme palette — add the color to ui/mod.rs::theme (const or ramp), or mark a genuine constructor with 'lint-ok: raw-rgb':"
     echo "$RAW_RGB"
     ERRORS=$((ERRORS + 1))
 fi
@@ -1352,12 +1353,39 @@ if [ -n "$RAW_PCT" ]; then
     ERRORS=$((ERRORS + 1))
 fi
 
-# 51. Test that builds the search index through the real state dir.
+# 52. A public gray in the theme. Text grays stay private behind role names
+# (`TIME`, `LABEL`, `VALUE`…) because two grays a few points apart read as one
+# and callers then pick by shade, forking the same role across screens. A new
+# `pub const` whose channels sit within a narrow band is that fork in the
+# making; add a role alias to an existing private gray instead. The listed
+# names are structural (fills, backgrounds, lines, extremes), not text tiers.
+PUBLIC_GRAYS=$(python3 -c "
+import re
+allowed = {'FAINT', 'BORDER', 'SEPARATOR', 'TEXT_BRIGHT', 'TEXT_DARK', 'HEATMAP_EMPTY', 'SEARCH_MATCH'}
+for i, line in enumerate(open('src/ui/mod.rs').read().split('\\n')):
+    m = re.match(r'\\s*pub const ([A-Z_]+): Color = Color::Rgb\\((\\d+), (\\d+), (\\d+)\\)', line)
+    if not m or m.group(1) in allowed:
+        continue
+    rgb = [int(m.group(k)) for k in (2, 3, 4)]
+    if max(rgb) - min(rgb) <= 30:
+        print(f'src/ui/mod.rs:{i+1}: {line.strip()}')
+" 2>/dev/null || true)
+if [ -n "$PUBLIC_GRAYS" ]; then
+    echo "ERROR: public gray in ui::theme — alias an existing private gray under a role name instead:"
+    echo "$PUBLIC_GRAYS"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 51. Test that writes the real state dir (search index or cache).
 # `SearchIndex::build` / `update_or_build` resolve `~/.ccsight/index`, and
 # building there starts by deleting the directory — so a test that reaches for
 # them wipes the developer's own index and passes anyway. `build_in` takes the
 # directory, so tests point it at a temp dir. `// lint-ok: real-index` marks a
-# test that deliberately works on real data.
+# test that deliberately works on real data. The cache likewise: `load_data`
+# and a bare `Cache::load()` save it back when they aggregate, so a build with
+# another `CACHE_VERSION` leaves the installed release a cache it rejects.
+# `load_data_with` + `Cache::read_only` read without writing;
+# `// lint-ok: real-cache` marks a deliberate write.
 REAL_INDEX_IN_TESTS=$(python3 -c "
 import re
 for fname in '$ALL_RUST_FILES'.split():
@@ -1376,13 +1404,15 @@ for fname in '$ALL_RUST_FILES'.split():
             if depth <= 0:
                 in_tests = False
                 continue
-            if 'lint-ok: real-index' in line:
+            if 'lint-ok: real-index' in line or 'lint-ok: real-cache' in line:
                 continue
             if re.search(r'SearchIndex::(build|clear_index)\(|update_or_build\(', line):
                 print(f'{fname}:{i+1}: {stripped}')
+            elif re.search(r'\bload_data\(|Cache::load\(\)', line):
+                print(f'{fname}:{i+1}: {stripped}  [real cache: load_data_with + Cache::read_only]')
 " 2>/dev/null || true)
 if [ -n "$REAL_INDEX_IN_TESTS" ]; then
-    echo "ERROR: test builds the real ~/.ccsight index (it deletes the directory first) — use SearchIndex::build_in with a temp dir:"
+    echo "ERROR: test writes the real ~/.ccsight state — index: use SearchIndex::build_in with a temp dir; cache: use load_data_with + Cache::read_only:"
     echo "$REAL_INDEX_IN_TESTS"
     ERRORS=$((ERRORS + 1))
 fi

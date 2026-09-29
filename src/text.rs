@@ -8,6 +8,13 @@ fn is_cjk_breakable(c: char) -> bool {
     )
 }
 
+/// Round a dollar figure to whole cents for JSON `cost_usd` output. Clamps at
+/// 0 so a zero-token session can't emit `-0.0` (the TUI clamps via format_cost).
+/// Shared by the MCP tools and the CLI's `--json`, so the two agree.
+pub(crate) fn round_cents(cost: f64) -> f64 {
+    (cost.max(0.0) * 100.0).round() / 100.0
+}
+
 pub fn wrap_text_with_continuation(text: &str, max_width: usize) -> (Vec<String>, Vec<bool>) {
     use unicode_width::UnicodeWidthChar;
 
@@ -246,29 +253,19 @@ pub fn parse_text_with_code_blocks(text: &str) -> Vec<TextSegment> {
     segments
 }
 
-/// Heuristic: after the known-tag strip pass, any remaining `<kebab-case>`
-/// marker (one or more `-` inside ASCII alphanumeric) is treated as an
-/// unstripped system-injected wrapper. Single-word tags (`<foo>`) and
-/// arrow-style prose (`x < 3` / `if a > b`) are NOT matched so genuine
-/// user content with `<`/`>` is preserved.
+/// Heuristic: after the known-tag strip pass, text that still OPENS with a
+/// `<kebab-case>` marker is an unstripped system-injected wrapper — Claude
+/// Code emits them as whole messages. A tag further in is quoted content (a
+/// pasted component, a recap), and matching it would drop a real prompt.
 pub fn looks_like_system_injection(s: &str) -> bool {
-    let mut rest = s;
-    while let Some(start) = rest.find('<') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find('>') else {
-            return false;
-        };
-        let inside = &rest[..end];
-        let name = inside.trim_start_matches('/');
-        let is_kebab_tag = name.contains('-')
-            && !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if is_kebab_tag {
-            return true;
-        }
-        rest = &rest[end + 1..];
-    }
-    false
+    let Some(rest) = s.trim_start().strip_prefix('<') else {
+        return false;
+    };
+    let Some(end) = rest.find('>') else {
+        return false;
+    };
+    let name = rest[..end].trim_start_matches('/');
+    name.contains('-') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Strip injected XML wrappers and collapse whitespace so the preview line
@@ -496,5 +493,17 @@ mod tests {
                 content
             } if content.is_empty()
         ));
+    }
+
+    #[test]
+    fn only_a_leading_kebab_tag_marks_a_system_injection() {
+        assert!(looks_like_system_injection("<task-notification> done"));
+        assert!(looks_like_system_injection("  </local-command-stdout>"));
+        assert!(!looks_like_system_injection(
+            "why does <my-button> not render?"
+        ));
+        assert!(!looks_like_system_injection("<div> plain html"));
+        assert!(!looks_like_system_injection("if a < b-c > d"));
+        assert!(!looks_like_system_injection("<unterminated-tag"));
     }
 }

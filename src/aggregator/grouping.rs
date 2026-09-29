@@ -8,7 +8,6 @@ use crate::aggregator::{StatsAggregator, TokenStats};
 use crate::domain::EntryType;
 use crate::infrastructure::Cache;
 use crate::parser::JsonlParser;
-use crate::text::{clean_user_message_preview, looks_like_system_injection};
 
 pub type ModelTokens = TokenStats;
 
@@ -31,6 +30,9 @@ pub struct SessionInfo {
     /// `message.role == User` (slash-command tokens included once per user
     /// turn). Used by the session-detail popup to show conversation depth.
     pub day_user_msgs: u64,
+    /// The share of `day_user_msgs` someone typed — `day_user_msgs` also
+    /// counts every tool result, which Claude Code files under the user role.
+    pub day_prompts: u64,
     /// Assistant-role messages emitted on this day. Counted per assistant
     /// entry regardless of whether it carried tool calls or just text.
     pub day_assistant_msgs: u64,
@@ -53,6 +55,9 @@ pub struct SessionInfo {
     pub first_user_message: Option<String>,
     pub model: Option<String>,
     pub is_subagent: bool,
+    /// The transcript that launched this subagent; `None` for every
+    /// non-subagent and for a subagent whose parent id is unknown.
+    pub parent_path: Option<PathBuf>,
     pub is_continued: bool,
 }
 
@@ -62,6 +67,19 @@ impl SessionInfo {
     /// Centralised so callers don't keep re-typing the addition.
     pub fn work_tokens(&self) -> u64 {
         self.day_input_tokens + self.day_output_tokens
+    }
+
+    /// Label for one of ccsight's own `claude -p` calls (title / summary
+    /// generation); `None` for the user's own work.
+    pub fn ccsight_generated(&self) -> Option<&'static str> {
+        let first = self
+            .first_user_message
+            .as_deref()
+            .or(self.summary.as_deref())?;
+        crate::summary::GENERATED_PROMPTS
+            .iter()
+            .find(|(opening, _)| first.trim_start().starts_with(opening))
+            .map(|(_, kind)| *kind)
     }
 
     /// The single representative line for a session, highest priority first:
@@ -105,7 +123,51 @@ pub struct DailyGroup {
     pub sessions: Vec<SessionInfo>,
 }
 
+/// Spend of the subagents one session launched. Kept apart from the session's
+/// own cost so a total that already sums every transcript can't count it twice.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct SubagentSpend {
+    pub(crate) count: usize,
+    pub(crate) work_tokens: u64,
+    pub(crate) cost: f64,
+    pub(crate) unpriced: bool,
+}
+
+impl SubagentSpend {
+    fn add(&mut self, s: &SessionInfo, calculator: &crate::aggregator::CostCalculator) {
+        self.count += 1;
+        self.work_tokens += s.work_tokens();
+        self.cost += s.cost(calculator);
+        self.unpriced |= s.has_unpriced_model(calculator);
+    }
+}
+
 impl DailyGroup {
+    /// This day's spend by the subagents `parent` launched.
+    pub(crate) fn subagent_spend(&self, parent: &Path) -> SubagentSpend {
+        let calculator = crate::aggregator::CostCalculator::global();
+        let mut spend = SubagentSpend::default();
+        for s in &self.sessions {
+            if s.parent_path.as_deref() == Some(parent) {
+                spend.add(s, calculator);
+            }
+        }
+        spend
+    }
+
+    /// [`Self::subagent_spend`] for every parent in one pass — for a caller
+    /// that looks up many rows of the same day.
+    pub(crate) fn subagent_spend_by_parent(&self) -> HashMap<&Path, SubagentSpend> {
+        let calculator = crate::aggregator::CostCalculator::global();
+        let mut out: HashMap<&Path, SubagentSpend> = HashMap::new();
+        for s in &self.sessions {
+            if let Some(parent) = s.parent_path.as_deref() {
+                out.entry(parent).or_default().add(s, calculator);
+            }
+        }
+        out
+    }
+
     /// Iterator over sessions excluding subagents — the canonical "user-facing"
     /// session list. Most aggregations skip subagents to avoid double-counting
     /// nested activity that's already attributed to the parent session.
@@ -176,19 +238,27 @@ impl DailyGrouper {
     ) -> Vec<DailyGroup> {
         let mut date_map: HashMap<NaiveDate, Vec<SessionInfo>> = HashMap::new();
 
-        // Cross-file dedup: resume/branch rewrites duplicate (msg_id,
-        // requestId) across sessions but Anthropic bills once. Pre-load
-        // with hashes from VALID-cache files only — stale entries would
-        // block fresh-parse files from re-crediting their own tokens.
+        // Resume/branch rewrites duplicate (msg_id, requestId) across files but
+        // bill once, so cache hits' hashes are pre-loaded. Hits are decided
+        // ONCE and shared with the walk: a file the walk re-parses anyway
+        // (appended to mid-pass, or a valid entry without per-day stats) would
+        // otherwise be parsed against its own hashes and credit itself nothing.
+        let hits: std::collections::HashSet<&PathBuf> =
+            cache
+                .as_ref()
+                .map_or_else(std::collections::HashSet::new, |c| {
+                    files
+                        .iter()
+                        .filter(|f| {
+                            c.is_valid(f) && c.get(f).is_some_and(|e| !e.daily_stats.is_empty())
+                        })
+                        .collect()
+                });
         let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(c) = cache.as_ref() {
-            for file in files {
-                if c.is_valid(file)
-                    && let Some(cached) = c.get(file)
-                {
-                    for h in &cached.unique_hashes {
-                        global_seen.insert(h.clone());
-                    }
+            for cached in hits.iter().filter_map(|f| c.get(f)) {
+                for h in &cached.unique_hashes {
+                    global_seen.insert(h.clone());
                 }
             }
         }
@@ -203,7 +273,7 @@ impl DailyGrouper {
         let mut parsed_any = false;
         for file in &sorted_files {
             let (sessions_by_date, parsed) =
-                Self::get_sessions_by_date(file, cache, &mut global_seen);
+                Self::get_sessions_by_date(file, cache, &mut global_seen, hits.contains(*file));
             if parsed {
                 parsed_any = true;
             }
@@ -241,11 +311,11 @@ impl DailyGrouper {
         file: &Path,
         cache: &mut Option<Cache>,
         global_seen: &mut std::collections::HashSet<String>,
+        hit: bool,
     ) -> (Vec<(NaiveDate, SessionInfo)>, bool) {
-        if let Some(c) = cache.as_ref()
-            && c.is_valid(file)
+        if hit
+            && let Some(c) = cache.as_ref()
             && let Some(cached) = c.get(file)
-            && !cached.daily_stats.is_empty()
         {
             // Cache hit: hashes are already in `global_seen`
             // from the pre-load pass at the top of
@@ -270,6 +340,10 @@ impl DailyGrouper {
         let session_start_date = cached
             .session_date
             .unwrap_or_else(|| session_first.with_timezone(&Local).date_naive());
+        let parent_path = cached
+            .is_subagent
+            .then(|| subagent_parent_path(file, cached.session_id.as_deref()))
+            .flatten();
 
         cached
             .daily_stats
@@ -296,6 +370,7 @@ impl DailyGrouper {
                         day_input_tokens: ds.input_tokens,
                         day_output_tokens: ds.output_tokens,
                         day_user_msgs: ds.user_msgs,
+                        day_prompts: ds.prompts,
                         day_assistant_msgs: ds.assistant_msgs,
                         day_tokens_by_model: tokens_by_model,
                         day_hourly_activity: ds.hourly_activity.clone(),
@@ -310,6 +385,7 @@ impl DailyGrouper {
                         first_user_message: cached.first_user_message.clone(),
                         model: cached.model.clone(),
                         is_subagent: cached.is_subagent,
+                        parent_path: parent_path.clone(),
                         is_continued: date != session_start_date,
                     },
                 ))
@@ -444,7 +520,10 @@ impl DailyGrouper {
         let mut file_tool_error_count: usize = 0;
         let mut file_tool_success_count: usize = 0;
         let mut file_model_usage: HashMap<String, usize> = HashMap::new();
-        let session_id_from_entries = entries.first().and_then(|e| e.session_id.clone());
+        let session_id_from_entries = crate::aggregator::stats::session_id_of(&entries);
+        let parent_path = is_subagent
+            .then(|| subagent_parent_path(file, session_id_from_entries.as_deref()))
+            .flatten();
 
         for entry in &entries {
             if let Some(ts) = entry.timestamp {
@@ -468,6 +547,9 @@ impl DailyGrouper {
                     // so the per-day tool_usage reflects command invocations.
                     if matches!(message.role, crate::domain::Role::User) {
                         stats.user_msgs += 1;
+                        if crate::aggregator::stats::is_human_prompt(entry) {
+                            stats.prompts += 1;
+                        }
                         let text = message.content.extract_text();
                         for cmd in crate::aggregator::stats::extract_command_names(&text) {
                             *stats
@@ -642,6 +724,7 @@ impl DailyGrouper {
                         language_usage: ds.language_usage.clone(),
                         extension_usage: ds.extension_usage.clone(),
                         user_msgs: ds.user_msgs,
+                        prompts: ds.prompts,
                         assistant_msgs: ds.assistant_msgs,
                         line_churn: ds.line_churn,
                     },
@@ -717,6 +800,7 @@ impl DailyGrouper {
                         day_input_tokens: stats.input_tokens,
                         day_output_tokens: stats.output_tokens,
                         day_user_msgs: stats.user_msgs,
+                        day_prompts: stats.prompts,
                         day_assistant_msgs: stats.assistant_msgs,
                         day_tokens_by_model: stats.tokens_by_model,
                         day_hourly_activity: stats.hourly_activity,
@@ -731,6 +815,7 @@ impl DailyGrouper {
                         first_user_message: first_user_message.clone(),
                         model: model.clone(),
                         is_subagent,
+                        parent_path: parent_path.clone(),
                         is_continued,
                     },
                 )
@@ -760,41 +845,20 @@ pub(crate) fn extract_first_user_message_for_cache(
     extract_first_user_message(entries)
 }
 
-/// Forward walk for the first user-role message; same cleanup pipeline as
-/// the "last" variant so injected wrappers don't end up in the title.
+/// Title fallback. Shares the prompt test with the prompt count, so a
+/// compaction recap or an injected wrapper never becomes the title.
 fn extract_first_user_message(entries: &[crate::domain::LogEntry]) -> Option<String> {
-    use crate::domain::Role;
-    entries.iter().find_map(|e| {
-        let msg = e.message.as_ref()?;
-        if !matches!(msg.role, Role::User) {
-            return None;
-        }
-        let raw = msg.content.extract_text();
-        let cleaned = clean_user_message_preview(&raw);
-        if cleaned.is_empty() || looks_like_system_injection(&cleaned) {
-            return None;
-        }
-        Some(cleaned)
-    })
+    entries
+        .iter()
+        .find_map(crate::aggregator::stats::human_prompt_text)
 }
 
-/// Most-recent meaningful user-role text. Strips known system wrappers;
-/// any remaining unknown `<kebab-tag>` causes fall-through to the prior
-/// user entry (same approach as `extract_first_user_message`).
+/// Most recent typed prompt, under the same test as the first.
 fn extract_last_user_message(entries: &[crate::domain::LogEntry]) -> Option<String> {
-    use crate::domain::Role;
-    entries.iter().rev().find_map(|e| {
-        let msg = e.message.as_ref()?;
-        if !matches!(msg.role, Role::User) {
-            return None;
-        }
-        let raw = msg.content.extract_text();
-        let cleaned = clean_user_message_preview(&raw);
-        if cleaned.is_empty() || looks_like_system_injection(&cleaned) {
-            return None;
-        }
-        Some(cleaned)
-    })
+    entries
+        .iter()
+        .rev()
+        .find_map(crate::aggregator::stats::human_prompt_text)
 }
 /// Lifetime aggregate of one session, summed across every day it appears. The
 /// canonical per-session total shared by the Live tab, the session detail popup,
@@ -812,15 +876,28 @@ pub(crate) struct SessionCumulative {
     pub(crate) cost: f64,
     pub(crate) unpriced: bool,
     pub(crate) user_msgs: u64,
+    pub(crate) prompts: u64,
     pub(crate) assistant_msgs: u64,
     /// `None` when no day matched — avoids coupling a sentinel `Utc::now()` to
     /// the wall clock.
     pub(crate) earliest_start: Option<DateTime<Utc>>,
     pub(crate) total_work_mins: i64,
+    /// Summed over every day; `count` counts subagent-days, not transcripts.
+    pub(crate) subagents: SubagentSpend,
 }
 
 /// Fold one day's `SessionInfo` slice into a running cumulative — the single
 /// accumulation site both public entry points share.
+impl SessionCumulative {
+    /// The session plus the subagents it launched — the end-to-end spend.
+    pub(crate) fn cost_with_subagents(&self) -> (f64, bool) {
+        (
+            self.cost + self.subagents.cost,
+            self.unpriced || self.subagents.unpriced,
+        )
+    }
+}
+
 fn fold_session_day(
     cum: &mut SessionCumulative,
     s: &SessionInfo,
@@ -831,6 +908,7 @@ fn fold_session_day(
     cum.input_tokens += s.day_input_tokens;
     cum.output_tokens += s.day_output_tokens;
     cum.user_msgs += s.day_user_msgs;
+    cum.prompts += s.day_prompts;
     cum.assistant_msgs += s.day_assistant_msgs;
     for t in s.day_tokens_by_model.values() {
         cum.cache_creation += t.cache_creation_tokens;
@@ -845,6 +923,35 @@ fn fold_session_day(
     cum.total_work_mins += (s.day_last_timestamp - s.day_first_timestamp).num_minutes();
 }
 
+/// Subagent spend on the day `session` is a slice of.
+pub(crate) fn day_subagent_spend(session: &SessionInfo, groups: &[DailyGroup]) -> SubagentSpend {
+    let day = session
+        .day_first_timestamp
+        .with_timezone(&Local)
+        .date_naive();
+    groups
+        .iter()
+        .find(|g| g.date == day)
+        .map(|g| g.subagent_spend(&session.file_path))
+        .unwrap_or_default()
+}
+
+/// A subagent's entries carry its parent's `sessionId`, and the parent sits in
+/// the storage dir — beside the subagent, or above the `<id>/subagents/`
+/// folder it lives under at any depth (workflow runs nest one level more).
+fn subagent_parent_path(file: &Path, session_id: Option<&str>) -> Option<PathBuf> {
+    let dir = file.parent()?;
+    let storage = match dir
+        .ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "subagents"))
+    {
+        Some(subagents) => subagents.parent()?.parent()?,
+        None => dir,
+    };
+    let parent = storage.join(format!("{}.jsonl", session_id?));
+    (parent != file).then_some(parent)
+}
+
 /// Lifetime cumulative for a single session (every day matching `file_path`).
 pub(crate) fn compute_session_cumulative(
     file_path: &Path,
@@ -856,6 +963,8 @@ pub(crate) fn compute_session_cumulative(
         for s in &group.sessions {
             if s.file_path == *file_path {
                 fold_session_day(&mut cum, s, calculator);
+            } else if s.parent_path.as_deref() == Some(file_path) {
+                cum.subagents.add(s, calculator);
             }
         }
     }
@@ -880,6 +989,11 @@ pub(crate) fn cumulative_by_path(
             fold_session_day(&mut entry.0, s, calculator);
         }
     }
+    for s in groups.iter().flat_map(|g| &g.sessions) {
+        if let Some(parent) = s.parent_path.as_deref().and_then(|p| out.get_mut(p)) {
+            parent.0.subagents.add(s, calculator);
+        }
+    }
     out
 }
 
@@ -897,6 +1011,11 @@ pub(crate) fn cumulative_owned_by_path(
         for s in &group.sessions {
             let entry = out.entry(s.file_path.clone()).or_default();
             fold_session_day(entry, s, calculator);
+        }
+    }
+    for s in groups.iter().flat_map(|g| &g.sessions) {
+        if let Some(parent) = s.parent_path.as_deref().and_then(|p| out.get_mut(p)) {
+            parent.subagents.add(s, calculator);
         }
     }
     out
@@ -1137,6 +1256,7 @@ mod tests {
             version: None,
             is_sidechain: false,
             is_compact_summary: false,
+            is_meta: false,
             user_type: None,
             request_id: None,
             level: None,
@@ -1167,6 +1287,37 @@ mod tests {
         assert_eq!(
             extract_last_user_message(&entries),
             Some("final prompt".to_string()),
+        );
+    }
+
+    #[test]
+    fn an_injected_meta_note_is_not_a_prompt() {
+        let mut note = user_entry("Continue from where you left off.");
+        note.is_meta = true;
+        let entries = vec![note.clone(), user_entry("typed"), note.clone()];
+        assert_eq!(
+            extract_first_user_message(&entries),
+            Some("typed".to_string())
+        );
+        assert_eq!(
+            extract_last_user_message(&entries),
+            Some("typed".to_string())
+        );
+        assert!(!crate::aggregator::stats::is_human_prompt(&note));
+    }
+
+    #[test]
+    fn a_compaction_recap_is_neither_the_first_nor_the_last_prompt() {
+        let mut recap = user_entry("summary of the conversation so far");
+        recap.is_compact_summary = true;
+        let entries = vec![recap.clone(), user_entry("typed"), recap];
+        assert_eq!(
+            extract_first_user_message(&entries),
+            Some("typed".to_string())
+        );
+        assert_eq!(
+            extract_last_user_message(&entries),
+            Some("typed".to_string())
         );
     }
 
@@ -1348,6 +1499,7 @@ mod tests {
             version: None,
             is_sidechain: false,
             is_compact_summary: false,
+            is_meta: false,
             user_type: None,
             request_id: None,
             level: None,
@@ -1374,6 +1526,7 @@ mod tests {
             version: None,
             is_sidechain: false,
             is_compact_summary: false,
+            is_meta: false,
             user_type: None,
             request_id: None,
             level: None,
@@ -1440,6 +1593,7 @@ mod tests {
             language_usage: HashMap::new(),
             extension_usage: HashMap::new(),
             user_msgs: 0,
+            prompts: 0,
             assistant_msgs: 0,
             line_churn: Default::default(),
         }
@@ -1545,12 +1699,17 @@ mod tests {
         let mut cached = make_cached_file_stats(daily_stats);
         cached.project_name = Some("~/projects/task".to_string());
         cached.is_subagent = true;
+        cached.session_id = Some("parent-id".to_string());
 
         let file = Path::new("/tmp/agent-test.jsonl");
         let sessions = DailyGrouper::build_sessions_from_cache(file, &cached);
 
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].1.is_subagent);
+        assert_eq!(
+            sessions[0].1.parent_path.as_deref(),
+            Some(Path::new("/tmp/parent-id.jsonl"))
+        );
     }
 
     #[test]
@@ -1659,6 +1818,22 @@ mod tests {
     // `uuid` — into its own file. Both aggregation paths, cold and from the
     // cache, must count such an edit once, or Edits reads high by every copy.
     #[test]
+    fn ccsight_generation_sessions_are_recognised_by_their_first_prompt() {
+        use crate::test_helpers::helpers::make_session;
+        let mut s = make_session("proj", None, None);
+        s.first_user_message = Some(
+            "Generate a VERY SHORT title (max 60 chars) for this Claude Code session, ...".into(),
+        );
+        assert_eq!(s.ccsight_generated(), Some("ccsight · title generation"));
+        s.first_user_message = Some("fix the flaky test".into());
+        assert_eq!(
+            s.ccsight_generated(),
+            None,
+            "the user's own work was flagged"
+        );
+    }
+
+    #[test]
     fn a_tool_result_copied_into_another_file_counts_its_churn_once() {
         use crate::aggregator::StatsAggregator;
         use crate::infrastructure::Cache;
@@ -1710,6 +1885,47 @@ mod tests {
         assert_eq!(warm_stats.line_churn, expected, "stats path, warm");
         let warm = DailyGrouper::group_by_date_with_shared_cache(&files, &mut Some(cache));
         assert_eq!(grouped_churn(&warm), expected, "grouper path, warm");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The pre-load and the walk must agree on which files are cache hits. A
+    // valid entry the walk still re-parses (here: one with no per-day stats)
+    // had its own hashes pre-loaded and was then parsed against them, so the
+    // file credited itself nothing. The same split opened on a timing window
+    // for any file appended to mid-pass, and cached the zero.
+    #[test]
+    fn a_reparsed_file_is_not_deduped_against_its_own_cached_hashes() {
+        use crate::aggregator::StatsAggregator;
+        use crate::infrastructure::Cache;
+        let dir = std::env::temp_dir().join(format!("ccsight-selfdedup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("s.jsonl");
+        let line = serde_json::json!({
+            "type": "assistant", "uuid": "u1", "requestId": "r1",
+            "timestamp": "2026-02-25T10:00:00Z", "cwd": "/tmp/proj", "sessionId": "s",
+            "message": {"id": "m1", "role": "assistant", "model": "claude-opus-5",
+                "content": "hi", "usage": {"input_tokens": 100, "output_tokens": 50}}
+        });
+        std::fs::write(&file, line.to_string() + "\n").unwrap();
+        let files = vec![file.clone()];
+
+        let (_, _, mut cache) =
+            StatsAggregator::aggregate_with_shared_cache(&files, Cache::new_empty());
+        let mut entry = cache.get(&file).cloned().expect("entry written");
+        assert!(
+            !entry.unique_hashes.is_empty(),
+            "fixture must carry a dedup hash"
+        );
+        entry.daily_stats.clear();
+        cache.insert(&file, entry);
+
+        let groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut Some(cache));
+        let output: u64 = groups
+            .iter()
+            .flat_map(|g| g.sessions.iter())
+            .map(|s| s.day_output_tokens)
+            .sum();
+        assert_eq!(output, 50, "the file was deduped against its own hashes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1838,6 +2054,16 @@ mod tests {
             },
             "DailyGrouper persisted churn"
         );
+        // One typed prompt ("hello"); the tool results under the user role
+        // must not count as prompts.
+        let prompts = |e: &crate::infrastructure::CachedFileStats| {
+            e.daily_stats.values().map(|d| d.prompts).sum::<u64>()
+        };
+        assert_eq!(
+            prompts(&entry_from_grouper),
+            1,
+            "DailyGrouper persisted prompts"
+        );
         assert_eq!(entry_from_grouper.weekday_activity.len(), 1);
         assert!(
             entry_from_grouper
@@ -1847,6 +2073,11 @@ mod tests {
 
         // Cross-path comparison when Stats's cache landed on disk.
         if let Some(stats_entry) = entry_from_stats {
+            assert_eq!(
+                prompts(&stats_entry),
+                1,
+                "StatsAggregator persisted prompts"
+            );
             assert_eq!(
                 stats_entry.tool_success_count,
                 entry_from_grouper.tool_success_count
@@ -1887,12 +2118,17 @@ mod tests {
     fn test_parse_and_build_sessions_subagent_by_filename() {
         use std::io::Write;
         let path = std::env::temp_dir().join("agent-ccsight_subagent_test.jsonl");
-        let entries = vec![serde_json::json!({
-            "type": "user",
-            "timestamp": "2026-02-25T10:00:00Z",
-            "cwd": "/Users/test/projects/task",
-            "message": {"role": "user", "content": "do task"}
-        })];
+        // A leading line without `sessionId` must not cost the parent link.
+        let entries = vec![
+            serde_json::json!({"type": "summary", "summary": "s"}),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-02-25T10:00:00Z",
+                "cwd": "/Users/test/projects/task",
+                "sessionId": "parent-id",
+                "message": {"role": "user", "content": "do task"}
+            }),
+        ];
         {
             let mut f = std::fs::File::create(&path).unwrap();
             for e in &entries {
@@ -1908,5 +2144,90 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].1.is_subagent);
+        assert_eq!(
+            sessions[0].1.parent_path,
+            Some(std::env::temp_dir().join("parent-id.jsonl"))
+        );
+    }
+
+    #[test]
+    fn a_subagent_reports_to_the_transcript_its_session_id_names() {
+        let flat = Path::new("/p/slug/agent-a.jsonl");
+        let nested = Path::new("/p/slug/pid/subagents/agent-a.jsonl");
+        let workflow = Path::new("/p/slug/pid/subagents/workflows/wf_1/agent-a.jsonl");
+        let want = Some(PathBuf::from("/p/slug/pid.jsonl"));
+        assert_eq!(subagent_parent_path(flat, Some("pid")), want);
+        assert_eq!(subagent_parent_path(nested, Some("pid")), want);
+        assert_eq!(subagent_parent_path(workflow, Some("pid")), want);
+        assert_eq!(subagent_parent_path(flat, None), None);
+        // A transcript naming itself is not its own parent.
+        assert_eq!(
+            subagent_parent_path(Path::new("/p/slug/pid.jsonl"), Some("pid")),
+            None
+        );
+    }
+
+    #[test]
+    fn subagent_spend_rides_on_the_parent_without_touching_its_own_cost() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let calculator = crate::aggregator::CostCalculator::global();
+        let mut parent = make_session_with_tokens("proj", 1_000_000, 0, "claude-opus-4-6");
+        parent.file_path = PathBuf::from("/p/slug/pid.jsonl");
+        let sub = |name: &str, day_offset: i64| {
+            let mut s = make_session_with_tokens("proj", 1_000_000, 0, "claude-opus-4-6");
+            s.file_path = PathBuf::from(format!("/p/slug/pid/subagents/{name}.jsonl"));
+            s.is_subagent = true;
+            s.parent_path = Some(parent.file_path.clone());
+            s.day_first_timestamp -= chrono::Duration::days(day_offset);
+            s
+        };
+        let unit = parent.cost(calculator);
+        assert!(unit > 0.0);
+        let mut stranger = sub("agent-other", 0);
+        stranger.parent_path = Some(PathBuf::from("/p/slug/other.jsonl"));
+        let today = chrono::Local::now().date_naive();
+        let groups = vec![
+            make_daily_group(
+                today,
+                vec![
+                    parent.clone(),
+                    sub("agent-a", 0),
+                    sub("agent-b", 0),
+                    stranger,
+                ],
+            ),
+            make_daily_group(today - chrono::Duration::days(1), vec![sub("agent-a", 1)]),
+        ];
+
+        let day = groups[0].subagent_spend(&parent.file_path);
+        assert_eq!(
+            groups[0]
+                .subagent_spend_by_parent()
+                .get(parent.file_path.as_path()),
+            Some(&day)
+        );
+        assert_eq!(day.count, 2);
+        assert_eq!(day.work_tokens, 2 * parent.work_tokens());
+        assert!((day.cost - 2.0 * unit).abs() < 1e-9);
+        assert_eq!(day_subagent_spend(&parent, &groups), day);
+
+        let solo = compute_session_cumulative(&parent.file_path, &groups);
+        let by_path = cumulative_by_path(&groups);
+        let owned = cumulative_owned_by_path(&groups);
+        for cum in [
+            &solo,
+            &by_path[parent.file_path.as_path()].0,
+            &owned[&parent.file_path],
+        ] {
+            assert!(
+                (cum.cost - unit).abs() < 1e-9,
+                "own cost stays the session's"
+            );
+            assert!(
+                (cum.subagents.cost - 3.0 * unit).abs() < 1e-9,
+                "both days' subagents"
+            );
+            assert!((cum.cost_with_subagents().0 - 4.0 * unit).abs() < 1e-9);
+        }
     }
 }

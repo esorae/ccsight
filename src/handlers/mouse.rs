@@ -91,7 +91,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         }
     }
 
-    // Tool Usage detail popup: tab click switches section.
+    // Ecosystem detail popup: tab click switches section.
     if state.show_dashboard_detail() && state.dashboard_panel == 3 {
         for (idx, area) in state.layout.tools_detail_tab_areas.clone() {
             if in_area(column, row, &area) {
@@ -1020,6 +1020,7 @@ mod tests {
             snippet: None,
             match_type: crate::search::SearchMatchType::Content,
             session_path: None,
+            message_date: None,
         }
     }
 

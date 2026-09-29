@@ -157,6 +157,35 @@ impl TokenStats {
 
 pub struct StatsAggregator;
 
+/// The transcript's `sessionId`. Both cold walks write it to the shared
+/// cache, where a subagent's parent link is derived from it, so they must
+/// read it off the same entry.
+pub(crate) fn session_id_of(entries: &[crate::domain::LogEntry]) -> Option<String> {
+    entries.iter().find_map(|e| e.session_id.clone())
+}
+
+/// A user entry someone typed. `role: user` also carries every tool result,
+/// the wrappers Claude Code injects for slash commands, hooks and `!` output,
+/// and compaction recaps — counting those reports a turn per tool call. The
+/// filter is the one the conversation preview applies, so the two agree.
+pub(crate) fn is_human_prompt(entry: &crate::domain::LogEntry) -> bool {
+    human_prompt_text(entry).is_some()
+}
+
+/// The typed text of a human prompt, cleaned for display; `None` for every
+/// entry [`is_human_prompt`] rejects.
+pub(crate) fn human_prompt_text(entry: &crate::domain::LogEntry) -> Option<String> {
+    if entry.is_compact_summary || entry.is_meta {
+        return None;
+    }
+    let message = entry.message.as_ref()?;
+    if !matches!(message.role, crate::domain::Role::User) {
+        return None;
+    }
+    let cleaned = crate::text::clean_user_message_preview(&message.content.extract_text());
+    (!cleaned.is_empty() && !crate::text::looks_like_system_injection(&cleaned)).then_some(cleaned)
+}
+
 /// Per-day accumulator shared by both aggregation paths (`StatsAggregator`
 /// and `DailyGrouper`) so a new per-day field is declared once, not mirrored
 /// in two structs that silently drift. Timestamps are `Option` (empty until
@@ -168,6 +197,8 @@ pub(crate) struct DailyStats {
     pub(crate) input_tokens: u64,
     pub(crate) output_tokens: u64,
     pub(crate) user_msgs: u64,
+    /// The share of `user_msgs` someone typed (see `is_human_prompt`).
+    pub(crate) prompts: u64,
     pub(crate) assistant_msgs: u64,
     pub(crate) line_churn: crate::domain::LineChurn,
     pub(crate) tokens_by_model: HashMap<String, TokenStats>,
@@ -320,19 +351,19 @@ impl StatsAggregator {
             parsed_files: 0,
         };
 
-        // Pre-load global-dedup set from cache. Mirrors the grouping.rs
-        // pass: same (msg_id, requestId) across multiple JSONLs must bill
-        // once. Restrict pre-load to STILL-VALID cache entries — a stale
-        // entry's hashes belong to a file that is about to be re-parsed
-        // and must be free to re-credit them.
+        // Same (msg_id, requestId) across JSONLs bills once, so hashes of the
+        // cache hits are pre-loaded. Hits are decided ONCE and the walk reuses
+        // the decision: a file appended to between two separate checks would
+        // be pre-loaded, then re-parsed against its own hashes — crediting
+        // itself nothing and caching that zero. Mirrors the grouping.rs pass.
+        let hits: std::collections::HashSet<&PathBuf> = files
+            .iter()
+            .filter(|f| cache.is_valid(f) && cache.get(f).is_some())
+            .collect();
         let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for file in files {
-            if cache.is_valid(file)
-                && let Some(cached) = cache.get(file)
-            {
-                for h in &cached.unique_hashes {
-                    global_seen.insert(h.clone());
-                }
+        for cached in hits.iter().filter_map(|f| cache.get(f)) {
+            for h in &cached.unique_hashes {
+                global_seen.insert(h.clone());
             }
         }
 
@@ -345,7 +376,7 @@ impl StatsAggregator {
 
         for file in &sorted_files {
             PROGRESS_DONE.fetch_add(1, Ordering::Relaxed);
-            if cache.is_valid(file)
+            if hits.contains(*file)
                 && let Some(cached) = cache.get(file)
             {
                 let project_name = cached.project_name.clone();
@@ -401,6 +432,7 @@ impl StatsAggregator {
                                 language_usage: ds.language_usage,
                                 extension_usage: ds.extension_usage,
                                 user_msgs: ds.user_msgs,
+                                prompts: ds.prompts,
                                 assistant_msgs: ds.assistant_msgs,
                                 line_churn: ds.line_churn,
                             },
@@ -509,13 +541,12 @@ impl StatsAggregator {
             + cached.cache_read_tokens;
         let session_work_tokens = cached.work_tokens();
 
-        // Subagents are included so the per-project total matches the
-        // Project filter popup (the single source of truth for "all activity
-        // attributed to this project"). Sum-of-projects then reconciles with
-        // the Overview cost number, which also includes subagents.
+        // Tokens include subagents so sum-of-projects reconciles with the
+        // subagent-inclusive Overview; `sessions` counts the user's own, the
+        // number the project popup shows beside it.
         if let Some(name) = project_name {
             let project = stats.project_stats.entry(name.clone()).or_default();
-            project.sessions += 1;
+            project.sessions += usize::from(!cached.is_subagent);
             project.tokens += session_tokens;
             project.work_tokens += session_work_tokens;
         }
@@ -578,10 +609,10 @@ impl StatsAggregator {
 
         stats.total_entries += entries.len();
 
+        file_stats.session_id = session_id_of(entries);
         let entries_with_ts: Vec<_> = entries.iter().filter(|e| e.timestamp.is_some()).collect();
         if let Some(first) = entries_with_ts.first() {
             file_stats.first_timestamp = first.timestamp;
-            file_stats.session_id = first.session_id.clone();
             // git_branch is mutable mid-session (`git checkout`); use the
             // LATEST value, not the first. Matches `grouping.rs` and the
             // session-representative-value rule.
@@ -762,6 +793,7 @@ impl StatsAggregator {
                                 &mut file_stats,
                                 daily_date,
                                 message,
+                                is_human_prompt(entry),
                             );
                             continue;
                         }
@@ -796,7 +828,13 @@ impl StatsAggregator {
                 let daily_date = entry
                     .timestamp
                     .map(|ts| ts.with_timezone(&Local).date_naive());
-                Self::count_tool_usage_with_file_stats(stats, &mut file_stats, daily_date, message);
+                Self::count_tool_usage_with_file_stats(
+                    stats,
+                    &mut file_stats,
+                    daily_date,
+                    message,
+                    is_human_prompt(entry),
+                );
             }
         }
 
@@ -806,11 +844,11 @@ impl StatsAggregator {
             + file_stats.cache_read_tokens;
         let session_work_tokens = file_stats.work_tokens();
 
-        // Mirror of `merge_cached_stats`: subagents are included so the
-        // per-project total matches the Project filter popup.
+        // Mirror of `merge_cached_stats`: tokens include subagents, sessions
+        // count the user's own.
         if let Some(name) = project_name {
             let project = stats.project_stats.entry(name.clone()).or_default();
-            project.sessions += 1;
+            project.sessions += usize::from(!file_stats.is_subagent);
             project.tokens += session_tokens;
             project.work_tokens += session_work_tokens;
         }
@@ -846,6 +884,7 @@ impl StatsAggregator {
         file_stats: &mut FileStats,
         daily_date: Option<NaiveDate>,
         message: &crate::domain::Message,
+        human_prompt: bool,
     ) {
         use crate::domain::{ContentBlock, MessageContent};
 
@@ -858,6 +897,9 @@ impl StatsAggregator {
                 && let Some(d) = file_stats.daily_stats.get_mut(&date)
             {
                 d.user_msgs += 1;
+                if human_prompt {
+                    d.prompts += 1;
+                }
             }
             let text = message.content.extract_text();
             for cmd in extract_command_names(&text) {
@@ -1336,6 +1378,34 @@ mod tests {
     }
 
     #[test]
+    fn only_typed_user_entries_count_as_prompts() {
+        let entry = |json: &str| serde_json::from_str::<crate::domain::LogEntry>(json).unwrap();
+        assert!(is_human_prompt(&entry(
+            r#"{"type":"user","message":{"role":"user","content":"fix the bug"}}"#
+        )));
+        for (json, why) in [
+            (
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}}"#,
+                "a tool result",
+            ),
+            (
+                r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued"}}"#,
+                "a compaction recap",
+            ),
+            (
+                r#"{"type":"user","message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#,
+                "an injected wrapper",
+            ),
+            (
+                r#"{"type":"assistant","message":{"role":"assistant","content":"hi"}}"#,
+                "an assistant reply",
+            ),
+        ] {
+            assert!(!is_human_prompt(&entry(json)), "{why} counted as a prompt");
+        }
+    }
+
+    #[test]
     fn test_add_session_adoption_counts_skill_subagent_mcp_once_per_call() {
         let mut stats = Stats::default();
         let day_keys = keys(&[
@@ -1397,6 +1467,35 @@ mod tests {
         assert_eq!(user.tool_sessions.get("skill:s1"), Some(&1));
         assert_eq!(user.sessions_using_skills, 1);
         assert_eq!(user.total_session_days, 1);
+    }
+
+    #[test]
+    fn a_project_counts_its_subagents_tokens_but_only_the_users_sessions() {
+        let cached = |is_subagent: bool| -> crate::infrastructure::CachedFileStats {
+            serde_json::from_value(serde_json::json!({
+                "modified_secs": 0,
+                "entry_count": 1,
+                "input_tokens": 100,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "is_subagent": is_subagent,
+                "tool_usage": {},
+                "model_usage": {},
+                "daily_stats": {},
+            }))
+            .expect("cached fixture")
+        };
+        let mut stats = Stats::default();
+        let project = Some("p".to_string());
+        StatsAggregator::merge_cached_stats(&mut stats, &cached(false), &project);
+        StatsAggregator::merge_cached_stats(&mut stats, &cached(true), &project);
+        let p = &stats.project_stats["p"];
+        assert_eq!(
+            p.work_tokens, 200,
+            "subagent tokens count toward the project"
+        );
+        assert_eq!(p.sessions, 1, "the popup's session count, not transcripts");
     }
 
     // `tool_usage` counts calls over every session; `tool_sessions` has to use
