@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 
 use crate::aggregator::{DailyGroup, mcp_server_of};
 
@@ -144,6 +144,20 @@ fn claude_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude.json"))
 }
 
+/// The instant `is_underutilized` judges at for a view ending `view_end`: that
+/// day's close when the view ends before today, else now. A past range then
+/// asks "idle as of its own end" instead of marking every server stale.
+pub fn stale_reference(view_end: Option<NaiveDate>) -> DateTime<Utc> {
+    let today = Local::now().date_naive();
+    match view_end {
+        Some(end) if end < today => end
+            .and_hms_opt(23, 59, 59)
+            .and_then(|t| t.and_local_timezone(Local).single())
+            .map_or_else(Utc::now, |t| t.with_timezone(&Utc)),
+        _ => Utc::now(),
+    }
+}
+
 /// Compute MCP server usage status by joining configured servers with observed tool_usage.
 pub fn compute_mcp_status(daily_groups: &[DailyGroup]) -> Vec<McpServerStatus> {
     use std::collections::HashMap;
@@ -155,10 +169,9 @@ pub fn compute_mcp_status(daily_groups: &[DailyGroup]) -> Vec<McpServerStatus> {
     let mut total_calls_map: HashMap<String, usize> = HashMap::new();
 
     for group in daily_groups {
+        // Subagents included: a server only a subagent calls is in use, and its
+        // calls sum to the Ecosystem total the same rows sit under.
         for session in &group.sessions {
-            if session.is_subagent {
-                continue;
-            }
             let last_ts = session.day_last_timestamp;
             for (tool_name, count) in &session.day_tool_usage {
                 let Some(server) = mcp_server_of(tool_name) else {
@@ -206,6 +219,38 @@ pub fn compute_mcp_status(daily_groups: &[DailyGroup]) -> Vec<McpServerStatus> {
 
 #[cfg(test)]
 mod tests {
+    // A past view is judged at its own close; a view reaching today, at now.
+    #[test]
+    fn staleness_is_judged_at_the_views_end() {
+        let today = Local::now().date_naive();
+        let past = today - chrono::Duration::days(40);
+        let at = stale_reference(Some(past)).with_timezone(&Local);
+        assert_eq!(at.date_naive(), past);
+        let now_ish = |t: DateTime<Utc>| (Utc::now() - t).num_seconds().abs() < 5;
+        assert!(now_ish(stale_reference(Some(today))));
+        assert!(now_ish(stale_reference(None)));
+    }
+
+    // A server only a subagent calls is in use: its calls and last use count.
+    #[test]
+    fn a_server_only_a_subagent_calls_reads_as_used() {
+        let mut sub = crate::test_helpers::helpers::make_session("p", None, Some("sub"));
+        sub.is_subagent = true;
+        sub.day_tool_usage
+            .insert("mcp__server1__action".to_string(), 5);
+        let groups = vec![crate::test_helpers::helpers::make_daily_group(
+            chrono::Local::now().date_naive(),
+            vec![sub],
+        )];
+        let status = compute_mcp_status(&groups);
+        let s = status
+            .iter()
+            .find(|s| s.name == "server1")
+            .expect("server listed");
+        assert_eq!(s.total_calls, 5);
+        assert!(s.last_used.is_some());
+    }
+
     use super::*;
     use chrono::{Duration, Utc};
 
@@ -333,6 +378,8 @@ mod tests {
                 day_output_tokens: 0,
                 day_user_msgs: 0,
                 day_prompts: 0,
+                day_tool_errors: 0,
+                day_tool_successes: 0,
                 day_assistant_msgs: 0,
                 day_tokens_by_model: HashMap::new(),
                 day_hourly_activity: HashMap::new(),

@@ -90,8 +90,8 @@ fi
 # every push. CI owns that one; run `bash scripts/smoke-ci.sh` by hand after
 # touching rendering or navigation.
 
-# The one check CI cannot run: the EXHAUSTIVE aggregation-agreement pass over
-# ALL of `~/.claude` (the commit gate only samples it). No-ops without local
+# The one check CI cannot run: the EXHAUSTIVE fresh-vs-cached agreement pass
+# over ALL of `~/.claude` (the commit gate only samples it). No-ops without local
 # Claude data. Slow (minutes on a large history) by design.
 # A file written during the minutes-long pass makes it inconclusive rather
 # than failed, and an active session makes that likely, so only that outcome
@@ -100,12 +100,12 @@ agreement_log=$(mktemp)
 trap 'rm -f "$agreement_log"' EXIT
 for attempt in 1 2 3; do
     echo "[pre-push] cargo test -- --ignored (full real-data agreement, attempt $attempt/3) ..."
-    if cargo test --quiet test_stats_and_grouper_agree_on_token_totals -- --ignored 2>&1 \
+    if cargo test --quiet test_fresh_and_cached_walks_agree_on_real_data -- --ignored 2>&1 \
         | tee "$agreement_log"; [ "${PIPESTATUS[0]}" -eq 0 ]; then
         break
     fi
     if ! grep -q 'inconclusive:' "$agreement_log"; then
-        echo "[pre-push] FAILED: full real-data aggregation paths diverged."
+        echo "[pre-push] FAILED: a cache rebuild diverged from the fresh parse on real data."
         exit 1
     fi
     if [ "$attempt" -eq 3 ]; then

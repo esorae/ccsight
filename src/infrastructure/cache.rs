@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // Bump on changes to: parser output, aggregator field semantics
 // (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
-const CACHE_VERSION: u32 = 43;
+const CACHE_VERSION: u32 = 46;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {
@@ -42,8 +42,8 @@ pub struct CachedDailyStats {
     #[serde(default)]
     pub extension_usage: HashMap<String, usize>,
     /// Lines added / removed by this day's edits. Stored per day only — a
-    /// per-file copy would be a second definition of the same number that the
-    /// two independent writers could disagree on. `serde(default)` keeps the
+    /// per-file copy would be a second definition of the same number that
+    /// could drift. `serde(default)` keeps the
     /// derive total; the version gate is what stops a stale entry being read.
     #[serde(default)]
     pub line_churn: crate::domain::LineChurn,
@@ -57,35 +57,22 @@ pub struct CachedDailyStats {
     pub prompts: u64,
     #[serde(default)]
     pub assistant_msgs: u64,
+    #[serde(default)]
+    pub tool_errors: usize,
+    #[serde(default)]
+    pub tool_successes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CachedFileStats {
     pub modified_secs: u64,
     #[serde(default)]
     pub file_size: u64,
-    pub entry_count: usize,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
-    /// 5-min TTL share of `cache_creation_tokens`. `#[serde(default)]` so
-    /// older cache files (pre-1h-TTL fix, version 29 and below) deserialize
-    /// without losing the rest of the entry — they'll re-aggregate to fill
-    /// these on the next cache write.
-    #[serde(default)]
-    pub cache_creation_5m_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_1h_tokens: u64,
     /// `(message.id, requestId)` pairs credited to this file. Pre-loaded
     /// into the cross-file dedup set so resume/branch duplicates skip.
     /// Empty for caches predating this field (`serde(default)`).
     #[serde(default)]
     pub unique_hashes: Vec<String>,
-    pub tool_usage: HashMap<String, usize>,
-    pub model_usage: HashMap<String, usize>,
-    #[serde(default)]
-    pub model_tokens: HashMap<String, CachedTokenStats>,
     pub session_date: Option<NaiveDate>,
     pub project_name: Option<String>,
     /// First cwd in the file whose official slug matches the parent project
@@ -96,7 +83,6 @@ pub struct CachedFileStats {
     pub session_id: Option<String>,
     pub git_branch: Option<String>,
     pub first_timestamp: Option<DateTime<Utc>>,
-    pub last_timestamp: Option<DateTime<Utc>>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -118,34 +104,6 @@ pub struct CachedFileStats {
     pub is_subagent: bool,
     #[serde(default)]
     pub daily_stats: HashMap<String, CachedDailyStats>,
-    #[serde(default)]
-    pub hourly_activity: HashMap<u8, u64>,
-    #[serde(default)]
-    pub hourly_work_activity: HashMap<u8, u64>,
-    #[serde(default)]
-    pub weekday_activity: HashMap<u8, u64>,
-    #[serde(default)]
-    pub weekday_work_activity: HashMap<u8, u64>,
-    #[serde(default)]
-    pub tool_error_count: usize,
-    #[serde(default)]
-    pub tool_success_count: usize,
-    #[serde(default)]
-    pub session_duration_mins: Option<i64>,
-    #[serde(default)]
-    pub language_usage: HashMap<String, usize>,
-    #[serde(default)]
-    pub extension_usage: HashMap<String, usize>,
-}
-
-impl CachedFileStats {
-    /// Same "work tokens" concept as `aggregator::stats::TokenStats` —
-    /// input + output only, excluding cache. Named the same across both
-    /// types so the formula has one name to grep for instead of inline
-    /// arithmetic repeated per call site.
-    pub fn work_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens
-    }
 }
 
 impl Default for CacheData {
@@ -167,8 +125,8 @@ pub struct Cache {
 
 impl Cache {
     /// Test-only: an empty cache that DOES persist to `path` (unlike
-    /// `new_empty`'s non-saving `/dev/null`), so a test can read back the
-    /// entries a writer produced and compare the two aggregation paths.
+    /// `new_empty`'s non-saving `/dev/null`), so a test can read back what a
+    /// writer produced.
     #[cfg(test)]
     pub(crate) fn empty_at(cache_path: PathBuf) -> Self {
         Self {
@@ -184,6 +142,17 @@ impl Cache {
     pub(crate) fn read_only(mut self) -> Self {
         self.cache_path = PathBuf::from("/dev/null");
         self
+    }
+
+    /// The cache as it would come back from disk: serialized and parsed
+    /// again, so a test exercises the on-disk shape without touching disk.
+    #[cfg(test)]
+    pub(crate) fn through_disk_shape(self) -> Self {
+        let json = serde_json::to_vec(&self.data).expect("serialize cache");
+        Self {
+            cache_path: self.cache_path,
+            data: serde_json::from_slice(&json).expect("parse cache"),
+        }
     }
 
     pub fn new_empty() -> Self {
@@ -272,8 +241,80 @@ impl Cache {
         self.data.session_summaries.insert(key, summary);
     }
 
+    /// One file per cache version: a ccsight still running an older build (a
+    /// long-lived MCP server) keeps its own file instead of discarding this one
+    /// on every load and making both rebuild from scratch.
     fn cache_file_path() -> Result<PathBuf> {
-        super::cache_path()
+        let path = super::cache_path()?.with_file_name(format!("cache-v{CACHE_VERSION}.json"));
+        if let Some(dir) = path.parent() {
+            prune_stale_versions(dir, &path, is_cache_file, STALE_VERSION_AFTER);
+        }
+        Ok(path)
+    }
+
+    /// Every version's cache file, for `--clear-cache`.
+    pub fn clear_all() -> Result<Vec<PathBuf>> {
+        let dir = super::cache_path()?
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let mut removed = Vec::new();
+        for entry in fs::read_dir(&dir)?.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_cache_file)
+                && fs::remove_file(&path).is_ok()
+            {
+                removed.push(path);
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Another version's state goes once nothing has written it for this long —
+/// a build still running keeps touching its own file on every reload.
+pub(crate) const STALE_VERSION_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+fn is_cache_file(name: &str) -> bool {
+    name == "cache.json" || (name.starts_with("cache-v") && name.ends_with(".json"))
+}
+
+/// Remove the entries of `dir` that `in_family` claims, other than `keep`,
+/// whose last write is older than `idle`. Best-effort: a failure leaves the
+/// entry for the next pass.
+pub(crate) fn prune_stale_versions(
+    dir: &Path,
+    keep: &Path,
+    in_family: fn(&str) -> bool,
+    idle: std::time::Duration,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let claimed = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(in_family);
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > idle);
+        if claimed && stale && path != keep {
+            let removed = if path.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            drop(removed);
+        }
     }
 }
 
@@ -285,12 +326,37 @@ pub fn get_file_modified_secs(path: &Path) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-pub fn get_file_size(path: &Path) -> u64 {
-    fs::metadata(path).map_or(0, |m| m.len())
-}
-
 #[cfg(test)]
 mod tests {
+    // A version still being written survives; one idle past the window goes;
+    // names outside the family and the current file are never touched.
+    #[test]
+    fn only_idle_other_versions_are_pruned() {
+        let dir = std::env::temp_dir().join(format!("ccsight-prune-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        let make = |name: &str, idle: bool| {
+            let path = dir.join(name);
+            let file = File::create(&path).unwrap();
+            if idle {
+                file.set_modified(old).unwrap();
+            }
+            path
+        };
+        let current = make("cache-v9.json", true);
+        let idle_other = make("cache-v8.json", true);
+        let busy_other = make("cache.json", false);
+        let unrelated = make("pins.json", true);
+
+        prune_stale_versions(&dir, &current, is_cache_file, STALE_VERSION_AFTER);
+
+        assert!(current.exists(), "the current version is kept");
+        assert!(!idle_other.exists(), "an idle other version is removed");
+        assert!(busy_other.exists(), "a version still written is kept");
+        assert!(unrelated.exists(), "a non-cache file is never touched");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
@@ -370,43 +436,18 @@ mod tests {
                     map.insert(
                         key.clone(),
                         CachedFileStats {
-                            verified_cwd: None,
                             modified_secs: 1234,
                             file_size: 100,
-                            entry_count: 10,
-                            input_tokens: 1000,
-                            output_tokens: 500,
-                            cache_creation_tokens: 200,
-                            cache_creation_5m_tokens: 0,
-                            cache_creation_1h_tokens: 0,
-                            unique_hashes: Vec::new(),
-                            cache_read_tokens: 100,
-                            tool_usage: tool_usage.clone(),
-                            model_usage: HashMap::new(),
-                            model_tokens: HashMap::new(),
-                            session_date: None,
                             project_name: Some("proj".to_string()),
                             session_id: Some("sid".to_string()),
-                            git_branch: None,
-                            first_timestamp: None,
-                            last_timestamp: None,
-                            summary: None,
-                            custom_title: None,
-                            ai_title: None,
-                            last_user_message: None,
-                            first_user_message: None,
-                            model: None,
-                            is_subagent: false,
-                            daily_stats: HashMap::new(),
-                            hourly_activity: HashMap::new(),
-                            hourly_work_activity: HashMap::new(),
-                            weekday_activity: HashMap::new(),
-                            weekday_work_activity: HashMap::new(),
-                            tool_error_count: 0,
-                            tool_success_count: 0,
-                            session_duration_mins: None,
-                            language_usage: HashMap::new(),
-                            extension_usage: HashMap::new(),
+                            daily_stats: HashMap::from([(
+                                "2026-01-01".to_string(), // lint-ok: date-literal
+                                CachedDailyStats {
+                                    tool_usage: tool_usage.clone(),
+                                    ..Default::default()
+                                },
+                            )]),
+                            ..Default::default()
                         },
                     );
                     map
@@ -425,9 +466,10 @@ mod tests {
 
         assert_eq!(reloaded.version, CACHE_VERSION);
         let entry = reloaded.files.get(&key).expect("file entry survived");
-        assert_eq!(entry.entry_count, 10);
-        assert_eq!(entry.tool_usage.get("Bash"), Some(&5));
-        assert_eq!(entry.tool_usage.get("skill:my-skill"), Some(&2));
+        let day = &entry.daily_stats["2026-01-01"]; // lint-ok: date-literal
+        assert_eq!(day.tool_usage.get("Bash"), Some(&5));
+        assert_eq!(day.tool_usage.get("skill:my-skill"), Some(&2));
+        assert_eq!(entry.session_id.as_deref(), Some("sid"));
 
         let _ = fs::remove_file(&path);
     }

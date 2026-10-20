@@ -27,64 +27,13 @@ pub struct ToolResultChurn(pub LineChurn);
 
 impl<'de> Deserialize<'de> for ToolResultChurn {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use lenient::{Text, default_scalars};
         use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 
-        // Every value below is read through one of these, which accept ANY
-        // JSON type and read it to its end. `next_value::<T>()` on a mismatched
+        // Every value below is read through a visitor that accepts ANY
+        // JSON type and reads it to its end. `next_value::<T>()` on a mismatched
         // array or object stops mid-value, so the entry's next key fails to
         // parse and the whole entry — tokens included — is dropped.
-
-        /// Scalars carry no churn; each visit returns the type's default.
-        macro_rules! skip_scalars {
-            ($v:ty) => {
-                fn visit_bool<E>(self, _: bool) -> Result<$v, E> {
-                    Ok(<$v>::default())
-                }
-                fn visit_i64<E>(self, _: i64) -> Result<$v, E> {
-                    Ok(<$v>::default())
-                }
-                fn visit_u64<E>(self, _: u64) -> Result<$v, E> {
-                    Ok(<$v>::default())
-                }
-                fn visit_f64<E>(self, _: f64) -> Result<$v, E> {
-                    Ok(<$v>::default())
-                }
-                fn visit_unit<E>(self) -> Result<$v, E> {
-                    Ok(<$v>::default())
-                }
-                fn visit_none<E>(self) -> Result<$v, E> {
-                    Ok(<$v>::default())
-                }
-            };
-        }
-
-        /// A string's value when it is one; `None` for anything else.
-        #[derive(Default)]
-        struct Text(Option<String>);
-        impl<'de> Deserialize<'de> for Text {
-            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                struct V;
-                impl<'de> Visitor<'de> for V {
-                    type Value = Text;
-                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        f.write_str("any value")
-                    }
-                    fn visit_str<E>(self, v: &str) -> Result<Text, E> {
-                        Ok(Text(Some(v.to_string())))
-                    }
-                    fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Text, A::Error> {
-                        while s.next_element::<IgnoredAny>()?.is_some() {}
-                        Ok(Text(None))
-                    }
-                    fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Text, A::Error> {
-                        while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                        Ok(Text(None))
-                    }
-                    skip_scalars!(Text);
-                }
-                d.deserialize_any(V)
-            }
-        }
 
         /// One `lines` element's sign: a non-string element counts nothing
         /// and leaves its well-formed neighbours counted.
@@ -141,10 +90,7 @@ impl<'de> Deserialize<'de> for ToolResultChurn {
                         while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
                         Ok(Sum::default())
                     }
-                    fn visit_str<E>(self, _: &str) -> Result<Sum<T>, E> {
-                        Ok(Sum::default())
-                    }
-                    skip_scalars!(Sum<T>);
+                    default_scalars!(Sum<T>);
                 }
                 d.deserialize_any(V(std::marker::PhantomData))
             }
@@ -176,10 +122,7 @@ impl<'de> Deserialize<'de> for ToolResultChurn {
                         while s.next_element::<IgnoredAny>()?.is_some() {}
                         Ok(Hunk::default())
                     }
-                    fn visit_str<E>(self, _: &str) -> Result<Hunk, E> {
-                        Ok(Hunk::default())
-                    }
-                    skip_scalars!(Hunk);
+                    default_scalars!(Hunk);
                 }
                 d.deserialize_any(V)
             }
@@ -232,10 +175,7 @@ impl<'de> Deserialize<'de> for ToolResultChurn {
                 while s.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(ToolResultChurn::default())
             }
-            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
-                Ok(ToolResultChurn::default())
-            }
-            skip_scalars!(ToolResultChurn);
+            default_scalars!(ToolResultChurn);
         }
         d.deserialize_any(ChurnVisitor)
     }
@@ -475,6 +415,11 @@ pub struct Usage {
 
     #[serde(default)]
     pub speed: Option<String>,
+
+    /// One record per attempt when a declined attempt fell back to another
+    /// model; the top-level counts cover only the returned attempt.
+    #[serde(default, deserialize_with = "lenient_iterations")]
+    pub iterations: Vec<UsageIteration>,
 }
 
 impl Usage {
@@ -484,6 +429,241 @@ impl Usage {
     /// one name to grep for instead of inline arithmetic repeated per site.
     pub fn work_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UsageIteration {
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation: Option<CacheCreationBreakdown>,
+}
+
+/// Reads `usage.iterations` without ever failing its entry, which would take
+/// the top-level tokens down too: a value that is not an array yields no
+/// attempts, a non-object element is skipped, a mistyped field reads as unset.
+fn lenient_iterations<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<UsageIteration>, D::Error> {
+    use lenient::{Attempt, skip_map};
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+    struct Attempts;
+    impl<'de> Visitor<'de> for Attempts {
+        type Value = Vec<UsageIteration>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("any value")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(Attempt(a)) = s.next_element::<Attempt>()? {
+                out.extend(a);
+            }
+            Ok(out)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, m: A) -> Result<Self::Value, A::Error> {
+            skip_map(m).map(|()| Vec::new())
+        }
+        lenient::default_scalars!(Vec<UsageIteration>);
+    }
+    d.deserialize_any(Attempts)
+}
+
+/// Visitors that accept any JSON value, read it to its end, and keep only
+/// what has the expected type.
+mod lenient {
+    use super::{CacheCreationBreakdown, UsageIteration};
+    use serde::Deserialize;
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    /// A scalar that is not the wanted type reads as the default.
+    macro_rules! default_scalars {
+        ($v:ty) => {
+            fn visit_bool<E>(self, _: bool) -> Result<$v, E> {
+                Ok(<$v>::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<$v, E> {
+                Ok(<$v>::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<$v, E> {
+                Ok(<$v>::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<$v, E> {
+                Ok(<$v>::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<$v, E> {
+                Ok(<$v>::default())
+            }
+            fn visit_unit<E>(self) -> Result<$v, E> {
+                Ok(<$v>::default())
+            }
+            fn visit_none<E>(self) -> Result<$v, E> {
+                Ok(<$v>::default())
+            }
+        };
+    }
+    pub(super) use default_scalars;
+
+    pub(super) fn skip_seq<'de, A: SeqAccess<'de>>(mut s: A) -> Result<(), A::Error> {
+        while s.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
+
+    pub(super) fn skip_map<'de, A: MapAccess<'de>>(mut m: A) -> Result<(), A::Error> {
+        while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
+
+    /// Declares a lenient wrapper: `$visit` reads the wanted shape, every
+    /// other shape is read through and yields the default.
+    macro_rules! lenient_type {
+        ($name:ident($inner:ty), $what:literal, { $($visit:tt)* }) => {
+            #[derive(Default)]
+            pub(super) struct $name(pub $inner);
+            impl<'de> Deserialize<'de> for $name {
+                fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                    struct V;
+                    impl<'de> Visitor<'de> for V {
+                        type Value = $name;
+                        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                            f.write_str($what)
+                        }
+                        $($visit)*
+                    }
+                    d.deserialize_any(V)
+                }
+            }
+        };
+    }
+
+    lenient_type!(Count(u64), "any value", {
+        fn visit_u64<E>(self, v: u64) -> Result<Count, E> {
+            Ok(Count(v))
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Count, E> {
+            Ok(Count(0))
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Count, E> {
+            Ok(Count(0))
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Count, E> {
+            Ok(Count(0))
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Count, E> {
+            Ok(Count(0))
+        }
+        fn visit_unit<E>(self) -> Result<Count, E> {
+            Ok(Count(0))
+        }
+        fn visit_none<E>(self) -> Result<Count, E> {
+            Ok(Count(0))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, s: A) -> Result<Count, A::Error> {
+            skip_seq(s).map(|()| Count(0))
+        }
+        fn visit_map<A: MapAccess<'de>>(self, m: A) -> Result<Count, A::Error> {
+            skip_map(m).map(|()| Count(0))
+        }
+    });
+
+    lenient_type!(Text(Option<String>), "any value", {
+        fn visit_str<E>(self, v: &str) -> Result<Text, E> {
+            Ok(Text(Some(v.to_string())))
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Text, E> {
+            Ok(Text(None))
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Text, E> {
+            Ok(Text(None))
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Text, E> {
+            Ok(Text(None))
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Text, E> {
+            Ok(Text(None))
+        }
+        fn visit_unit<E>(self) -> Result<Text, E> {
+            Ok(Text(None))
+        }
+        fn visit_none<E>(self) -> Result<Text, E> {
+            Ok(Text(None))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, s: A) -> Result<Text, A::Error> {
+            skip_seq(s).map(|()| Text(None))
+        }
+        fn visit_map<A: MapAccess<'de>>(self, m: A) -> Result<Text, A::Error> {
+            skip_map(m).map(|()| Text(None))
+        }
+    });
+
+    lenient_type!(Breakdown(Option<CacheCreationBreakdown>), "any value", {
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Breakdown, A::Error> {
+            let mut b = CacheCreationBreakdown::default();
+            while let Some(key) = m.next_key::<Text>()? {
+                match key.0.as_deref() {
+                    Some("ephemeral_5m_input_tokens") => {
+                        b.ephemeral_5m_input_tokens = m.next_value::<Count>()?.0;
+                    }
+                    Some("ephemeral_1h_input_tokens") => {
+                        b.ephemeral_1h_input_tokens = m.next_value::<Count>()?.0;
+                    }
+                    _ => {
+                        m.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(Breakdown(Some(b)))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, s: A) -> Result<Breakdown, A::Error> {
+            skip_seq(s).map(|()| Breakdown(None))
+        }
+        default_scalars!(Breakdown);
+    });
+
+    lenient_type!(Attempt(Option<UsageIteration>), "any value", {
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Attempt, A::Error> {
+            let mut it = UsageIteration::default();
+            while let Some(key) = m.next_key::<Text>()? {
+                match key.0.as_deref() {
+                    Some("model") => it.model = m.next_value::<Text>()?.0,
+                    Some("input_tokens") => it.input_tokens = m.next_value::<Count>()?.0,
+                    Some("output_tokens") => it.output_tokens = m.next_value::<Count>()?.0,
+                    Some("cache_creation_input_tokens") => {
+                        it.cache_creation_input_tokens = m.next_value::<Count>()?.0;
+                    }
+                    Some("cache_read_input_tokens") => {
+                        it.cache_read_input_tokens = m.next_value::<Count>()?.0;
+                    }
+                    Some("cache_creation") => it.cache_creation = m.next_value::<Breakdown>()?.0,
+                    _ => {
+                        m.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(Attempt(Some(it)))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, s: A) -> Result<Attempt, A::Error> {
+            skip_seq(s).map(|()| Attempt(None))
+        }
+        default_scalars!(Attempt);
+    });
+}
+
+impl UsageIteration {
+    /// This attempt's counts, on the request-level fields of `parent`.
+    pub fn as_usage(&self, parent: &Usage) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_creation: self.cache_creation.clone(),
+            service_tier: parent.service_tier.clone(),
+            speed: parent.speed.clone(),
+            iterations: Vec::new(),
+        }
     }
 }
 
@@ -499,6 +679,41 @@ pub struct CacheCreationBreakdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A malformed `iterations` costs only the attempts it garbles: the
+    // usage keeps its top-level counts and every well-formed attempt.
+    #[test]
+    fn a_malformed_iterations_value_keeps_the_usage_and_its_good_attempts() {
+        for raw in [
+            r#"{"output_tokens":9,"iterations":null}"#,
+            r#"{"output_tokens":9,"iterations":"x"}"#,
+            r#"{"output_tokens":9,"iterations":{"a":[1]}}"#,
+        ] {
+            let u: Usage = serde_json::from_str(raw).expect(raw);
+            assert_eq!((u.output_tokens, u.iterations.len()), (9, 0), "{raw}");
+        }
+        let raw = r#"{"output_tokens":9,"iterations":[
+            7, [1],
+            {"model":3,"output_tokens":null,"input_tokens":-1,"cache_creation":[1]},
+            {"type":"message","model":"m","output_tokens":5,"extra":{"x":[]},
+             "cache_creation":{"ephemeral_1h_input_tokens":4,"other":{}}}
+        ]}"#;
+        let u: Usage = serde_json::from_str(raw).unwrap();
+        assert_eq!(u.output_tokens, 9);
+        assert_eq!(u.iterations.len(), 2, "non-object elements are skipped");
+        let garbled = &u.iterations[0];
+        assert_eq!((garbled.model.as_deref(), garbled.output_tokens), (None, 0));
+        assert!(garbled.cache_creation.is_none());
+        let good = &u.iterations[1];
+        assert_eq!((good.model.as_deref(), good.output_tokens), (Some("m"), 5));
+        assert_eq!(
+            good.cache_creation
+                .as_ref()
+                .unwrap()
+                .ephemeral_1h_input_tokens,
+            4
+        );
+    }
 
     /// `toolUseResult` is foreign JSON: an edit carries a unified-diff
     /// `structuredPatch`, a create carries the whole new file in `content`
@@ -694,6 +909,7 @@ mod tests {
             cache_creation: None,
             service_tier: None,
             speed: None,
+            iterations: Vec::new(),
         };
         assert_eq!(usage.work_tokens(), 150);
     }

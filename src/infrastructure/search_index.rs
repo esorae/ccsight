@@ -13,7 +13,10 @@ use tantivy::schema::{
     TextOptions,
 };
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
+use tantivy::{
+    DocId, Index, IndexReader, IndexWriter, ReloadPolicy, Score, SegmentReader, TantivyDocument,
+    Term, doc,
+};
 
 use chrono::{Local, NaiveDate};
 
@@ -23,7 +26,21 @@ use crate::parser::JsonlParser;
 use crate::search::{SearchMatchType, SearchResult, extract_snippet};
 
 const INDEX_VERSION: u32 = 7;
+
+fn is_index_dir(name: &str) -> bool {
+    name == "index" || name.starts_with("index-v")
+}
 const TOKENIZER_NAME: &str = "ngram23";
+const MSG_TS_FIELD: &str = "msg_ts";
+/// Age at which a match's recency bonus halves.
+const RECENCY_HALF_LIFE_SECS: f64 = 14.0 * 24.0 * 3600.0;
+
+/// A match's relevance multiplier: up to 2 for one written now, falling
+/// towards 1 with age, so recency lifts a match but never buries an old one.
+fn recency_boost(age_secs: i64) -> Score {
+    let age = age_secs.max(0) as f64;
+    (1.0 + 0.5f64.powf(age / RECENCY_HALF_LIFE_SECS)) as Score
+}
 
 #[derive(Serialize, Deserialize)]
 struct Manifest {
@@ -558,12 +575,21 @@ impl SearchIndex {
         };
 
         let searcher = self.reader.searcher();
-        // tantivy 0.26 occasionally panics inside `phrase_scorer` when the
-        // query is mutated rapidly (e.g., a user editing the search box). The
-        // panic kills the TUI, so we catch it here and treat it as "no
-        // results" — the next keystroke will issue a fresh query.
+        let now = chrono::Utc::now().timestamp();
+        let collector = TopDocs::with_limit(limit).tweak_score(move |segment: &SegmentReader| {
+            let written = segment
+                .fast_fields()
+                .i64(MSG_TS_FIELD)
+                .ok()
+                .map(|c| c.first_or_default_col(0));
+            move |doc: DocId, score: Score| {
+                let ts = written.as_ref().map_or(0, |c| c.get_val(doc));
+                score * recency_boost(now - ts)
+            }
+        });
+        // phrase_scorer can panic on a rapidly edited query: read it as no results.
         let search_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())
+            searcher.search(&query, &collector)
         }));
         let Ok(Ok(top_docs)) = search_result else {
             return Vec::new();
@@ -612,10 +638,21 @@ impl SearchIndex {
         results
     }
 
+    /// Every version's index, for `--clear-cache`.
     pub fn clear_index() -> anyhow::Result<()> {
-        let index_dir = Self::index_path()?;
-        if index_dir.exists() {
-            fs::remove_dir_all(&index_dir)?;
+        let base = super::index_dir()?;
+        let Some(dir) = base.parent() else {
+            return Ok(());
+        };
+        for entry in fs::read_dir(dir)?.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_index_dir)
+            {
+                fs::remove_dir_all(&path)?;
+            }
         }
         Ok(())
     }
@@ -634,7 +671,7 @@ impl SearchIndex {
             .set_indexing_options(text_indexing)
             .set_stored();
         let text = schema_builder.add_text_field("text", text_options);
-        let msg_ts = schema_builder.add_i64_field("msg_ts", INDEXED | STORED | FAST);
+        let msg_ts = schema_builder.add_i64_field(MSG_TS_FIELD, INDEXED | STORED | FAST);
 
         let schema = schema_builder.build();
         let fields = Fields {
@@ -648,8 +685,19 @@ impl SearchIndex {
         (schema, fields)
     }
 
+    /// One directory per index version, for the reason `Cache` keeps one
+    /// file per version: an older build still running rebuilds only its own.
     fn index_path() -> anyhow::Result<PathBuf> {
-        super::index_dir()
+        let path = super::index_dir()?.with_file_name(format!("index-v{INDEX_VERSION}"));
+        if let Some(dir) = path.parent() {
+            super::cache::prune_stale_versions(
+                dir,
+                &path,
+                is_index_dir,
+                super::cache::STALE_VERSION_AFTER,
+            );
+        }
+        Ok(path)
     }
 
     fn save_manifest(daily_groups: &[DailyGroup], index_dir: &Path) -> anyhow::Result<()> {
@@ -867,6 +915,63 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Recency lifts a match by at most double and never below its own
+    // relevance, halving its lift every half-life.
+    #[test]
+    fn the_recency_boost_lifts_new_matches_without_burying_old_ones() {
+        let half = RECENCY_HALF_LIFE_SECS as i64;
+        assert!((recency_boost(0) - 2.0).abs() < 1e-6);
+        assert!((recency_boost(half) - 1.5).abs() < 1e-6);
+        assert!((recency_boost(2 * half) - 1.25).abs() < 1e-6);
+        assert!(
+            recency_boost(i64::MAX) >= 1.0,
+            "an ancient match keeps its relevance"
+        );
+        assert!(
+            recency_boost(-5) <= 2.0,
+            "a clock skew past now caps at the newest"
+        );
+    }
+
+    // Two equally relevant matches come back newest first.
+    #[test]
+    fn of_equal_matches_the_newer_message_ranks_first() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let dir = std::env::temp_dir().join(format!("ccsight-recency-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = |name: &str, days_ago: i64| {
+            let at = (chrono::Utc::now() - chrono::Duration::days(days_ago)).to_rfc3339();
+            let p = dir.join(format!("{name}.jsonl"));
+            std::fs::write(
+                &p,
+                format!(
+                    r#"{{"type":"user","uuid":"{name}","timestamp":"{at}","message":{{"role":"user","content":"needle"}}}}"#
+                ),
+            )
+            .unwrap();
+            let mut s = make_session("p", None, None);
+            s.file_path = p;
+            s
+        };
+        let today = Local::now().date_naive();
+        let groups = vec![
+            make_daily_group(today - chrono::Duration::days(90), vec![session("old", 90)]),
+            make_daily_group(today, vec![session("new", 0)]),
+        ];
+        let index =
+            SearchIndex::build_in(&dir.join("index"), &groups, &|_| {}, FIRST_COMMIT_SESSIONS)
+                .unwrap();
+        let order: Vec<String> = index
+            .search("needle", 10, 50)
+            .into_iter()
+            .filter_map(|r| r.session_path)
+            .collect();
+        assert_eq!(order.len(), 2);
+        assert!(order[0].ends_with("new.jsonl"), "{order:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

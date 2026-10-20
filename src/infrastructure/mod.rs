@@ -23,6 +23,6 @@ pub use cowork_source::{
     cowork_session_id, is_cowork_audit_path, resolve_cowork_title, resolve_project_name,
 };
 pub use file_discovery::{FileDiscovery, RetentionWarning, check_cleanup_period};
-pub use mcp_config::{McpServerStatus, compute_mcp_status};
+pub use mcp_config::{McpServerStatus, compute_mcp_status, stale_reference};
 pub use resource_config::{ConfiguredResources, discover_configured_resources};
 pub use search_index::SearchIndex;

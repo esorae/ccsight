@@ -1,14 +1,6 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc, Weekday};
-
-use crate::domain::{EntryType, LogEntry, Usage};
-use crate::infrastructure::{
-    Cache, CachedDailyStats, CachedFileStats, CachedTokenStats, get_file_modified_secs,
-    get_file_size,
-};
-use crate::parser::JsonlParser;
+use crate::domain::Usage;
 
 /// Slash-command name from a "command invocation" user message. Accepts
 /// only messages with exactly one `<command-name>` tag AND body < 500
@@ -42,43 +34,158 @@ pub(crate) fn extract_command_names(text: &str) -> Vec<String> {
 
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
-    pub total_entries: usize,
     /// Cumulative lines added / removed across every edit in scope. Churn, so
     /// re-editing a line counts again; not a net diff and not scoped to one
     /// context window the way `/usage` is.
     pub line_churn: crate::domain::LineChurn,
     pub total_tokens: TokenStats,
     pub tool_usage: HashMap<String, usize>,
-    pub model_usage: HashMap<String, usize>,
     pub model_tokens: HashMap<String, TokenStats>,
-    pub daily_activity: HashMap<NaiveDate, u64>,
-    pub daily_work_activity: HashMap<NaiveDate, u64>,
     pub project_stats: HashMap<String, ProjectStats>,
-    pub hourly_activity: HashMap<u8, u64>,
     pub hourly_work_activity: HashMap<u8, u64>,
-    pub weekday_activity: HashMap<Weekday, u64>,
-    pub weekday_work_activity: HashMap<Weekday, u64>,
     pub tool_error_count: usize,
     pub tool_success_count: usize,
     pub total_sessions_count: usize,
     pub language_usage: HashMap<String, usize>,
     pub extension_usage: HashMap<String, usize>,
-    /// Per-tool/Skills/Subagents/MCP key: distinct session-days that used this key at least once.
+    /// Per tool key: distinct user sessions that used it, a subagent's use
+    /// credited to its parent.
     pub tool_sessions: HashMap<String, usize>,
-    /// Per-MCP-server: distinct session-days that used at least one tool from this server.
-    /// A session that uses two tools from the same server still counts as 1. Keyed by the
-    /// normalized server name (e.g. `serverA`, `orgA/serverB` for plugin-form servers).
+    /// Per-MCP-server: distinct user sessions that used one of its tools, a
+    /// subagent's use credited to its parent. Keyed by the normalized server
+    /// name (`serverA`, or `orgA/serverB` for plugin-form servers).
     pub mcp_server_sessions: HashMap<String, usize>,
-    /// Session-days that used at least one Skills entry (key starts with `skill:`).
+    /// Distinct user sessions that used at least one Skills entry (key starts with `skill:`).
     pub sessions_using_skills: usize,
-    /// Session-days that used at least one Subagents entry (key starts with `agent:`).
+    /// Distinct user sessions that used at least one Subagents entry (key starts with `agent:`).
     pub sessions_using_subagents: usize,
-    /// Session-days that used at least one MCP tool (key starts with `mcp__`).
+    /// Distinct user sessions that used at least one MCP tool (key starts with `mcp__`).
     pub sessions_using_mcp: usize,
-    /// Session-days that invoked at least one slash command (key starts with `command:`).
+    /// Distinct user sessions that invoked at least one slash command (key starts with `command:`).
     pub sessions_using_commands: usize,
-    /// Total session-days (non-subagent). Denominator for adoption rate calculations.
-    pub total_session_days: usize,
+}
+
+impl Stats {
+    /// The whole-view figures folded from per-day session slices — what a
+    /// filtered view shows, and the one definition every view can share.
+    pub(crate) fn from_groups(groups: &[crate::aggregator::DailyGroup]) -> Stats {
+        let mut stats = Stats::default();
+        // `groups` repeats a session once per active day; every session count
+        // below dedups by path, so a multi-day session counts once.
+        let mut seen_paths: std::collections::HashSet<&std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let mut tool_owners: HashMap<&String, std::collections::HashSet<&std::path::PathBuf>> =
+            HashMap::new();
+        let mut server_owners: HashMap<String, std::collections::HashSet<&std::path::PathBuf>> =
+            HashMap::new();
+        let mut adoption_owners: [std::collections::HashSet<&std::path::PathBuf>; 4] =
+            Default::default();
+
+        for group in groups {
+            for session in &group.sessions {
+                // The subagent rule (CLAUDE.md, Key Patterns): counts leave
+                // subagents out, everything consumed or done takes them in.
+                let first_sighting = !session.is_subagent && seen_paths.insert(&session.file_path);
+                if first_sighting {
+                    stats.total_sessions_count += 1;
+                }
+                // A subagent's tools count for the session that launched it,
+                // so a tool's session count stays a count of user sessions.
+                let owner = if session.is_subagent {
+                    session.parent_path.as_ref()
+                } else {
+                    Some(&session.file_path)
+                };
+                if let Some(owner) = owner {
+                    for tool in session.day_tool_usage.keys() {
+                        if let Some(slot) = adoption_slot(tool) {
+                            adoption_owners[slot].insert(owner);
+                        }
+                        tool_owners.entry(tool).or_default().insert(owner);
+                        if let Some(server) = crate::aggregator::mcp_server_of(tool) {
+                            server_owners.entry(server).or_default().insert(owner);
+                        }
+                    }
+                }
+
+                let work_tokens = session.work_tokens();
+                // Cache reads and writes included — the measure the unfiltered
+                // aggregation credits to `tokens` / `*_activity`.
+                let all_tokens = work_tokens
+                    + session
+                        .day_tokens_by_model
+                        .values()
+                        .map(|t| t.cache_creation_tokens + t.cache_read_tokens)
+                        .sum::<u64>();
+                stats.line_churn.add(session.line_churn);
+                stats.tool_error_count += session.day_tool_errors;
+                stats.tool_success_count += session.day_tool_successes;
+                stats.total_tokens.input_tokens += session.day_input_tokens;
+                stats.total_tokens.output_tokens += session.day_output_tokens;
+
+                for (model, tokens) in &session.day_tokens_by_model {
+                    stats
+                        .model_tokens
+                        .entry(model.clone())
+                        .or_default()
+                        .merge(tokens);
+
+                    stats.total_tokens.cache_creation_tokens += tokens.cache_creation_tokens;
+                    stats.total_tokens.cache_creation_5m_tokens += tokens.cache_creation_5m_tokens;
+                    stats.total_tokens.cache_creation_1h_tokens += tokens.cache_creation_1h_tokens;
+                    stats.total_tokens.cache_read_tokens += tokens.cache_read_tokens;
+                }
+
+                for (hour, tokens) in &session.day_hourly_work_tokens {
+                    *stats.hourly_work_activity.entry(*hour).or_insert(0) += tokens;
+                }
+
+                let project_stats = stats
+                    .project_stats
+                    .entry(session.project_name.clone())
+                    .or_default();
+                // Distinct user sessions, the count the project popup shows.
+                project_stats.sessions += usize::from(first_sighting);
+                project_stats.work_tokens += work_tokens;
+                project_stats.tokens += all_tokens;
+
+                for (tool, count) in &session.day_tool_usage {
+                    *stats.tool_usage.entry(tool.clone()).or_insert(0) += count;
+                }
+                for (lang, count) in &session.day_language_usage {
+                    *stats.language_usage.entry(lang.clone()).or_insert(0) += count;
+                }
+                for (ext, count) in &session.day_extension_usage {
+                    *stats.extension_usage.entry(ext.clone()).or_insert(0) += count;
+                }
+            }
+        }
+        // Only owners that are user sessions of this view count: a parent the
+        // view does not hold (or a transcript naming none) is no session here.
+        let sessions_among = |owners: std::collections::HashSet<&std::path::PathBuf>| {
+            owners
+                .into_iter()
+                .filter(|p| seen_paths.contains(p))
+                .count()
+        };
+        stats.tool_sessions = tool_owners
+            .into_iter()
+            .map(|(tool, owners)| (tool.clone(), sessions_among(owners)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let [skills, subagents, mcp, commands] = adoption_owners.map(sessions_among);
+        stats.sessions_using_skills = skills;
+        stats.sessions_using_subagents = subagents;
+        stats.sessions_using_mcp = mcp;
+        stats.sessions_using_commands = commands;
+        stats.mcp_server_sessions = server_owners
+            .into_iter()
+            .map(|(server, owners)| (server, sessions_among(owners)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+
+        stats
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,7 +195,12 @@ pub struct ProjectStats {
     pub work_tokens: u64,
 }
 
-pub(crate) const KNOWN_SPEED: &str = "standard";
+/// Speeds with a rate; any other marks its aggregate's cost unknown.
+const RATED_SPEEDS: &[&str] = &["standard", "fast"];
+
+pub(crate) fn is_unrated_speed(speed: Option<&str>) -> bool {
+    speed.is_some_and(|s| !RATED_SPEEDS.contains(&s))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenStats {
@@ -125,7 +237,7 @@ impl TokenStats {
     }
 
     pub fn add(&mut self, usage: &Usage) {
-        self.non_standard_speed |= usage.speed.as_deref().is_some_and(|s| s != KNOWN_SPEED);
+        self.non_standard_speed |= is_unrated_speed(usage.speed.as_deref());
         self.input_tokens += usage.input_tokens;
         self.output_tokens += usage.output_tokens;
         self.cache_creation_tokens += usage.cache_creation_input_tokens;
@@ -155,11 +267,8 @@ impl TokenStats {
     }
 }
 
-pub struct StatsAggregator;
-
-/// The transcript's `sessionId`. Both cold walks write it to the shared
-/// cache, where a subagent's parent link is derived from it, so they must
-/// read it off the same entry.
+/// The transcript's `sessionId`, off the first entry that carries one — a
+/// subagent's parent link is derived from it.
 pub(crate) fn session_id_of(entries: &[crate::domain::LogEntry]) -> Option<String> {
     entries.iter().find_map(|e| e.session_id.clone())
 }
@@ -186,877 +295,24 @@ pub(crate) fn human_prompt_text(entry: &crate::domain::LogEntry) -> Option<Strin
     (!cleaned.is_empty() && !crate::text::looks_like_system_injection(&cleaned)).then_some(cleaned)
 }
 
-/// Per-day accumulator shared by both aggregation paths (`StatsAggregator`
-/// and `DailyGrouper`) so a new per-day field is declared once, not mirrored
-/// in two structs that silently drift. Timestamps are `Option` (empty until
-/// the first entry of the day folds in).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct DailyStats {
-    pub(crate) first_timestamp: Option<DateTime<Utc>>,
-    pub(crate) last_timestamp: Option<DateTime<Utc>>,
-    pub(crate) input_tokens: u64,
-    pub(crate) output_tokens: u64,
-    pub(crate) user_msgs: u64,
-    /// The share of `user_msgs` someone typed (see `is_human_prompt`).
-    pub(crate) prompts: u64,
-    pub(crate) assistant_msgs: u64,
-    pub(crate) line_churn: crate::domain::LineChurn,
-    pub(crate) tokens_by_model: HashMap<String, TokenStats>,
-    pub(crate) hourly_activity: HashMap<u8, u64>,
-    pub(crate) hourly_work_activity: HashMap<u8, u64>,
-    pub(crate) tool_usage: HashMap<String, usize>,
-    pub(crate) language_usage: HashMap<String, usize>,
-    pub(crate) extension_usage: HashMap<String, usize>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct FileStats {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_creation_tokens: u64,
-    cache_creation_5m_tokens: u64,
-    cache_creation_1h_tokens: u64,
-    cache_read_tokens: u64,
-    /// Hashes that this file uniquely contributed (i.e. were NOT already in
-    /// the global_seen set when this file was parsed). Saved to cache so
-    /// next run's pre-load can rebuild global_seen without re-parsing.
-    unique_hashes: Vec<String>,
-    tool_usage: HashMap<String, usize>,
-    model_usage: HashMap<String, usize>,
-    model_tokens: HashMap<String, TokenStats>,
-    session_date: Option<NaiveDate>,
-    session_id: Option<String>,
-    git_branch: Option<String>,
-    first_timestamp: Option<DateTime<Utc>>,
-    last_timestamp: Option<DateTime<Utc>>,
-    summary: Option<String>,
-    custom_title: Option<String>,
-    ai_title: Option<String>,
-    last_user_message: Option<String>,
-    first_user_message: Option<String>,
-    model: Option<String>,
-    is_subagent: bool,
-    daily_stats: HashMap<NaiveDate, DailyStats>,
-    hourly_activity: HashMap<u8, u64>,
-    hourly_work_activity: HashMap<u8, u64>,
-    weekday_activity: HashMap<u8, u64>,
-    weekday_work_activity: HashMap<u8, u64>,
-    tool_error_count: usize,
-    tool_success_count: usize,
-    session_duration_mins: Option<i64>,
-    language_usage: HashMap<String, usize>,
-    extension_usage: HashMap<String, usize>,
-}
-
-impl FileStats {
-    /// Same "work tokens" concept as `TokenStats::work_tokens` — input +
-    /// output only, excluding cache.
-    fn work_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens
-    }
-}
-
 pub struct CacheStats {
     pub cached_files: usize,
     pub parsed_files: usize,
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Files walked / total for the running stats pass. A process global rather
-/// than a threaded parameter because the only reader is the render thread,
-/// which has no call path into the walk.
-static PROGRESS_DONE: AtomicUsize = AtomicUsize::new(0);
-static PROGRESS_TOTAL: AtomicUsize = AtomicUsize::new(0);
-
-/// `(files walked, files to walk)`. `(_, 0)` means no pass has started.
-pub fn load_progress() -> (usize, usize) {
-    (
-        PROGRESS_DONE.load(Ordering::Relaxed),
-        PROGRESS_TOTAL.load(Ordering::Relaxed),
-    )
-}
-
-impl StatsAggregator {
-    /// Per-tool session-day count, over EVERY session including subagents —
-    /// the same scope `tool_usage` counts calls in. Scoping the two columns
-    /// differently rendered a subagent-only entry as `2 calls · 0 ses`.
-    pub(crate) fn add_tool_sessions<'a, I: IntoIterator<Item = &'a String>>(
-        stats: &mut Stats,
-        keys: I,
-    ) {
-        for key in keys {
-            *stats.tool_sessions.entry(key.clone()).or_insert(0) += 1;
-        }
-    }
-
-    /// For one session-day (iterator over the keys used in that day), increment the
-    /// `sessions_using_*` adoption counters. Each counter is incremented at most once
-    /// per call regardless of how many keys of a category appear. Subagent sessions are
-    /// excluded by the caller: adoption answers "how many of MY sessions use this".
-    pub(crate) fn add_session_adoption<'a, I: IntoIterator<Item = &'a String>>(
-        stats: &mut Stats,
-        keys: I,
-    ) {
-        let mut used_skill = false;
-        let mut used_subagent = false;
-        let mut used_mcp = false;
-        let mut used_command = false;
-        // Collect MCP servers touched in this session-day. Using a local set so a session
-        // that hits two tools from the same server increments `mcp_server_sessions` only
-        // once.
-        let mut servers_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for key in keys {
-            if key.starts_with("skill:") {
-                used_skill = true;
-            } else if key.starts_with("agent:") {
-                used_subagent = true;
-            } else if key.starts_with("command:") {
-                used_command = true;
-            } else if key.starts_with("mcp__") {
-                used_mcp = true;
-                if let Some(server) = crate::aggregator::mcp_server_of(key) {
-                    servers_seen.insert(server);
-                }
-            }
-        }
-        if used_skill {
-            stats.sessions_using_skills += 1;
-        }
-        if used_subagent {
-            stats.sessions_using_subagents += 1;
-        }
-        if used_mcp {
-            stats.sessions_using_mcp += 1;
-        }
-        if used_command {
-            stats.sessions_using_commands += 1;
-        }
-        for server in servers_seen {
-            *stats.mcp_server_sessions.entry(server).or_insert(0) += 1;
-        }
-    }
-
-    /// Returns the updated cache so the caller can hand it to
-    /// `DailyGrouper::group_by_date_with_shared_cache` — every miss parsed
-    /// here becomes a grouper hit, keeping cold start at one parse per file.
-    pub fn aggregate_with_shared_cache(
-        files: &[PathBuf],
-        mut cache: Cache,
-    ) -> (Stats, CacheStats, Cache) {
-        let mut stats = Stats::default();
-
-        let mut cache_stats = CacheStats {
-            cached_files: 0,
-            parsed_files: 0,
-        };
-
-        // Same (msg_id, requestId) across JSONLs bills once, so hashes of the
-        // cache hits are pre-loaded. Hits are decided ONCE and the walk reuses
-        // the decision: a file appended to between two separate checks would
-        // be pre-loaded, then re-parsed against its own hashes — crediting
-        // itself nothing and caching that zero. Mirrors the grouping.rs pass.
-        let hits: std::collections::HashSet<&PathBuf> = files
-            .iter()
-            .filter(|f| cache.is_valid(f) && cache.get(f).is_some())
-            .collect();
-        let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for cached in hits.iter().filter_map(|f| cache.get(f)) {
-            for h in &cached.unique_hashes {
-                global_seen.insert(h.clone());
-            }
-        }
-
-        // Sorted iteration for deterministic hash attribution across runs.
-        let mut sorted_files: Vec<&PathBuf> = files.iter().collect();
-        sorted_files.sort();
-
-        PROGRESS_DONE.store(0, Ordering::Relaxed);
-        PROGRESS_TOTAL.store(sorted_files.len(), Ordering::Relaxed);
-
-        for file in &sorted_files {
-            PROGRESS_DONE.fetch_add(1, Ordering::Relaxed);
-            if hits.contains(*file)
-                && let Some(cached) = cache.get(file)
-            {
-                let project_name = cached.project_name.clone();
-                Self::merge_cached_stats(&mut stats, cached, &project_name);
-                cache_stats.cached_files += 1;
-                continue;
-            }
-
-            if let Ok(entries) = JsonlParser::parse_file(file) {
-                // For Cowork audit.jsonl the in-stream `cwd` is meaningless
-                // (sandbox / outputs subdir); `resolve_project_name` swaps in
-                // the metadata's `userSelectedFolders` (real project) or a
-                // single `Cowork` bucket. Non-cowork files are unaffected.
-                // Single source of truth: cache writer here + `grouping.rs`.
-                let project_name = crate::infrastructure::resolve_project_name(
-                    file,
-                    Self::extract_project_name_from_entries(&entries),
-                );
-                let file_stats = Self::aggregate_file_entries(
-                    &mut stats,
-                    &entries,
-                    &project_name,
-                    file,
-                    &mut global_seen,
-                );
-
-                let model_tokens_cached: HashMap<String, CachedTokenStats> = file_stats
-                    .model_tokens
-                    .iter()
-                    .map(|(model, ts)| (model.clone(), ts.clone()))
-                    .collect();
-
-                let daily_stats_cached: HashMap<String, CachedDailyStats> = file_stats
-                    .daily_stats
-                    .into_iter()
-                    .map(|(date, ds)| {
-                        let tokens_by_model = ds
-                            .tokens_by_model
-                            .iter()
-                            .map(|(model, ts)| (model.clone(), ts.clone()))
-                            .collect();
-                        (
-                            date.to_string(),
-                            CachedDailyStats {
-                                first_timestamp: ds.first_timestamp,
-                                last_timestamp: ds.last_timestamp,
-                                input_tokens: ds.input_tokens,
-                                output_tokens: ds.output_tokens,
-                                tokens_by_model,
-                                hourly_activity: ds.hourly_activity,
-                                hourly_work_activity: ds.hourly_work_activity,
-                                tool_usage: ds.tool_usage,
-                                language_usage: ds.language_usage,
-                                extension_usage: ds.extension_usage,
-                                user_msgs: ds.user_msgs,
-                                prompts: ds.prompts,
-                                assistant_msgs: ds.assistant_msgs,
-                                line_churn: ds.line_churn,
-                            },
-                        )
-                    })
-                    .collect();
-
-                let cached_file_stats = CachedFileStats {
-                    verified_cwd: crate::aggregator::extract_verified_cwd(&entries, file),
-                    modified_secs: get_file_modified_secs(file),
-                    file_size: get_file_size(file),
-                    entry_count: entries.len(),
-                    input_tokens: file_stats.input_tokens,
-                    output_tokens: file_stats.output_tokens,
-                    cache_creation_tokens: file_stats.cache_creation_tokens,
-                    cache_creation_5m_tokens: file_stats.cache_creation_5m_tokens,
-                    cache_creation_1h_tokens: file_stats.cache_creation_1h_tokens,
-                    cache_read_tokens: file_stats.cache_read_tokens,
-                    unique_hashes: file_stats.unique_hashes,
-                    tool_usage: file_stats.tool_usage,
-                    model_usage: file_stats.model_usage,
-                    model_tokens: model_tokens_cached,
-                    session_date: file_stats.session_date,
-                    project_name: project_name.clone(),
-                    session_id: file_stats.session_id,
-                    git_branch: file_stats.git_branch.clone(),
-                    first_timestamp: file_stats.first_timestamp,
-                    last_timestamp: file_stats.last_timestamp,
-                    summary: file_stats.summary.clone(),
-                    custom_title: file_stats.custom_title.clone(),
-                    ai_title: file_stats.ai_title.clone(),
-                    last_user_message: file_stats.last_user_message.clone(),
-                    first_user_message: file_stats.first_user_message.clone(),
-                    model: file_stats.model,
-                    is_subagent: file_stats.is_subagent,
-                    daily_stats: daily_stats_cached,
-                    hourly_activity: file_stats.hourly_activity,
-                    hourly_work_activity: file_stats.hourly_work_activity,
-                    weekday_activity: file_stats.weekday_activity,
-                    weekday_work_activity: file_stats.weekday_work_activity,
-                    tool_error_count: file_stats.tool_error_count,
-                    tool_success_count: file_stats.tool_success_count,
-                    session_duration_mins: file_stats.session_duration_mins,
-                    language_usage: file_stats.language_usage,
-                    extension_usage: file_stats.extension_usage,
-                };
-
-                Self::apply_productivity_stats(&mut stats, &cached_file_stats);
-                cache.insert(file, cached_file_stats);
-                cache_stats.parsed_files += 1;
-            }
-        }
-
-        let _ = cache.save();
-
-        (stats, cache_stats, cache)
-    }
-
-    fn merge_cached_stats(
-        stats: &mut Stats,
-        cached: &CachedFileStats,
-        project_name: &Option<String>,
-    ) {
-        stats.total_entries += cached.entry_count;
-        for ds in cached.daily_stats.values() {
-            stats.line_churn.add(ds.line_churn);
-        }
-        stats.total_tokens.input_tokens += cached.input_tokens;
-        stats.total_tokens.output_tokens += cached.output_tokens;
-        stats.total_tokens.cache_creation_tokens += cached.cache_creation_tokens;
-        stats.total_tokens.cache_read_tokens += cached.cache_read_tokens;
-        stats.total_tokens.cache_creation_5m_tokens += cached.cache_creation_5m_tokens;
-        stats.total_tokens.cache_creation_1h_tokens += cached.cache_creation_1h_tokens;
-
-        for (tool, count) in &cached.tool_usage {
-            *stats.tool_usage.entry(tool.clone()).or_insert(0) += count;
-        }
-
-        // `tool_sessions` spans every session so its scope matches `tool_usage`
-        // above; adoption and `total_session_days` count user sessions only.
-        for ds in cached.daily_stats.values() {
-            Self::add_tool_sessions(stats, ds.tool_usage.keys());
-        }
-        if !cached.is_subagent {
-            for ds in cached.daily_stats.values() {
-                Self::add_session_adoption(stats, ds.tool_usage.keys());
-                stats.total_session_days += 1;
-            }
-        }
-
-        for (model, count) in &cached.model_usage {
-            *stats.model_usage.entry(model.clone()).or_insert(0) += count;
-        }
-
-        for (model, cached_ts) in &cached.model_tokens {
-            stats
-                .model_tokens
-                .entry(model.clone())
-                .or_default()
-                .merge(cached_ts);
-        }
-
-        let session_tokens = cached.input_tokens
-            + cached.output_tokens
-            + cached.cache_creation_tokens
-            + cached.cache_read_tokens;
-        let session_work_tokens = cached.work_tokens();
-
-        // Tokens include subagents so sum-of-projects reconciles with the
-        // subagent-inclusive Overview; `sessions` counts the user's own, the
-        // number the project popup shows beside it.
-        if let Some(name) = project_name {
-            let project = stats.project_stats.entry(name.clone()).or_default();
-            project.sessions += usize::from(!cached.is_subagent);
-            project.tokens += session_tokens;
-            project.work_tokens += session_work_tokens;
-        }
-
-        if let Some(date) = cached.session_date {
-            *stats.daily_activity.entry(date).or_insert(0) += session_tokens;
-            *stats.daily_work_activity.entry(date).or_insert(0) += session_work_tokens;
-        }
-
-        for (hour, tokens) in &cached.hourly_activity {
-            *stats.hourly_activity.entry(*hour).or_insert(0) += tokens;
-        }
-
-        for (hour, tokens) in &cached.hourly_work_activity {
-            *stats.hourly_work_activity.entry(*hour).or_insert(0) += tokens;
-        }
-
-        for (weekday, tokens) in &cached.weekday_activity {
-            *stats
-                .weekday_activity
-                .entry(Weekday::try_from(*weekday).unwrap_or(Weekday::Mon))
-                .or_insert(0) += tokens;
-        }
-
-        for (weekday, tokens) in &cached.weekday_work_activity {
-            *stats
-                .weekday_work_activity
-                .entry(Weekday::try_from(*weekday).unwrap_or(Weekday::Mon))
-                .or_insert(0) += tokens;
-        }
-
-        stats.tool_error_count += cached.tool_error_count;
-        stats.tool_success_count += cached.tool_success_count;
-
-        for (lang, count) in &cached.language_usage {
-            *stats.language_usage.entry(lang.clone()).or_insert(0) += count;
-        }
-
-        for (ext, count) in &cached.extension_usage {
-            *stats.extension_usage.entry(ext.clone()).or_insert(0) += count;
-        }
-
-        Self::apply_productivity_stats(stats, cached);
-    }
-
-    fn apply_productivity_stats(stats: &mut Stats, cached: &CachedFileStats) {
-        if !cached.is_subagent {
-            stats.total_sessions_count += 1;
-        }
-    }
-
-    fn aggregate_file_entries(
-        stats: &mut Stats,
-        entries: &[LogEntry],
-        project_name: &Option<String>,
-        file: &Path,
-        global_seen: &mut std::collections::HashSet<String>,
-    ) -> FileStats {
-        let mut file_stats = FileStats::default();
-
-        stats.total_entries += entries.len();
-
-        file_stats.session_id = session_id_of(entries);
-        let entries_with_ts: Vec<_> = entries.iter().filter(|e| e.timestamp.is_some()).collect();
-        if let Some(first) = entries_with_ts.first() {
-            file_stats.first_timestamp = first.timestamp;
-            // git_branch is mutable mid-session (`git checkout`); use the
-            // LATEST value, not the first. Matches `grouping.rs` and the
-            // session-representative-value rule.
-            file_stats.git_branch = entries_with_ts
-                .iter()
-                .rev()
-                .find_map(|e| e.git_branch.clone());
-            let is_subagent_by_entry = first.is_sidechain;
-            let is_subagent_by_filename = file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("agent-"));
-            file_stats.is_subagent = is_subagent_by_entry || is_subagent_by_filename;
-        }
-        if let Some(last) = entries_with_ts.last() {
-            file_stats.last_timestamp = last.timestamp;
-        }
-
-        file_stats.summary = entries
-            .iter()
-            .rfind(|e| e.entry_type == EntryType::Summary)
-            .and_then(|e| e.summary.clone())
-            .or_else(|| {
-                entries
-                    .iter()
-                    .rev()
-                    .filter(|e| {
-                        e.entry_type == EntryType::User || e.entry_type == EntryType::System
-                    })
-                    .find_map(|e| {
-                        let text = e.message.as_ref()?.content.extract_text();
-                        let text = text.trim();
-                        if text.is_empty() || text.starts_with('<') {
-                            None
-                        } else {
-                            let truncated: String = text.chars().take(80).collect();
-                            Some(truncated)
-                        }
-                    })
-            });
-
-        file_stats.custom_title = entries
-            .iter()
-            .rfind(|e| e.entry_type == EntryType::CustomTitle)
-            .and_then(|e| e.custom_title.clone())
-            // Cowork sessions don't emit a `customTitle` JSONL entry; pull the
-            // user-curated `title` from the sibling metadata json instead so
-            // the cached value matches what the grouper would resolve.
-            .or_else(|| crate::infrastructure::resolve_cowork_title(file));
-
-        file_stats.ai_title = entries
-            .iter()
-            .rfind(|e| e.entry_type == EntryType::AiTitle)
-            .and_then(|e| e.ai_title.clone());
-
-        file_stats.last_user_message =
-            crate::aggregator::grouping::extract_last_user_message_for_cache(entries);
-        file_stats.first_user_message =
-            crate::aggregator::grouping::extract_first_user_message_for_cache(entries);
-
-        file_stats.model = super::extract_session_model(entries);
-
-        for entry in entries {
-            // Single dedup decision shared by both daily_stats and global
-            // stats below — independent decisions would split TUI Overview
-            // and `--daily` totals.
-            let skip_tokens = if entry.entry_type == EntryType::Assistant
-                && entry
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.usage.as_ref())
-                    .is_some()
-            {
-                match crate::parser::JsonlParser::entry_hash(entry) {
-                    Some(hash) => {
-                        if !global_seen.insert(hash.clone()) {
-                            true
-                        } else {
-                            file_stats.unique_hashes.push(hash);
-                            false
-                        }
-                    }
-                    None => false,
-                }
-            } else {
-                false
-            };
-
-            if let Some(ts) = entry.timestamp {
-                let date = ts.with_timezone(&Local).date_naive();
-                let daily = file_stats.daily_stats.entry(date).or_default();
-
-                if daily.first_timestamp.is_none() || Some(ts) < daily.first_timestamp {
-                    daily.first_timestamp = Some(ts);
-                }
-                if daily.last_timestamp.is_none() || Some(ts) > daily.last_timestamp {
-                    daily.last_timestamp = Some(ts);
-                }
-                let churn = crate::aggregator::grouping::credited_churn(
-                    entry,
-                    global_seen,
-                    &mut file_stats.unique_hashes,
-                );
-                daily.line_churn.add(churn);
-                // The cold walk folds into `stats` directly, as it does for
-                // tokens; only a cache hit goes through `merge_cached_stats`.
-                stats.line_churn.add(churn);
-
-                if entry.entry_type == EntryType::Assistant
-                    && let Some(ref message) = entry.message
-                    && let Some(ref usage) = message.usage
-                {
-                    let model_key = message
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
-                    // Filter synthetic / empty-model entries from the
-                    // entry stream entirely. `continue` skips Block B
-                    // below too, preserving the prior semantics that
-                    // these never reach model_usage / tool_usage.
-                    if !super::is_real_model(&model_key) {
-                        continue;
-                    }
-                    // Deduped entries: token math skipped here, but
-                    // Block B's tool/model_usage still runs.
-                    if !skip_tokens {
-                        daily.input_tokens += usage.input_tokens;
-                        daily.output_tokens += usage.output_tokens;
-
-                        let daily_model = daily.tokens_by_model.entry(model_key).or_default();
-                        daily_model.add(usage);
-
-                        let local_ts = ts.with_timezone(&Local);
-                        let hour = local_ts.hour() as u8;
-                        let weekday = local_ts.weekday().num_days_from_monday() as u8;
-                        let tokens = usage.input_tokens
-                            + usage.output_tokens
-                            + usage.cache_creation_input_tokens
-                            + usage.cache_read_input_tokens;
-                        let work_tokens = usage.work_tokens();
-
-                        *daily.hourly_activity.entry(hour).or_insert(0) += tokens;
-                        *daily.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
-                        *file_stats.hourly_activity.entry(hour).or_insert(0) += tokens;
-                        *file_stats.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
-                        *file_stats.weekday_activity.entry(weekday).or_insert(0) += tokens;
-                        *file_stats.weekday_work_activity.entry(weekday).or_insert(0) +=
-                            work_tokens;
-                        *stats.hourly_activity.entry(hour).or_insert(0) += tokens;
-                        *stats.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
-                        *stats
-                            .weekday_activity
-                            .entry(local_ts.weekday())
-                            .or_insert(0) += tokens;
-                        *stats
-                            .weekday_work_activity
-                            .entry(local_ts.weekday())
-                            .or_insert(0) += work_tokens;
-                    }
-                }
-            }
-
-            if let Some(ref message) = entry.message {
-                if entry.entry_type == EntryType::Assistant {
-                    if let Some(ref usage) = message.usage {
-                        if skip_tokens {
-                            // tool_usage / model_usage still need this
-                            // entry, but token totals must not double-count.
-                            if let Some(ref model) = message.model {
-                                *stats.model_usage.entry(model.clone()).or_insert(0) += 1;
-                                *file_stats.model_usage.entry(model.clone()).or_insert(0) += 1;
-                            }
-                            let daily_date = entry
-                                .timestamp
-                                .map(|ts| ts.with_timezone(&Local).date_naive());
-                            Self::count_tool_usage_with_file_stats(
-                                stats,
-                                &mut file_stats,
-                                daily_date,
-                                message,
-                                is_human_prompt(entry),
-                            );
-                            continue;
-                        }
-                        stats.total_tokens.add(usage);
-                        file_stats.input_tokens += usage.input_tokens;
-                        file_stats.output_tokens += usage.output_tokens;
-                        file_stats.cache_creation_tokens += usage.cache_creation_input_tokens;
-                        file_stats.cache_read_tokens += usage.cache_read_input_tokens;
-                        if let Some(ref cc) = usage.cache_creation {
-                            file_stats.cache_creation_5m_tokens += cc.ephemeral_5m_input_tokens;
-                            file_stats.cache_creation_1h_tokens += cc.ephemeral_1h_input_tokens;
-                        } else {
-                            file_stats.cache_creation_5m_tokens +=
-                                usage.cache_creation_input_tokens;
-                        }
-
-                        if let Some(ref model) = message.model {
-                            let model_stats = stats.model_tokens.entry(model.clone()).or_default();
-                            model_stats.add(usage);
-                            let file_model_stats =
-                                file_stats.model_tokens.entry(model.clone()).or_default();
-                            file_model_stats.add(usage);
-                        }
-                    }
-
-                    if let Some(ref model) = message.model {
-                        *stats.model_usage.entry(model.clone()).or_insert(0) += 1;
-                        *file_stats.model_usage.entry(model.clone()).or_insert(0) += 1;
-                    }
-                }
-
-                let daily_date = entry
-                    .timestamp
-                    .map(|ts| ts.with_timezone(&Local).date_naive());
-                Self::count_tool_usage_with_file_stats(
-                    stats,
-                    &mut file_stats,
-                    daily_date,
-                    message,
-                    is_human_prompt(entry),
-                );
-            }
-        }
-
-        let session_tokens = file_stats.input_tokens
-            + file_stats.output_tokens
-            + file_stats.cache_creation_tokens
-            + file_stats.cache_read_tokens;
-        let session_work_tokens = file_stats.work_tokens();
-
-        // Mirror of `merge_cached_stats`: tokens include subagents, sessions
-        // count the user's own.
-        if let Some(name) = project_name {
-            let project = stats.project_stats.entry(name.clone()).or_default();
-            project.sessions += usize::from(!file_stats.is_subagent);
-            project.tokens += session_tokens;
-            project.work_tokens += session_work_tokens;
-        }
-
-        // `tool_sessions` spans every session so its scope matches `tool_usage`
-        // above; adoption and `total_session_days` count user sessions only.
-        for ds in file_stats.daily_stats.values() {
-            Self::add_tool_sessions(stats, ds.tool_usage.keys());
-        }
-        if !file_stats.is_subagent {
-            for ds in file_stats.daily_stats.values() {
-                Self::add_session_adoption(stats, ds.tool_usage.keys());
-                stats.total_session_days += 1;
-            }
-        }
-
-        file_stats.session_date = Self::extract_session_date(entries);
-        if let Some(date) = file_stats.session_date {
-            *stats.daily_activity.entry(date).or_insert(0) += session_tokens;
-            *stats.daily_work_activity.entry(date).or_insert(0) += session_work_tokens;
-        }
-
-        if let (Some(first), Some(last)) = (file_stats.first_timestamp, file_stats.last_timestamp) {
-            let duration = (last - first).num_minutes();
-            file_stats.session_duration_mins = Some(duration.max(1));
-        }
-
-        file_stats
-    }
-
-    fn count_tool_usage_with_file_stats(
-        stats: &mut Stats,
-        file_stats: &mut FileStats,
-        daily_date: Option<NaiveDate>,
-        message: &crate::domain::Message,
-        human_prompt: bool,
-    ) {
-        use crate::domain::{ContentBlock, MessageContent};
-
-        // Slash commands (`/clear`, `/model`, `/<custom>`) appear as XML
-        // metadata in user message text — they are NOT tool_use blocks. Scan
-        // user messages for `<command-name>/foo</command-name>` and bump the
-        // `command:foo` key so commands show up in tool_usage stats.
-        if matches!(message.role, crate::domain::Role::User) {
-            if let Some(date) = daily_date
-                && let Some(d) = file_stats.daily_stats.get_mut(&date)
-            {
-                d.user_msgs += 1;
-                if human_prompt {
-                    d.prompts += 1;
-                }
-            }
-            let text = message.content.extract_text();
-            for cmd in extract_command_names(&text) {
-                let key = format!("command:{cmd}");
-                *stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
-                *file_stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
-                if let Some(date) = daily_date
-                    && let Some(d) = file_stats.daily_stats.get_mut(&date)
-                {
-                    *d.tool_usage.entry(key).or_insert(0) += 1;
-                }
-            }
-        } else if matches!(message.role, crate::domain::Role::Assistant)
-            && let Some(date) = daily_date
-            && let Some(d) = file_stats.daily_stats.get_mut(&date)
-        {
-            d.assistant_msgs += 1;
-        }
-
-        if let MessageContent::Blocks(ref blocks) = message.content {
-            for block in blocks {
-                match block {
-                    ContentBlock::ToolUse { name, input, .. } => {
-                        let key = crate::aggregator::tool_usage_key(name, input);
-                        *stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
-                        *file_stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
-
-                        let exts = Self::extract_extensions_from_tool_input(name, input);
-                        // Per-extension language attribution keeps language_usage in
-                        // step with extension_usage when one tool call resolves to
-                        // multiple extensions (e.g. a glob like `*.{md,mdx}`).
-                        // Special filenames without an extension (Dockerfile,
-                        // Makefile, etc.) fall through to the language-only path.
-                        let mut langs: Vec<&'static str> = exts
-                            .iter()
-                            .map(|ext| crate::aggregator::language::for_extension(ext))
-                            .collect();
-                        if exts.is_empty()
-                            && let Some(l) = Self::extract_language_from_tool_input(name, input)
-                        {
-                            langs.push(l);
-                        }
-                        for lang in &langs {
-                            *stats.language_usage.entry((*lang).to_string()).or_insert(0) += 1;
-                            *file_stats
-                                .language_usage
-                                .entry((*lang).to_string())
-                                .or_insert(0) += 1;
-                        }
-                        for ext in &exts {
-                            *stats.extension_usage.entry(ext.clone()).or_insert(0) += 1;
-                            *file_stats.extension_usage.entry(ext.clone()).or_insert(0) += 1;
-                        }
-
-                        if let Some(date) = daily_date
-                            && let Some(d) = file_stats.daily_stats.get_mut(&date)
-                        {
-                            *d.tool_usage.entry(key).or_insert(0) += 1;
-                            for lang in &langs {
-                                *d.language_usage.entry((*lang).to_string()).or_insert(0) += 1;
-                            }
-                            for ext in exts {
-                                *d.extension_usage.entry(ext).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                    ContentBlock::ToolResult { is_error, .. } => {
-                        if *is_error {
-                            stats.tool_error_count += 1;
-                            file_stats.tool_error_count += 1;
-                        } else {
-                            stats.tool_success_count += 1;
-                            file_stats.tool_success_count += 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    pub(crate) fn extract_language_from_tool_input(
-        tool_name: &str,
-        input: &serde_json::Value,
-    ) -> Option<&'static str> {
-        match tool_name {
-            "Read" | "Edit" | "Write" | "MultiEdit" => {
-                let path = input
-                    .get("file_path")
-                    .or_else(|| input.get("path"))
-                    .and_then(|v| v.as_str())?;
-                super::language::from_path(path)
-            }
-            "NotebookEdit" => {
-                let path = input.get("notebook_path").and_then(|v| v.as_str())?;
-                super::language::from_path(path)
-            }
-            "Glob" => {
-                let pattern = input.get("pattern").and_then(|v| v.as_str())?;
-                super::language::from_glob_pattern(pattern)
-            }
-            "Grep" => {
-                let glob = input.get("glob").and_then(|v| v.as_str());
-                if let Some(g) = glob {
-                    return super::language::from_glob_pattern(g);
-                }
-                let type_filter = input.get("type").and_then(|v| v.as_str())?;
-                super::language::from_type_filter(type_filter)
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn extract_extensions_from_tool_input(
-        tool_name: &str,
-        input: &serde_json::Value,
-    ) -> Vec<String> {
-        match tool_name {
-            "Read" | "Edit" | "Write" | "MultiEdit" => {
-                let path = input
-                    .get("file_path")
-                    .or_else(|| input.get("path"))
-                    .and_then(|v| v.as_str());
-                path.and_then(super::language::extension_from_path)
-                    .into_iter()
-                    .collect()
-            }
-            "NotebookEdit" => {
-                let path = input.get("notebook_path").and_then(|v| v.as_str());
-                path.and_then(super::language::extension_from_path)
-                    .into_iter()
-                    .collect()
-            }
-            "Glob" => {
-                let pattern = input.get("pattern").and_then(|v| v.as_str());
-                pattern
-                    .map(super::language::parse_extensions_from_glob)
-                    .unwrap_or_default()
-            }
-            "Grep" => {
-                let glob = input.get("glob").and_then(|v| v.as_str());
-                glob.map(super::language::parse_extensions_from_glob)
-                    .unwrap_or_default()
-            }
-            _ => vec![],
-        }
-    }
-
-    fn extract_project_name_from_entries(entries: &[LogEntry]) -> Option<String> {
-        super::extract_project_name(entries)
-    }
-
-    fn extract_session_date(entries: &[LogEntry]) -> Option<NaiveDate> {
-        entries
-            .iter()
-            .find_map(|e| e.timestamp)
-            .map(|ts| ts.with_timezone(&Local).date_naive())
+/// Which `sessions_using_*` counter a tool key moves: skills, subagents,
+/// MCP, commands. `None` for a key no adoption counter tracks.
+fn adoption_slot(key: &str) -> Option<usize> {
+    if key.starts_with("skill:") {
+        Some(0)
+    } else if key.starts_with("agent:") {
+        Some(1)
+    } else if key.starts_with("mcp__") {
+        Some(2)
+    } else if key.starts_with("command:") {
+        Some(3)
+    } else {
+        None
     }
 }
 
@@ -1118,6 +374,7 @@ mod tests {
             service_tier: None,
             cache_creation: None,
             speed: None,
+            iterations: Vec::new(),
         };
         stats.add(&usage);
 
@@ -1139,6 +396,7 @@ mod tests {
             service_tier: None,
             cache_creation: None,
             speed: None,
+            iterations: Vec::new(),
         };
         let usage2 = Usage {
             input_tokens: 200,
@@ -1148,6 +406,7 @@ mod tests {
             service_tier: None,
             cache_creation: None,
             speed: None,
+            iterations: Vec::new(),
         };
         stats.add(&usage1);
         stats.add(&usage2);
@@ -1155,227 +414,7 @@ mod tests {
         assert_eq!(stats.all_tokens(), 600);
     }
 
-    #[test]
-    fn test_get_language_from_path_extensions() {
-        assert_eq!(
-            crate::aggregator::language::from_path("/src/main.rs"),
-            Some("Rust")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/app.tsx"),
-            Some("TypeScript")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/script.py"),
-            Some("Python")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/data.json"),
-            Some("JSON")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/data.jsonl"),
-            Some("JSON")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/style.scss"),
-            Some("CSS")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/page.vue"),
-            Some("Vue")
-        );
-    }
-
-    #[test]
-    fn test_get_language_from_path_new_extensions() {
-        assert_eq!(
-            crate::aggregator::language::from_path("/readme.txt"),
-            Some("Text")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/data.csv"),
-            Some("CSV")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/icon.png"),
-            Some("Image")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/logo.svg"),
-            Some("Image")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/notebook.ipynb"),
-            Some("Jupyter")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/Cargo.lock"),
-            Some("Lock")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/app.conf"),
-            Some("Other")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/test.snap"),
-            Some("Snapshot")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/template.hbs"),
-            Some("Handlebars")
-        );
-    }
-
-    #[test]
-    fn test_get_language_from_path_dotfiles() {
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/.gitignore"),
-            Some("Other")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/.editorconfig"),
-            Some("Other")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/.env"),
-            Some("Other")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/.prettierrc"),
-            Some("Other")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/.node-version"),
-            Some("Other")
-        );
-    }
-
-    #[test]
-    fn test_get_language_from_path_extensionless_files() {
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/Makefile"),
-            Some("Makefile")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/Dockerfile"),
-            Some("Docker")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/Gemfile"),
-            Some("Ruby")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/Justfile"),
-            Some("Makefile")
-        );
-    }
-
-    #[test]
-    fn test_get_language_from_path_unknown_extensionless() {
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/LICENSE"),
-            Some("Other")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/CHANGELOG"),
-            Some("Other")
-        );
-    }
-
-    #[test]
-    fn test_get_language_from_path_real_world_other() {
-        assert_eq!(
-            crate::aggregator::language::from_path("/config.kdl"),
-            Some("KDL")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/.envrc"),
-            Some("Other")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/.env.example"),
-            Some("Other")
-        );
-        assert_eq!(
-            crate::aggregator::language::from_path("/project/.claude"),
-            Some("Other")
-        );
-    }
-
-    #[test]
-    fn test_extract_language_glob_uses_pattern() {
-        let input = serde_json::json!({"pattern": "**/*.rs", "path": "/src"});
-        assert_eq!(
-            StatsAggregator::extract_language_from_tool_input("Glob", &input),
-            Some("Rust")
-        );
-    }
-
-    #[test]
-    fn test_extract_language_glob_brace_pattern() {
-        let input = serde_json::json!({"pattern": "**/*.{ts,js}", "path": "/src"});
-        assert_eq!(
-            StatsAggregator::extract_language_from_tool_input("Glob", &input),
-            Some("TypeScript")
-        );
-        let input2 = serde_json::json!({"pattern": "**/*.{json,yaml}", "path": "/"});
-        assert_eq!(
-            StatsAggregator::extract_language_from_tool_input("Glob", &input2),
-            Some("JSON")
-        );
-    }
-
-    #[test]
-    fn test_extract_language_grep_brace_glob() {
-        let input = serde_json::json!({"pattern": "TODO", "glob": "*.{js,json}"});
-        assert_eq!(
-            StatsAggregator::extract_language_from_tool_input("Grep", &input),
-            Some("JavaScript")
-        );
-    }
-
-    #[test]
-    fn test_extract_language_grep_uses_glob_field() {
-        let input = serde_json::json!({"pattern": "fn main", "glob": "*.py", "path": "/src"});
-        assert_eq!(
-            StatsAggregator::extract_language_from_tool_input("Grep", &input),
-            Some("Python")
-        );
-    }
-
-    #[test]
-    fn test_extract_language_grep_uses_type_filter() {
-        let input = serde_json::json!({"pattern": "fn main", "type": "rust", "path": "/src"});
-        assert_eq!(
-            StatsAggregator::extract_language_from_tool_input("Grep", &input),
-            Some("Rust")
-        );
-    }
-
-    #[test]
-    fn test_extract_language_grep_dir_only_returns_none() {
-        let input = serde_json::json!({"pattern": "fn main", "path": "/src"});
-        assert_eq!(
-            StatsAggregator::extract_language_from_tool_input("Grep", &input),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_language_read_uses_file_path() {
-        let input = serde_json::json!({"file_path": "/src/main.rs"});
-        assert_eq!(
-            StatsAggregator::extract_language_from_tool_input("Read", &input),
-            Some("Rust")
-        );
-    }
-
     // ─── Adoption / tool_sessions counters ───────────────────────────────────
-
-    fn keys(slice: &[&str]) -> Vec<String> {
-        slice.iter().map(|s| (*s).to_string()).collect()
-    }
 
     #[test]
     fn only_typed_user_entries_count_as_prompts() {
@@ -1405,91 +444,52 @@ mod tests {
         }
     }
 
+    // A tool's session count is a count of user sessions: a subagent's use
+    // credits the session that launched it, once however many days or
+    // transcripts it spans. Category adoption follows the same rule.
     #[test]
-    fn test_add_session_adoption_counts_skill_subagent_mcp_once_per_call() {
-        let mut stats = Stats::default();
-        let day_keys = keys(&[
-            "Bash",
-            "skill:s1",
-            "skill:s2",
-            "agent:t1",
-            "mcp__server1__action",
-        ]);
-        StatsAggregator::add_tool_sessions(&mut stats, day_keys.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
-
-        // Even though two `skill:*` keys are present, sessions_using_skills increments only once.
-        assert_eq!(stats.sessions_using_skills, 1);
-        assert_eq!(stats.sessions_using_subagents, 1);
-        assert_eq!(stats.sessions_using_mcp, 1);
-    }
-
-    // The guard that produced `2 calls · 0 ses` lives at the call site, not in
-    // the counters, so it has to be pinned there. A subagent's session-day must
-    // reach `tool_sessions` (same scope as `tool_usage`) but not adoption.
-    #[test]
-    fn a_subagent_session_day_reaches_tool_sessions_but_not_adoption() {
-        let cached_for = |is_subagent: bool| -> crate::infrastructure::CachedFileStats {
-            serde_json::from_value(serde_json::json!({
-                "modified_secs": 0,
-                "entry_count": 1,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_creation_tokens": 0,
-                "cache_read_tokens": 0,
-                "is_subagent": is_subagent,
-                "tool_usage": { "skill:s1": 2 },
-                "model_usage": {},
-                "daily_stats": { "2026-01-01": { // lint-ok: date-literal
-                    "first_timestamp": null,
-                    "last_timestamp": null,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "tokens_by_model": {},
-                    "tool_usage": { "skill:s1": 2 }
-                } },
-            }))
-            .expect("cached fixture")
+    fn a_subagents_tools_count_for_the_session_that_launched_it() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let next = day.succ_opt().unwrap();
+        let parent = make_session("p", None, None);
+        let parent_path = parent.file_path.clone();
+        let sub = |name: &str| {
+            let mut s = make_session("p", None, Some(name));
+            s.is_subagent = true;
+            s.parent_path = Some(parent_path.clone());
+            s.day_tool_usage.insert("skill:s1".to_string(), 2);
+            s
         };
-
-        let mut sub = Stats::default();
-        StatsAggregator::merge_cached_stats(&mut sub, &cached_for(true), &None);
+        let stats = Stats::from_groups(&[
+            make_daily_group(day, vec![parent.clone(), sub("a"), sub("b")]),
+            make_daily_group(next, vec![parent, sub("a")]),
+        ]);
         assert_eq!(
-            sub.tool_sessions.get("skill:s1"),
+            stats.tool_sessions.get("skill:s1"),
             Some(&1),
-            "a subagent-only skill must not read as `0 ses`"
+            "one user session"
         );
-        assert_eq!(sub.sessions_using_skills, 0, "adoption stays user-only");
-        assert_eq!(sub.total_session_days, 0);
-
-        let mut user = Stats::default();
-        StatsAggregator::merge_cached_stats(&mut user, &cached_for(false), &None);
-        assert_eq!(user.tool_sessions.get("skill:s1"), Some(&1));
-        assert_eq!(user.sessions_using_skills, 1);
-        assert_eq!(user.total_session_days, 1);
+        assert_eq!(
+            stats.tool_usage.get("skill:s1"),
+            Some(&6),
+            "every call counts"
+        );
+        assert_eq!(
+            stats.sessions_using_skills, 1,
+            "credited to the parent once"
+        );
     }
 
     #[test]
     fn a_project_counts_its_subagents_tokens_but_only_the_users_sessions() {
-        let cached = |is_subagent: bool| -> crate::infrastructure::CachedFileStats {
-            serde_json::from_value(serde_json::json!({
-                "modified_secs": 0,
-                "entry_count": 1,
-                "input_tokens": 100,
-                "output_tokens": 0,
-                "cache_creation_tokens": 0,
-                "cache_read_tokens": 0,
-                "is_subagent": is_subagent,
-                "tool_usage": {},
-                "model_usage": {},
-                "daily_stats": {},
-            }))
-            .expect("cached fixture")
-        };
-        let mut stats = Stats::default();
-        let project = Some("p".to_string());
-        StatsAggregator::merge_cached_stats(&mut stats, &cached(false), &project);
-        StatsAggregator::merge_cached_stats(&mut stats, &cached(true), &project);
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let user = make_session_with_tokens("p", 100, 0, "claude-opus-4-6");
+        let mut sub = make_session_with_tokens("p", 100, 0, "claude-opus-4-6");
+        sub.is_subagent = true;
+        sub.file_path = std::path::PathBuf::from("/tmp/test/sub.jsonl");
+        let stats = Stats::from_groups(&[make_daily_group(day, vec![user, sub])]);
         let p = &stats.project_stats["p"];
         assert_eq!(
             p.work_tokens, 200,
@@ -1498,144 +498,89 @@ mod tests {
         assert_eq!(p.sessions, 1, "the popup's session count, not transcripts");
     }
 
-    // `tool_usage` counts calls over every session; `tool_sessions` has to use
-    // the same scope or a subagent-only entry renders as `2 calls · 0 ses`.
-    // Adoption keeps the narrower scope — it answers "how many of MY sessions".
     #[test]
-    fn tool_sessions_and_adoption_use_different_scopes_on_purpose() {
-        let mut stats = Stats::default();
-        let day = keys(&["skill:s1"]);
-
-        // A subagent session-day: calls and tool_sessions, no adoption.
-        StatsAggregator::add_tool_sessions(&mut stats, day.iter());
-        assert_eq!(
-            stats.tool_sessions.get("skill:s1"),
-            Some(&1),
-            "a subagent-only entry still has a session count"
-        );
-        assert_eq!(
-            stats.sessions_using_skills, 0,
-            "adoption must not count subagent sessions"
-        );
-
-        // A user session-day on top: both move.
-        StatsAggregator::add_tool_sessions(&mut stats, day.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day.iter());
-        assert_eq!(stats.tool_sessions.get("skill:s1"), Some(&2));
-        assert_eq!(stats.sessions_using_skills, 1);
+    fn adoption_slots_cover_every_category_prefix() {
+        assert_eq!(adoption_slot("skill:s1"), Some(0));
+        assert_eq!(adoption_slot("agent:type-a"), Some(1));
+        assert_eq!(adoption_slot("mcp__server1__action"), Some(2));
+        assert_eq!(adoption_slot("mcp__plugin_orgA_serverB__action"), Some(2));
+        assert_eq!(adoption_slot("command:my-cmd"), Some(3));
+        assert_eq!(adoption_slot("Bash"), None);
     }
 
+    // A session that touches a category on several days, or with several of
+    // its keys, counts once; a session using none counts nowhere.
     #[test]
-    fn test_add_session_adoption_per_tool_session_count() {
-        let mut stats = Stats::default();
-        let day1 = keys(&["Bash", "skill:s1"]);
-        let day2 = keys(&["Bash", "skill:s1", "skill:s2"]);
-        for day in [&day1, &day2] {
-            StatsAggregator::add_tool_sessions(&mut stats, day.iter());
-            StatsAggregator::add_session_adoption(&mut stats, day.iter());
-        }
-
-        // tool_sessions counts +1 per call where the key appears.
-        assert_eq!(stats.tool_sessions.get("Bash"), Some(&2));
-        assert_eq!(stats.tool_sessions.get("skill:s1"), Some(&2));
-        assert_eq!(stats.tool_sessions.get("skill:s2"), Some(&1));
-        // sessions_using_skills increments on every call that has at least one skill key.
-        assert_eq!(stats.sessions_using_skills, 2);
-    }
-
-    #[test]
-    fn test_add_session_adoption_no_meta_keys_no_increment() {
-        let mut stats = Stats::default();
-        let day_keys = keys(&["Bash", "Read", "Edit"]);
-        StatsAggregator::add_tool_sessions(&mut stats, day_keys.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
-
-        assert_eq!(stats.sessions_using_skills, 0);
-        assert_eq!(stats.sessions_using_subagents, 0);
-        assert_eq!(stats.sessions_using_mcp, 0);
-        assert_eq!(stats.tool_sessions.len(), 3);
-    }
-
-    #[test]
-    fn test_add_session_adoption_empty_input() {
-        let mut stats = Stats::default();
-        let empty: Vec<String> = Vec::new();
-        StatsAggregator::add_tool_sessions(&mut stats, empty.iter());
-        StatsAggregator::add_session_adoption(&mut stats, empty.iter());
-
-        assert_eq!(stats.sessions_using_skills, 0);
-        assert_eq!(stats.tool_sessions.len(), 0);
-    }
-
-    #[test]
-    fn test_add_session_adoption_agent_and_task_both_increment_subagents() {
-        // Both `agent:*` (rewritten from Agent and Task tools) feed subagents counter.
-        let mut stats = Stats::default();
-        let day1 = keys(&["agent:type-a"]);
-        let day2 = keys(&["agent:type-b"]);
-        StatsAggregator::add_tool_sessions(&mut stats, day1.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day1.iter());
-        StatsAggregator::add_tool_sessions(&mut stats, day2.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day2.iter());
-
-        assert_eq!(stats.sessions_using_subagents, 2);
-        assert_eq!(stats.tool_sessions.get("agent:type-a"), Some(&1));
-        assert_eq!(stats.tool_sessions.get("agent:type-b"), Some(&1));
-    }
-
-    #[test]
-    fn test_add_session_adoption_mcp_server_sessions_deduped_per_session() {
-        // A session that hits two tools from the SAME MCP server must
-        // increment `mcp_server_sessions[<server>]` only once. Summing
-        // per-tool `tool_sessions` would double-count sessions that used
-        // multiple tools from the same server.
-        let mut stats = Stats::default();
-        let day1 = keys(&[
-            "mcp__server1__action1",
-            "mcp__server1__action2",
-            "mcp__server2__other",
+    fn adoption_counts_each_user_session_once() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let with = |keys: &[&str]| {
+            let mut s = make_session("p", None, None);
+            for k in keys {
+                s.day_tool_usage.insert((*k).to_string(), 1);
+            }
+            s
+        };
+        let a = with(&["skill:s1", "skill:s2", "mcp__server1__action"]);
+        let stats = Stats::from_groups(&[
+            make_daily_group(day, vec![a.clone()]),
+            make_daily_group(day.succ_opt().unwrap(), vec![a]),
         ]);
-        StatsAggregator::add_tool_sessions(&mut stats, day1.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day1.iter());
-        let day2 = keys(&["mcp__server1__action1"]);
-        StatsAggregator::add_tool_sessions(&mut stats, day2.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day2.iter());
+        assert_eq!(stats.sessions_using_skills, 1);
+        assert_eq!(stats.sessions_using_mcp, 1);
+        assert_eq!(stats.sessions_using_commands, 0);
+        let plain = Stats::from_groups(&[make_daily_group(day, vec![with(&["Bash"])])]);
+        assert_eq!(plain.sessions_using_skills + plain.sessions_using_mcp, 0);
+    }
 
-        // server1: used in day1 and day2 → 2 sessions (despite 3 tool invocations total)
+    // A subagent whose parent is unknown, or outside the groups folded, adds
+    // calls but no session: the count never exceeds the user sessions held.
+    #[test]
+    fn a_tools_session_count_never_exceeds_the_user_sessions_held() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let mut user = make_session("p", None, None);
+        user.day_tool_usage.insert("Read".to_string(), 1);
+        let sub = |name: &str, parent: Option<&str>| {
+            let mut s = make_session("p", None, Some(name));
+            s.is_subagent = true;
+            s.parent_path = parent.map(std::path::PathBuf::from);
+            s.day_tool_usage.insert("Read".to_string(), 3);
+            s
+        };
+        let stats = Stats::from_groups(&[make_daily_group(
+            day,
+            vec![
+                user,
+                sub("orphan", None),
+                sub("away", Some("/elsewhere/x.jsonl")),
+            ],
+        )]);
+        assert_eq!(stats.tool_sessions.get("Read"), Some(&1));
+        assert_eq!(stats.tool_usage.get("Read"), Some(&7));
+    }
+
+    // A server's session count is distinct user sessions: two of its tools in
+    // one session count once, and a subagent's call credits its parent.
+    #[test]
+    fn a_servers_sessions_are_distinct_user_sessions() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let mut a = make_session("p", None, Some("a"));
+        a.day_tool_usage
+            .insert("mcp__server1__action1".to_string(), 1);
+        a.day_tool_usage
+            .insert("mcp__server1__action2".to_string(), 1);
+        let mut b = make_session("p", None, Some("b"));
+        b.day_tool_usage
+            .insert("mcp__server2__other".to_string(), 1);
+        let mut sub = make_session("p", None, Some("sub"));
+        sub.is_subagent = true;
+        sub.parent_path = Some(b.file_path.clone());
+        sub.day_tool_usage
+            .insert("mcp__server1__action1".to_string(), 4);
+        let stats = Stats::from_groups(&[make_daily_group(day, vec![a, b, sub])]);
         assert_eq!(stats.mcp_server_sessions.get("server1"), Some(&2));
-        // server2: used only in day1 → 1 session
         assert_eq!(stats.mcp_server_sessions.get("server2"), Some(&1));
-        // tool_sessions still records per-key session-day counts.
-        assert_eq!(stats.tool_sessions.get("mcp__server1__action1"), Some(&2));
-        assert_eq!(stats.tool_sessions.get("mcp__server1__action2"), Some(&1));
-    }
-
-    #[test]
-    fn test_add_session_adoption_mcp_prefix_match() {
-        // Both standard `mcp__server__tool` and plugin `mcp__plugin_*` are detected.
-        let mut stats = Stats::default();
-        let day_keys = keys(&["mcp__server1__action", "mcp__plugin_orgA_serverB__action"]);
-        StatsAggregator::add_tool_sessions(&mut stats, day_keys.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
-
-        assert_eq!(stats.sessions_using_mcp, 1);
-        assert_eq!(stats.tool_sessions.len(), 2);
-    }
-
-    #[test]
-    fn test_add_session_adoption_plugin_only_session_counts_as_mcp() {
-        // Regression: a session that uses ONLY plugin-form MCP tools (no standard form)
-        // must still increment sessions_using_mcp. Guards against a future refactor that
-        // narrows the prefix check to e.g. `starts_with("mcp__server")`.
-        let mut stats = Stats::default();
-        let day_keys = keys(&["mcp__plugin_orgA_serverB__action"]);
-        StatsAggregator::add_tool_sessions(&mut stats, day_keys.iter());
-        StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
-
-        assert_eq!(stats.sessions_using_mcp, 1);
-        assert_eq!(
-            stats.tool_sessions.get("mcp__plugin_orgA_serverB__action"),
-            Some(&1)
-        );
     }
 }

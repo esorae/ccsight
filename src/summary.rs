@@ -119,15 +119,7 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
             .sum();
         total_tokens += session_tokens;
 
-        let session_cost: f64 = session
-            .day_tokens_by_model
-            .iter()
-            .map(|(model, tokens)| {
-                calculator
-                    .calculate_cost(tokens, Some(model))
-                    .unwrap_or(0.0)
-            })
-            .sum();
+        let session_cost = session.cost(calculator);
         total_cost += session_cost;
 
         let pm = project_metrics
@@ -149,6 +141,25 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
         }
         if latest_end.is_none() || Some(session.day_last_timestamp) > latest_end {
             latest_end = Some(session.day_last_timestamp);
+        }
+    }
+    // The day's figures include what its subagents spent and did, as the Daily
+    // header does; only the session count stays the user's.
+    for sub in group.sessions.iter().filter(|s| s.is_subagent) {
+        let sub_cost = sub.cost(calculator);
+        total_tokens += sub.work_tokens();
+        total_cost += sub_cost;
+        let pm = project_metrics.entry(sub.project_name.clone()).or_default();
+        pm.1 += sub.work_tokens();
+        pm.2 += sub_cost;
+        for (hour, tokens) in &sub.day_hourly_work_tokens {
+            *hourly_tokens.entry(*hour).or_default() += tokens;
+        }
+        for (lang, count) in &sub.day_language_usage {
+            *lang_counts.entry(lang.clone()).or_default() += count;
+        }
+        for (tool, count) in &sub.day_tool_usage {
+            *all_tools.entry(tool.clone()).or_insert(0) += count;
         }
     }
 
@@ -179,13 +190,8 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
     for (i, session) in sessions.iter().enumerate() {
         let start_time = session.day_first_timestamp.with_timezone(&chrono::Local);
         let end_time = session.day_last_timestamp.with_timezone(&chrono::Local);
-        let duration_mins =
-            (session.day_last_timestamp - session.day_first_timestamp).num_minutes();
-        let duration_str = if duration_mins >= 60 {
-            format!("{}h{}m", duration_mins / 60, duration_mins % 60)
-        } else {
-            format!("{}m", duration_mins.max(1))
-        };
+        let duration_mins = session.day_duration_mins();
+        let duration_str = crate::text::format_duration_mins(duration_mins.max(1));
 
         let session_tokens: u64 = session
             .day_tokens_by_model

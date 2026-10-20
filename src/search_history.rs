@@ -29,17 +29,38 @@ pub struct SearchHistory {
     /// on Down past index 0 means the user can browse and back-out without
     /// losing what they were typing.
     draft: Option<String>,
+    /// Where `push` saves. `Some` only when `load` read the file or found
+    /// none: a history it could not read is never written over, and the
+    /// default (every test state) never writes at all.
+    path: Option<std::path::PathBuf>,
 }
 
 impl SearchHistory {
     pub fn load() -> Self {
-        let Ok(path) = crate::infrastructure::search_history_path() else {
-            return Self::default();
+        crate::infrastructure::search_history_path()
+            .map_or_else(|_| Self::default(), Self::load_from)
+    }
+
+    fn load_from(path: std::path::PathBuf) -> Self {
+        let on_disk = match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<OnDisk>(&bytes) {
+                Ok(on_disk) => on_disk,
+                // Moved aside rather than written over, as pins.json is: the
+                // history starts fresh and the old file stays recoverable.
+                Err(_) => {
+                    let aside = path.with_extension(format!(
+                        "json.corrupt-{}",
+                        chrono::Utc::now().format("%Y%m%dT%H%M%S")
+                    ));
+                    if std::fs::rename(&path, &aside).is_err() {
+                        return Self::default();
+                    }
+                    OnDisk::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => OnDisk::default(),
+            Err(_) => return Self::default(),
         };
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Self::default();
-        };
-        let on_disk: OnDisk = serde_json::from_slice(&bytes).unwrap_or_default();
         let mut entries = VecDeque::from(on_disk.entries);
         while entries.len() > MAX_ENTRIES {
             entries.pop_front();
@@ -48,6 +69,7 @@ impl SearchHistory {
             entries,
             cursor: None,
             draft: None,
+            path: Some(path),
         }
     }
 
@@ -72,23 +94,18 @@ impl SearchHistory {
             self.entries.pop_front();
         }
         self.reset_cursor();
-        // Tests share the same `infrastructure::search_history_path()`
-        // and would otherwise overwrite the developer's real history file
-        // when run on their workstation. Save is production-only.
-        #[cfg(not(test))]
         let _ = self.save();
     }
 
-    // The only caller is `#[cfg(not(test))]` above, so test builds see `save`
-    // as dead. It is live in production — keep it, silence the test-only lint.
-    #[cfg_attr(test, allow(dead_code))]
     fn save(&self) -> Result<()> {
-        let path = crate::infrastructure::search_history_path()?;
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         let on_disk = OnDisk {
             entries: self.entries.iter().cloned().collect(),
         };
         let bytes = serde_json::to_vec_pretty(&on_disk)?;
-        crate::infrastructure::atomic_write(&path, &bytes)?;
+        crate::infrastructure::atomic_write(path, &bytes)?;
         Ok(())
     }
 
@@ -142,6 +159,47 @@ impl SearchHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A history file that cannot be parsed is moved aside and the history
+    // starts fresh; a missing one is created on the first query; a default
+    // history never writes.
+    #[test]
+    fn only_a_history_read_from_disk_or_absent_is_saved() {
+        let dir = std::env::temp_dir().join(format!("ccsight-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let corrupt = dir.join("corrupt.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        let mut h = SearchHistory::load_from(corrupt.clone());
+        h.push("query");
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the bad file is kept aside");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), b"{not json");
+        assert!(
+            String::from_utf8(std::fs::read(&corrupt).unwrap())
+                .unwrap()
+                .contains("query")
+        );
+
+        let fresh = dir.join("fresh.json");
+        let _ = std::fs::remove_file(&fresh);
+        let mut h = SearchHistory::load_from(fresh.clone());
+        h.push("query");
+        assert!(
+            String::from_utf8(std::fs::read(&fresh).unwrap())
+                .unwrap()
+                .contains("query")
+        );
+
+        let mut h = SearchHistory::default();
+        h.push("query");
+        assert!(h.path.is_none(), "a default history has nowhere to write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn step_back_returns_newest_then_older() {

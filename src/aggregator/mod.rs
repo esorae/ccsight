@@ -6,12 +6,13 @@ pub(crate) mod stats;
 pub(crate) mod tool_category;
 
 pub(crate) use buckets::{
-    aggregate_monthly_costs, aggregate_monthly_tokens, aggregate_weekday_avg,
+    aggregate_monthly_costs, aggregate_monthly_tokens, aggregate_weekday_avg, day_vs_usual,
+    days_in_month, trailing_weeks, weekday_hour_avg,
 };
 
 pub use grouping::*;
 pub use pricing::*;
-pub use stats::{CacheStats, ProjectStats, Stats, StatsAggregator, TokenStats, load_progress};
+pub use stats::{CacheStats, ProjectStats, Stats, TokenStats};
 pub use tool_category::*;
 
 /// The first cwd whose official slug matches the transcript's parent dir
@@ -41,10 +42,8 @@ pub(crate) fn extract_project_name(entries: &[crate::domain::LogEntry]) -> Optio
         .map(|cwd| format_project_path(cwd))
 }
 
-/// Max `day_last_timestamp` per `tool_usage` key. MCP-server tools skip
-/// subagent sessions (matches `infrastructure::compute_mcp_status`);
-/// Built-in / Skill / Subagent-meta include subagents so heavily-nested
-/// tools (e.g. TodoWrite) don't read as stale.
+/// Max `day_last_timestamp` per `tool_usage` key, subagents included — a
+/// tool only a subagent calls is still in use, not stale.
 pub fn compute_tool_last_used(
     daily_groups: &[DailyGroup],
 ) -> std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> {
@@ -54,11 +53,6 @@ pub fn compute_tool_last_used(
         for session in &group.sessions {
             let ts = session.day_last_timestamp;
             for tool in session.day_tool_usage.keys() {
-                let skip_for_subagent =
-                    session.is_subagent && matches!(classify_tool(tool), ToolCategory::Mcp { .. });
-                if skip_for_subagent {
-                    continue;
-                }
                 let entry = map.entry(tool.clone()).or_insert(ts);
                 if ts > *entry {
                     *entry = ts;
@@ -252,19 +246,20 @@ mod tests {
         assert_eq!(map.get("Bash").copied(), Some(ts(5)));
     }
 
+    // A subagent's call is recorded in its own transcript only, never again
+    // in the parent's, so counting it is no double count: an MCP tool only a
+    // subagent calls is in use, not stale.
     #[test]
-    fn test_compute_tool_last_used_skips_subagents_for_mcp() {
-        // MCP servers stay subagent-excluded to avoid the double-count problem
-        // (a parent session already attributes the nested MCP call once).
+    fn an_mcp_tool_a_subagent_calls_counts_as_used() {
         let date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(); // lint-ok: date-literal
         let groups = vec![group_with(
             date,
             vec![
                 (ts(0), &["mcp__server1__action"], false),
-                (ts(5), &["mcp__server1__action"], true), // subagent — must be ignored
+                (ts(5), &["mcp__server1__action"], true),
             ],
         )];
         let map = compute_tool_last_used(&groups);
-        assert_eq!(map.get("mcp__server1__action").copied(), Some(ts(0)));
+        assert_eq!(map.get("mcp__server1__action").copied(), Some(ts(5)));
     }
 }

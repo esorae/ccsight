@@ -41,15 +41,15 @@ tmux send-keys -t ccsight_smoke 'p' && sleep 0.5 && tmux send-keys -t ccsight_sm
 
 # Live tab → session navigation + info popup.
 # Captures cover: tab badge format, 3-line row layout, glyph palette
-# (🟢/◉/○/⏸/⟳), `[i]` button, session detail popup (PID line).
+# (🟢/◉/○/⏸/⟳), session detail popup (PID line).
 tmux send-keys -t ccsight_smoke '2' && sleep 1
 tmux capture-pane -t ccsight_smoke -p > /tmp/ccsight_live.txt
 tmux send-keys -t ccsight_smoke 'j' && sleep 0.3  # move cursor down
-tmux send-keys -t ccsight_smoke 'i' && sleep 0.5  # open detail popup
+tmux send-keys -t ccsight_smoke Enter && sleep 0.5  # open detail popup
 tmux capture-pane -t ccsight_smoke -p > /tmp/ccsight_live_detail.txt
 tmux send-keys -t ccsight_smoke Escape && sleep 0.3
 
-# Insights → detail popup (4-panel cycle)
+# Insights → detail popup (panel cycle)
 tmux send-keys -t ccsight_smoke '4' && sleep 1
 tmux send-keys -t ccsight_smoke 'i' && sleep 1
 tmux send-keys -t ccsight_smoke 'Right' && sleep 0.5

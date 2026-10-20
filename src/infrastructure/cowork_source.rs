@@ -96,8 +96,7 @@ pub fn read_metadata_for_audit(audit_path: &Path) -> Option<CoworkMetadata> {
 /// User-facing project name. Regular JSONL → in-stream `cwd`. Cowork
 /// audit.jsonl → its `userSelectedFolders` (real project) if any, else a
 /// single `Cowork` bucket — the in-stream `cwd` is a meaningless sandbox
-/// path. Single source of truth — both cache writer and live grouper route
-/// through this.
+/// path. Single source of truth — the entry walk routes through this.
 pub fn resolve_project_name(file: &Path, extracted: Option<String>) -> Option<String> {
     if !is_cowork_audit_path(file) {
         return extracted;

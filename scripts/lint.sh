@@ -241,7 +241,7 @@ if [ -n "$WRONG_SCROLL" ]; then
 fi
 
 # 8. Direct project name shortening instead of shorten_project()
-DIRECT_PROJECT=$(grep -n 'Path::new.*project_name.*file_name()' $UI_FILES "$SUMMARY_FILE" 2>/dev/null | grep -v 'shorten_project' || true)
+DIRECT_PROJECT=$(grep -nE "Path::new.*project_name.*file_name\(\)|rsplit\('/'\)\.next\(\)" $UI_FILES "$SUMMARY_FILE" 2>/dev/null | grep -v 'shorten_project' || true)
 if [ -n "$DIRECT_PROJECT" ]; then
     echo "ERROR: Direct project name shortening (use shorten_project()):"
     echo "$DIRECT_PROJECT"
@@ -657,13 +657,13 @@ fi
 # (`/work/dev/foo` vs `/other/area/foo`), it loses the disambiguating context.
 # Render paths must go through `state.project_label`, which prepends the parent
 # dir on collision. Allowed call sites:
-#   - the `shorten_project` definition itself (mod.rs:172)
+#   - the `shorten_project` definition itself (`ui/mod.rs`)
 #   - `unwrap_or_else(|| shorten_project(...))` fallback when `project_labels` is missing
 #   - `summary.rs` (AI prompt generation, single session, no list to disambiguate against)
 SHORTEN_DIRECT=$(python3 -c "
 import re
 pat = re.compile(r'\bshorten_project\s*\(')
-for fname in 'src/ui/dashboard.rs src/ui/insights.rs src/ui/mod.rs'.split():
+for fname in '$UI_FILES'.split():
     try:
         with open(fname) as f:
             content = f.read()
@@ -1362,13 +1362,14 @@ fi
 PUBLIC_GRAYS=$(python3 -c "
 import re
 allowed = {'FAINT', 'BORDER', 'SEPARATOR', 'TEXT_BRIGHT', 'TEXT_DARK', 'HEATMAP_EMPTY', 'SEARCH_MATCH'}
-for i, line in enumerate(open('src/ui/mod.rs').read().split('\\n')):
+for fname in '$UI_FILES'.split():
+  for i, line in enumerate(open(fname).read().split('\\n')):
     m = re.match(r'\\s*pub const ([A-Z_]+): Color = Color::Rgb\\((\\d+), (\\d+), (\\d+)\\)', line)
     if not m or m.group(1) in allowed:
         continue
     rgb = [int(m.group(k)) for k in (2, 3, 4)]
     if max(rgb) - min(rgb) <= 30:
-        print(f'src/ui/mod.rs:{i+1}: {line.strip()}')
+        print(f'{fname}:{i+1}: {line.strip()}')
 " 2>/dev/null || true)
 if [ -n "$PUBLIC_GRAYS" ]; then
     echo "ERROR: public gray in ui::theme — alias an existing private gray under a role name instead:"

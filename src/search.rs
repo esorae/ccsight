@@ -263,11 +263,50 @@ pub struct SearchResult {
 #[derive(Clone)]
 pub enum SearchMatchType {
     ProjectName,
+    Title,
     Summary,
     GitBranch,
     SessionId,
     Date,
     Content,
+}
+
+impl SearchMatchType {
+    /// Where a hit ranks: one naming the session first, then a message's
+    /// content, then a hit on an attribute alone (`project:` filters those).
+    pub fn tier(&self) -> u8 {
+        match self {
+            Self::Title | Self::Summary | Self::SessionId => 0,
+            Self::Content => 1,
+            Self::ProjectName | Self::GitBranch | Self::Date => 2,
+        }
+    }
+}
+
+/// Merges content hits into a tier-ordered metadata list: the hits go after
+/// the tier-0 rows, and a session listed only on an attribute moves up to
+/// its content hit. `path_of` names each row's session file.
+pub fn merge_content_hits(
+    results: &mut Vec<SearchResult>,
+    hits: Vec<SearchResult>,
+    path_of: impl Fn(&SearchResult) -> Option<std::path::PathBuf>,
+) {
+    let named: HashSet<std::path::PathBuf> = results
+        .iter()
+        .filter(|r| r.match_type.tier() == 0)
+        .filter_map(&path_of)
+        .collect();
+    let mut taken = HashSet::new();
+    let hits: Vec<SearchResult> = hits
+        .into_iter()
+        .filter(|h| path_of(h).is_some_and(|p| !named.contains(&p) && taken.insert(p)))
+        .collect();
+    results.retain(|r| r.match_type.tier() < 2 || path_of(r).is_none_or(|p| !taken.contains(&p)));
+    let at = results
+        .iter()
+        .position(|r| r.match_type.tier() == 2)
+        .unwrap_or(results.len());
+    results.splice(at..at, hits);
 }
 
 pub fn perform_search(
@@ -312,15 +351,18 @@ pub fn perform_search(
                 });
                 continue;
             }
-            if session.project_name.to_lowercase().contains(&query_lower) {
-                // The project column is already on line 1, so a snippet that
-                // re-prints the project name would just duplicate it. Set
-                // None and let the renderer collapse the row to a single line.
+            // Line 1 already shows the title, so its hit needs no snippet.
+            if session
+                .custom_title
+                .as_deref()
+                .or(session.ai_title.as_deref())
+                .is_some_and(|t| t.to_lowercase().contains(&query_lower))
+            {
                 results.push(SearchResult {
                     day_idx,
                     session_idx,
                     snippet: None,
-                    match_type: SearchMatchType::ProjectName,
+                    match_type: SearchMatchType::Title,
                     session_path: None,
                     message_date: None,
                 });
@@ -342,6 +384,35 @@ pub fn perform_search(
                 continue;
             }
 
+            if let Some(session_id) = session.file_path.file_stem().and_then(|n| n.to_str())
+                && session_id.to_lowercase().contains(&query_lower)
+            {
+                results.push(SearchResult {
+                    day_idx,
+                    session_idx,
+                    snippet: Some(session_id.to_string()),
+                    match_type: SearchMatchType::SessionId,
+                    session_path: None,
+                    message_date: None,
+                });
+                continue;
+            }
+
+            if session.project_name.to_lowercase().contains(&query_lower) {
+                // The project column is already on line 1, so a snippet that
+                // re-prints the project name would just duplicate it. Set
+                // None and let the renderer collapse the row to a single line.
+                results.push(SearchResult {
+                    day_idx,
+                    session_idx,
+                    snippet: None,
+                    match_type: SearchMatchType::ProjectName,
+                    session_path: None,
+                    message_date: None,
+                });
+                continue;
+            }
+
             if let Some(ref branch) = session.git_branch
                 && branch.to_lowercase().contains(&query_lower)
             {
@@ -352,20 +423,6 @@ pub fn perform_search(
                     session_idx,
                     snippet: None,
                     match_type: SearchMatchType::GitBranch,
-                    session_path: None,
-                    message_date: None,
-                });
-                continue;
-            }
-
-            if let Some(session_id) = session.file_path.file_stem().and_then(|n| n.to_str())
-                && session_id.to_lowercase().contains(&query_lower)
-            {
-                results.push(SearchResult {
-                    day_idx,
-                    session_idx,
-                    snippet: Some(session_id.to_string()),
-                    match_type: SearchMatchType::SessionId,
                     session_path: None,
                     message_date: None,
                 });
@@ -391,6 +448,8 @@ pub fn perform_search(
         }
     }
 
+    // Stable: each tier keeps the newest-first order the walk produced.
+    results.sort_by_key(|r| r.match_type.tier());
     results
 }
 
@@ -628,6 +687,56 @@ mod tests {
         ]
     }
 
+    // A hit naming the session outranks one on an attribute alone, however
+    // much newer the attribute hit is.
+    #[test]
+    fn a_title_hit_ranks_before_newer_project_name_hits() {
+        let mut groups = make_groups();
+        groups[1].sessions[0].custom_title = Some("app-a migration notes".to_string());
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "app-a", &__ctx);
+        let kinds: Vec<u8> = results.iter().map(|r| r.match_type.tier()).collect();
+        assert_eq!(kinds, [0, 2]);
+        assert!(matches!(results[0].match_type, SearchMatchType::Title));
+        assert_eq!(
+            results[0].day_idx, 1,
+            "the older day's titled session leads"
+        );
+    }
+
+    // Content hits slot in after the named rows; a session listed only on an
+    // attribute moves up to its content hit instead of appearing twice.
+    #[test]
+    fn content_hits_take_the_middle_tier_and_lift_attribute_rows() {
+        let row = |day_idx: usize, match_type: SearchMatchType| SearchResult {
+            day_idx,
+            session_idx: 0,
+            snippet: None,
+            match_type,
+            session_path: None,
+            message_date: None,
+        };
+        let mut results = vec![
+            row(0, SearchMatchType::Title),
+            row(1, SearchMatchType::ProjectName),
+            row(2, SearchMatchType::ProjectName),
+        ];
+        let hits = vec![
+            row(2, SearchMatchType::Content),
+            row(0, SearchMatchType::Content),
+            row(3, SearchMatchType::Content),
+            row(3, SearchMatchType::Content),
+        ];
+        let path_of = |r: &SearchResult| Some(std::path::PathBuf::from(r.day_idx.to_string()));
+        merge_content_hits(&mut results, hits, path_of);
+        let order: Vec<(usize, u8)> = results
+            .iter()
+            .map(|r| (r.day_idx, r.match_type.tier()))
+            .collect();
+        assert_eq!(order, [(0, 0), (2, 1), (3, 1), (1, 2)]);
+    }
+
     #[test]
     fn test_search_empty_query_returns_empty() {
         let groups = make_groups();
@@ -713,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_priority_project_over_summary() {
+    fn a_summary_hit_outranks_a_project_name_hit_on_the_same_session() {
         let groups = vec![make_daily_group(
             NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
             vec![make_session(
@@ -725,15 +834,11 @@ mod tests {
         let __c = empty_ctx();
         let __ctx = ctx(&__c);
         let results = perform_search(&groups, "myapp", &__ctx);
-        assert_eq!(
-            results.len(),
-            1,
-            "should match project name and skip summary due to continue"
+        assert_eq!(results.len(), 1, "one row per session");
+        assert!(
+            matches!(results[0].match_type, SearchMatchType::Summary),
+            "the stronger, session-naming hit is the one recorded"
         );
-        assert!(matches!(
-            results[0].match_type,
-            SearchMatchType::ProjectName
-        ));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::handlers;
 use crate::infrastructure::live_sessions::LiveSession;
 use crate::infrastructure::live_snapshots::LiveSnapshot;
-use crate::state::{ConvListMode, ConversationPane, MAX_PANES, SummaryType};
+use crate::state::{ConvListMode, ConversationPane, DailyPanel, MAX_PANES, SummaryType};
 use crate::{AppState, PeriodFilter, Tab, search, ui};
 
 /// Live tab snapshot stepper. `delta = +1` walks back one snapshot
@@ -164,44 +164,152 @@ pub(crate) fn handle_help_key(state: &mut AppState, key: KeyEvent) {
 /// j/k/↑↓ scroll.
 pub(crate) fn handle_project_detail_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+        KeyCode::Esc | KeyCode::Char('q') => {
             // Project detail is only ever drilled into from the Projects-list
             // DashboardDetail popup, so closing returns there (the two-level
             // drill-back), not straight to the bare dashboard.
             state.active_popup = crate::ActivePopup::DashboardDetail;
         }
+        KeyCode::Enter => open_project_session_detail(state),
         _ => {
             if let Some(action) = scroll_action_for_key(&key) {
-                state.set_project_detail_scroll(apply_scroll_usize(
-                    state.project_detail_scroll(),
-                    action,
-                ));
+                move_project_detail_cursor(state, action);
             }
         }
     }
 }
 
+/// The Session Detail of the project row under the cursor; closing it lands
+/// back on that row.
+pub(crate) fn open_project_session_detail(state: &mut AppState) {
+    let path = state.project_detail_path().to_string();
+    let (scroll, cursor) = (state.project_detail_scroll(), state.project_detail_cursor());
+    let Some(session) = crate::ui::project_session_rows(state, &path)
+        .get(cursor)
+        .map(|(_, s)| (*s).clone())
+    else {
+        return;
+    };
+    state.session_detail_override = Some(session);
+    state.session_detail_live_extra = None;
+    state.session_detail_scroll = 0;
+    state.active_popup = crate::ActivePopup::Detail {
+        back: Some(crate::state::DetailBack::ProjectDetail {
+            path,
+            scroll,
+            cursor,
+        }),
+    };
+}
+
+/// Move the project detail's cursor, kept on a session row.
+pub(crate) fn move_project_detail_cursor(state: &mut AppState, action: ScrollAction) {
+    let rows = crate::ui::project_session_rows(state, state.project_detail_path()).len();
+    let next = apply_scroll_usize(state.project_detail_cursor(), action);
+    state.set_project_detail_cursor(next.min(rows.saturating_sub(1)));
+}
+
+/// Daily ←/→: one day older / newer, from the first session. An open day
+/// detail (Breakdown, Activity) stays open on the new day, from its top.
+fn step_daily_day(state: &mut AppState, older: bool) {
+    let last = state.daily_groups.len().saturating_sub(1);
+    if older && state.selected_day < last {
+        state.selected_day += 1;
+    } else if !older && state.selected_day > 0 {
+        state.selected_day -= 1;
+    } else {
+        return;
+    }
+    state.selected_session = 0;
+    state.daily_breakdown_scroll = 0;
+    state.set_day_activity_scroll(0);
+    state.set_day_activity_cursor(0);
+}
+
+/// `ActivePopup::DayActivity` branch — ↑↓ pick a session, Enter opens its
+/// detail, ←→ step the day, Esc/q close.
+pub(crate) fn handle_day_activity_key(state: &mut AppState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.active_popup = crate::ActivePopup::None;
+        }
+        KeyCode::Left | KeyCode::Char('h') => step_daily_day(state, true),
+        KeyCode::Right | KeyCode::Char('l') => step_daily_day(state, false),
+        KeyCode::Enter => open_day_activity_session(state),
+        _ => {
+            if let Some(action) = scroll_action_for_key(&key) {
+                move_day_activity_cursor(state, action);
+            }
+        }
+    }
+}
+
+/// The Session Detail of the Day activity row under the cursor; closing it
+/// returns to that row.
+pub(crate) fn open_day_activity_session(state: &mut AppState) {
+    let Some(path) = day_activity_selected_path(state) else {
+        return;
+    };
+    let Some(idx) = state
+        .daily_groups
+        .get(state.selected_day)
+        .and_then(|g| g.user_sessions().position(|s| s.file_path == path))
+    else {
+        return;
+    };
+    // The picked session becomes the list's cursor, so focus follows it.
+    state.selected_session = idx;
+    state.daily_panel = DailyPanel::Sessions;
+    let back = crate::state::DetailBack::DayActivity {
+        scroll: state.day_activity_scroll(),
+        cursor: state.day_activity_cursor(),
+    };
+    state.active_popup = crate::ActivePopup::Detail { back: Some(back) };
+    state.session_detail_scroll = 0;
+}
+
+/// The session the Activity popup's cursor sits on.
+fn day_activity_selected_path(state: &AppState) -> Option<std::path::PathBuf> {
+    let group = state.daily_groups.get(state.selected_day)?;
+    let rows = crate::ui::day_activity_rows(state, group);
+    rows.into_iter()
+        .nth(state.day_activity_cursor())
+        .map(|(path, _, _)| path)
+}
+
+/// Move the Activity popup's cursor, kept on a session row.
+pub(crate) fn move_day_activity_cursor(state: &mut AppState, action: ScrollAction) {
+    let rows = state
+        .daily_groups
+        .get(state.selected_day)
+        .map_or(0, |g| g.user_sessions().count());
+    let next = apply_scroll_usize(state.day_activity_cursor(), action);
+    state.set_day_activity_cursor(next.min(rows.saturating_sub(1)));
+}
+
+/// Insights ←/→: the previous / next panel, wrapping at either end.
+fn step_insights_panel(state: &mut AppState, back: bool) {
+    let n = crate::ui::INSIGHTS_PANELS;
+    state.insights_panel = if back {
+        (state.insights_panel + n - 1) % n
+    } else {
+        (state.insights_panel + 1) % n
+    };
+}
+
 /// `ActivePopup::InsightsDetail` branch — Esc/q/Enter/i close,
-/// ←/→ h/l cycle through 4 panels (wrap), ↑/↓ j/k scroll the body.
+/// ←/→ h/l cycle through the panels (wrap), ↑/↓ j/k scroll the body.
 pub(crate) fn handle_insights_detail_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('i') => {
             state.active_popup = crate::ActivePopup::None;
         }
         KeyCode::Left | KeyCode::Char('h') => {
-            state.insights_panel = if state.insights_panel == 0 {
-                3
-            } else {
-                state.insights_panel - 1
-            };
+            step_insights_panel(state, true);
             state.set_insights_detail_scroll(0);
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            state.insights_panel = if state.insights_panel >= 3 {
-                0
-            } else {
-                state.insights_panel + 1
-            };
+            step_insights_panel(state, false);
             state.set_insights_detail_scroll(0);
         }
         _ => {
@@ -299,29 +407,7 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
             {
                 state.set_filter_popup_selected(state.filter_popup_selected() + 1);
             }
-            KeyCode::Enter => {
-                if state.filter_popup_selected() < PeriodFilter::ALL_VARIANTS.len() {
-                    state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected()];
-                    state.apply_filter();
-                    state.active_popup = crate::ActivePopup::None;
-                } else {
-                    state.set_filter_input_mode(true);
-                    let text = match state.period_filter {
-                        PeriodFilter::Custom(s, Some(e)) if s == e => {
-                            s.format("%Y-%m-%d").to_string()
-                        }
-                        PeriodFilter::Custom(s, Some(e)) => {
-                            format!("{}..{}", s.format("%Y-%m-%d"), e.format("%Y-%m-%d"))
-                        }
-                        PeriodFilter::Custom(s, None) => s.format("%Y-%m-%d").to_string(),
-                        _ => String::new(),
-                    };
-                    if let Some(input) = state.filter_input_mut() {
-                        input.set(text);
-                    }
-                    state.set_filter_input_error(false);
-                }
-            }
+            KeyCode::Enter => choose_filter_row(state),
             // Typing a digit (or `-`/`.`) from ANY row jumps to the
             // Custom row and starts date input with that keystroke —
             // starting to type a date is an unambiguous intent, and
@@ -342,56 +428,68 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `ActivePopup::Detail` branch — Session detail popup. Esc/q/Enter/i
-/// close, ↑↓/j/k scroll, Space toggles pin, C opens conversation in a new
-/// pane, S/r kicks off (re-)summary, R regenerates the JSONL summary.
+/// `ActivePopup::Detail { back: None }` branch — Session detail popup. Esc/q/i close,
+/// Enter opens the conversation, ↑↓/j/k scroll, Space toggles pin, C opens
+/// conversation in a new pane, S/r kicks off (re-)summary, R regenerates the
+/// JSONL summary.
 pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('i') => {
-            state.active_popup = crate::ActivePopup::None;
-            state.session_detail_override = None;
-            state.session_detail_live_extra = None;
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => state.close_detail(),
+        KeyCode::Enter => {
+            let Some(path) = crate::handlers::pane::detail_session_path(state) else {
+                return;
+            };
+            // From the tab views the list follows the tab (Live, else Day); from
+            // an open conversation it keeps its mode. A pane already showing
+            // the transcript is focused, not reloaded.
+            let from_tab = !state.show_conversation;
+            let opened = if from_tab && state.tab == Tab::Live {
+                open_live_conversation(state)
+            } else if let Some(i) = state
+                .panes
+                .iter()
+                .position(|p| p.file_path.as_deref() == Some(path.as_path()))
+            {
+                state.active_pane_index = Some(i);
+                state.show_conversation = true;
+                true
+            } else {
+                crate::handlers::pane::open_path_in_pane(state, &path)
+            };
+            if opened {
+                if from_tab && state.tab != Tab::Live {
+                    state.conv_list_mode = ConvListMode::Day;
+                }
+                state.active_popup = crate::ActivePopup::None;
+                state.session_detail_override = None;
+                state.session_detail_live_extra = None;
+            } else if state.panes.iter().any(|p| p.loading) {
+                state.toast("A conversation is still loading".to_string());
+            }
         }
         KeyCode::Char(' ') => {
-            if let Some(group) = state.daily_groups.get(state.selected_day) {
-                let sessions: Vec<_> = group.user_sessions().collect();
-                if let Some(session) = sessions.get(state.selected_session) {
-                    let p = session.file_path.clone();
-                    crate::handlers::pane::toggle_pin(state, &p);
-                }
+            if let Some(session) = crate::handlers::pane::detail_session(state) {
+                crate::handlers::pane::toggle_pin(state, &session.file_path);
             }
         }
         KeyCode::Char('y') => {
-            // Mirror the Live tab `y` binding: copy `cd ... && claude -r UUID`
-            // for the session whose detail popup is open. Use override (set
-            // by Live tab opens) so the copy targets the right JSONL even
-            // when the Daily selection cursor has moved.
-            let file_path = state
-                .session_detail_override
-                .as_ref()
-                .map(|s| s.file_path.clone())
-                .or_else(|| crate::current_selected_session(state).map(|s| s.file_path));
-            if let Some(path) = file_path {
+            // Mirror the Live tab `y` binding: copy `cd ... && claude -r UUID`.
+            if let Some(path) = crate::handlers::pane::detail_session(state).map(|s| s.file_path) {
                 copy_resume_command(state, &path);
                 state.needs_draw = true;
             }
         }
         KeyCode::Char('C') => {
             let no_loading_panes = state.panes.iter().all(|p| !p.loading);
-            if no_loading_panes && let Some(group) = state.daily_groups.get(state.selected_day) {
-                let path = group
-                    .user_sessions()
-                    .nth(state.selected_session)
-                    .map(|s| s.file_path.clone());
-                if let Some(path) = path
-                    && open_or_focus_pane(state, &path)
-                {
-                    state.conv_list_mode = ConvListMode::Day;
-                    state.show_conversation = true;
-                    state.active_popup = crate::ActivePopup::None;
-                    state.session_detail_override = None;
-                    state.session_detail_live_extra = None;
-                }
+            if no_loading_panes
+                && let Some(session) = crate::handlers::pane::detail_session(state)
+                && open_or_focus_pane(state, &session.file_path)
+            {
+                state.conv_list_mode = ConvListMode::Day;
+                state.show_conversation = true;
+                state.active_popup = crate::ActivePopup::None;
+                state.session_detail_override = None;
+                state.session_detail_live_extra = None;
             }
         }
         // `s` opens the AI summary popup (where `r` regenerates); `t` writes a
@@ -399,7 +497,7 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
         // writing a title doesn't require the summary-generation detour first.
         KeyCode::Char('s') => {
             if state.summary_task.is_none()
-                && let Some(session) = crate::current_selected_session(state)
+                && let Some(session) = crate::handlers::pane::detail_session(state)
             {
                 handlers::tasks::start_session_summary(state, session, false);
             }
@@ -407,12 +505,12 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
         // `t` opens the title editor prefilled with the current title. Enter
         // saves the typed text; clearing it and pressing Enter AI-generates.
         KeyCode::Char('t') => {
-            if let Some(session) = state
-                .session_detail_override
-                .clone()
-                .or_else(|| crate::current_selected_session(state))
-            {
-                open_title_editor(state, &session, crate::TitleEditReturn::Detail);
+            if let Some(session) = crate::handlers::pane::detail_session(state) {
+                let back = match &state.active_popup {
+                    crate::ActivePopup::Detail { back } => back.clone(),
+                    _ => None,
+                };
+                open_title_editor(state, &session, crate::TitleEditReturn::Detail(back));
             }
         }
         _ => {
@@ -447,6 +545,33 @@ fn copy_resume_command(state: &mut AppState, jsonl_path: &std::path::Path) {
     }
 }
 
+/// Lines ↑↓ move through a message taller than the pane: small enough to
+/// read as a scroll, while `d` / `u` still page.
+const CONV_LINE_STEP: usize = 3;
+
+/// Opens the Live cursor's transcript in the active pane, with the
+/// conversation list switched to Live so j/k walks the live sessions.
+fn open_live_conversation(state: &mut AppState) -> bool {
+    let Some(jsonl) = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone()) else {
+        return false;
+    };
+    // `active_pane_index` carries keyboard focus: an empty-panes open that
+    // left it unset would keep j/k on the session list.
+    if state.panes.is_empty() {
+        state.panes.push(ConversationPane::load_from(&jsonl));
+        state.active_pane_index = Some(0);
+    } else {
+        let idx = state.active_pane_index.unwrap_or(0);
+        state.panes[idx] = ConversationPane::load_from(&jsonl);
+        state.active_pane_index = Some(idx);
+    }
+    state.conv_list_mode = ConvListMode::Live;
+    state.show_conversation = true;
+    // The Live conv list counts active + paused, the same index as the tab.
+    state.selected_session = state.live_selected;
+    true
+}
+
 /// Open `path` in a new pane, or focus the pane already showing it — a second
 /// pane of one transcript scrolls and searches identically, so it adds nothing.
 /// A full set of panes says so rather than ignoring the key. Returns whether a
@@ -468,6 +593,223 @@ fn open_or_focus_pane(state: &mut AppState, path: &std::path::Path) -> bool {
     state.panes.push(ConversationPane::load_from(path));
     state.active_pane_index = Some(state.panes.len() - 1);
     true
+}
+
+/// Filter popup with the cursor on the active period (the Custom row for a
+/// custom range), so Enter without moving keeps the current filter.
+pub(crate) fn open_filter_popup(state: &mut AppState) {
+    let selected = if matches!(state.period_filter, PeriodFilter::Custom(_, _)) {
+        PeriodFilter::ALL_VARIANTS.len()
+    } else {
+        PeriodFilter::ALL_VARIANTS
+            .iter()
+            .position(|&v| v == state.period_filter)
+            .unwrap_or(0)
+    };
+    state.active_popup = crate::ActivePopup::FilterPopup {
+        selected,
+        input_mode: false,
+        input: crate::TextInput::default(),
+        input_error: false,
+    };
+}
+
+/// Project popup with the cursor on the active project. Preselects against
+/// `project_list_sorted`, the order the popup renders and Enter indexes — the
+/// raw `project_list` order would land on an unrelated project.
+pub(crate) fn open_project_popup(state: &mut AppState) {
+    let selected = match &state.project_filter {
+        Some(name) => state
+            .project_list_sorted()
+            .iter()
+            .position(|(n, _, _)| n == name)
+            .map_or(0, |i| i + 1),
+        None => 0,
+    };
+    state.active_popup = crate::ActivePopup::ProjectPopup {
+        selected,
+        scroll: 0,
+    };
+}
+
+/// Enter / double-click in the filter popup: apply a preset, or start editing
+/// the Custom row prefilled with the active custom range.
+pub(crate) fn choose_filter_row(state: &mut AppState) {
+    if state.filter_popup_selected() < PeriodFilter::ALL_VARIANTS.len() {
+        state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected()];
+        state.apply_filter();
+        state.active_popup = crate::ActivePopup::None;
+        return;
+    }
+    state.set_filter_input_mode(true);
+    let text = match state.period_filter {
+        PeriodFilter::Custom(s, Some(e)) if s == e => s.format("%Y-%m-%d").to_string(),
+        PeriodFilter::Custom(s, Some(e)) => {
+            format!("{}..{}", s.format("%Y-%m-%d"), e.format("%Y-%m-%d"))
+        }
+        PeriodFilter::Custom(s, None) => s.format("%Y-%m-%d").to_string(),
+        _ => String::new(),
+    };
+    if let Some(input) = state.filter_input_mut() {
+        input.set(text);
+    }
+    state.set_filter_input_error(false);
+}
+
+/// Enter / double-click in the project popup. Row 0 is "All"; the rest index
+/// `project_list_sorted`, the order the popup renders.
+pub(crate) fn choose_project_row(state: &mut AppState) {
+    let selected = state.project_popup_selected();
+    state.project_filter = selected.checked_sub(1).and_then(|i| {
+        state
+            .project_list_sorted()
+            .get(i)
+            .map(|(name, _, _)| (*name).clone())
+    });
+    state.apply_filter();
+    state.active_popup = crate::ActivePopup::None;
+}
+
+/// Drill into row `row` of the Projects list, resolved through the same sort
+/// the panel, popup and click paths render.
+pub(crate) fn open_project_detail(state: &mut AppState, row: usize) {
+    let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
+    state.sort_projects(&mut projects);
+    if let Some((name, _)) = projects.get(row) {
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: (*name).clone(),
+            scroll: 0,
+            cursor: 0,
+        };
+    }
+}
+
+/// `s` on a ranked panel (Projects 1, Models 2, Ecosystem 3, Languages 4):
+/// flip recency vs magnitude. The cursor indexes the sorted rows, so it and
+/// the viewport restart at the top instead of landing on an unrelated row.
+fn toggle_panel_sort(state: &mut AppState, panel: usize) {
+    match panel {
+        1 => state.dashboard_projects_sort = state.dashboard_projects_sort.toggle(),
+        2 => state.dashboard_models_sort = state.dashboard_models_sort.toggle(),
+        3 => {
+            state.dashboard_ecosystem_sort = state.dashboard_ecosystem_sort.toggle();
+            state.mcp_selected_server = 0;
+            state.mcp_selected_tool = None;
+        }
+        4 => state.dashboard_languages_sort = state.dashboard_languages_sort.toggle(),
+        _ => return,
+    }
+    state.dashboard_scroll[panel] = 0;
+    state.dashboard_viewport[panel] = 0;
+}
+
+/// h / l across the dashboard panels, wrapping at both ends.
+fn step_dashboard_panel(state: &mut AppState, forward: bool) {
+    // One scroll slot per panel, so the array length is the panel count.
+    let panels = state.dashboard_scroll.len();
+    state.dashboard_panel = if forward {
+        (state.dashboard_panel + 1) % panels
+    } else {
+        (state.dashboard_panel + panels - 1) % panels
+    };
+}
+
+/// Show Ecosystem section `section` from its top. Section 0 (Tools) holds the
+/// MCP server rows, whose cursor restarts so a value from another visit
+/// cannot sit past the visible server list.
+pub(crate) fn set_ecosystem_section(state: &mut AppState, section: usize) {
+    state.tools_detail_section = section;
+    state.dashboard_scroll[3] = 0;
+    if section == 0 {
+        state.mcp_selected_server = 0;
+        state.mcp_selected_tool = None;
+    }
+}
+
+/// Expand / collapse MCP server row `idx` of the Tools section.
+pub(crate) fn toggle_mcp_server(state: &mut AppState, idx: usize) {
+    let servers = crate::collect_mcp_servers(state);
+    if let Some(name) = servers.get(idx)
+        && !state.mcp_expanded_servers.remove(name)
+    {
+        state.mcp_expanded_servers.insert(name.clone());
+    }
+}
+
+/// The session `s` summarizes in the conversation view: the focused pane's,
+/// else the list cursor's. A subagent pane falls through to the list, since a
+/// subagent transcript has no resume-title slot for the summary's `t`.
+fn conv_summary_session(
+    state: &AppState,
+    list_file: fn(&AppState, usize) -> Option<std::path::PathBuf>,
+) -> Option<crate::aggregator::SessionInfo> {
+    let pane_path = state
+        .active_pane_index
+        .and_then(|i| state.panes.get(i))
+        .and_then(|p| p.file_path.clone());
+    [pane_path, list_file(state, state.selected_session)]
+        .into_iter()
+        .flatten()
+        .find_map(|p| crate::handlers::pane::find_indexed_session_by_path(state, &p))
+}
+
+/// `m` / a click on the pin trigger: the conversation view on the Pinned
+/// list, its first pin previewed.
+pub(crate) fn open_pinned_view(state: &mut AppState, preview: fn(&mut AppState)) {
+    state.conv_list_mode = ConvListMode::Pinned;
+    state.selected_session = 0;
+    state.tab = Tab::Daily;
+    if !state.show_conversation {
+        state.panes.clear();
+        state.panes.push(ConversationPane::default());
+        state.show_conversation = true;
+    }
+    state.active_pane_index = None;
+    if state.panes.len() == 1 {
+        preview(state);
+    }
+}
+
+/// S-Tab / a click on the list title: Day → Pinned (when any) → All → Day,
+/// with a lone pane following the list's new first row.
+pub(crate) fn cycle_conv_list_mode(state: &mut AppState, preview: fn(&mut AppState)) {
+    state.conv_list_mode = match state.conv_list_mode {
+        ConvListMode::Day if state.pins.entries().is_empty() => ConvListMode::All,
+        ConvListMode::Day => ConvListMode::Pinned,
+        ConvListMode::Pinned => ConvListMode::All,
+        ConvListMode::All => ConvListMode::Day,
+        // Sticky once entered from the Live tab, so j/k keeps walking live rows.
+        ConvListMode::Live => ConvListMode::Live,
+    };
+    state.selected_session = 0;
+    if state.panes.len() == 1 {
+        preview(state);
+    }
+}
+
+/// Open the focused Dashboard panel's detail popup, its cursor on the row
+/// the compact panel had selected.
+pub(crate) fn open_dashboard_detail(state: &mut AppState) {
+    state.active_popup = crate::ActivePopup::DashboardDetail;
+}
+
+/// `C` / Shift+Enter on Daily: the cursor's session in a pane of its own, or
+/// focus on the pane already holding it.
+fn open_selected_session_in_new_pane(state: &mut AppState) {
+    if state.panes.iter().any(|p| p.loading) {
+        return;
+    }
+    let path = state
+        .daily_groups
+        .get(state.selected_day)
+        .and_then(|g| g.user_sessions().nth(state.selected_session))
+        .map(|s| s.file_path.clone());
+    if let Some(path) = path
+        && open_or_focus_pane(state, &path)
+    {
+        state.conv_list_mode = ConvListMode::Day;
+        state.show_conversation = true;
+    }
 }
 
 /// Open the `TitleEdit` popup for `session`, prefilled with its current title
@@ -517,11 +859,11 @@ pub(crate) fn handle_title_edit_key(state: &mut AppState, key: KeyEvent) {
         match handlers::pane::find_session_indices_by_path(state, &path).and_then(
             |(day, sess, idx)| {
                 let s = state.daily_groups.get(day)?.sessions.get(idx)?.clone();
-                Some((s, day, sess, idx))
+                Some((s, day, sess))
             },
         ) {
-            Some((session, day, sess, idx)) => {
-                handlers::tasks::start_jsonl_regen(state, session, day, sess, idx);
+            Some((session, day, sess)) => {
+                handlers::tasks::start_jsonl_regen(state, session, day, sess);
                 state.toast("Generating title…");
             }
             None => state.toast("Session no longer loaded — cannot write title"),
@@ -531,7 +873,7 @@ pub(crate) fn handle_title_edit_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             if let crate::ActivePopup::TitleEdit { return_to, .. } = &state.active_popup {
-                state.active_popup = return_to.restore();
+                state.active_popup = return_to.clone().restore();
             }
         }
         KeyCode::Enter => {
@@ -597,9 +939,7 @@ pub(crate) fn handle_conversation_key(
         .is_some_and(|p| p.search_mode);
 
     if pane_search_mode {
-        if let Some(idx) = state.active_pane_index
-            && let Some(pane) = state.panes.get_mut(idx)
-        {
+        if let Some(pane) = state.active_pane_mut() {
             match key.code {
                 KeyCode::Esc => {
                     // VS Code semantics: Esc ends the search outright —
@@ -708,17 +1048,7 @@ pub(crate) fn handle_conversation_key(
                 state.active_pane_index = Some(target_idx);
             }
         }
-        KeyCode::Char('Q') => {
-            state.show_conversation = false;
-            // Leaving conv view from Live mode: reset selection so the next
-            // open doesn't index into a stale live row.
-            if state.conv_list_mode == ConvListMode::Live {
-                state.selected_session = 0;
-            }
-            state.panes.clear();
-            state.active_pane_index = None;
-            state.conv_list_mode = ConvListMode::Day;
-        }
+        KeyCode::Char('Q') => crate::close_conversation_view(state),
         KeyCode::Char('T') => {
             state.session_list_hidden = !state.session_list_hidden;
         }
@@ -745,9 +1075,7 @@ pub(crate) fn handle_conversation_key(
         // Toggle the whole pane between compact (one line per message) and the
         // classic full-transcript reading view.
         KeyCode::Char('c') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            if let Some(pane) = state.active_pane_mut() {
                 pane.compact = !pane.compact;
             }
         }
@@ -757,32 +1085,13 @@ pub(crate) fn handle_conversation_key(
             // bar-Esc already cleared matches, and the query text survives
             // intentionally so `/` can restore it.
             if state.search_preview_mode {
-                state.show_conversation = false;
-                if state.conv_list_mode == ConvListMode::Live {
-                    state.selected_session = 0;
-                }
-                for pane in &mut state.panes {
-                    pane.clear();
-                }
-                state.active_pane_index = None;
-                if let Some((tab, day, session, _)) = &state.search_saved_state {
-                    state.tab = *tab;
-                    state.selected_day = *day;
-                    state.selected_session = *session;
-                }
-                state.search_mode = true;
-                state.search_preview_mode = false;
+                crate::return_to_search(state);
             } else if state.active_pane_index.is_some() {
                 // Esc only ever backs out one level. Moving focus inward is
                 // `Tab` / `1-4`, opening a pane is `C`, closing one is `X`.
                 state.active_pane_index = None;
             } else {
-                state.show_conversation = false;
-                if state.conv_list_mode == ConvListMode::Live {
-                    state.selected_session = 0;
-                }
-                state.panes.clear();
-                state.conv_list_mode = ConvListMode::Day;
+                crate::close_conversation_view(state);
             }
         }
         // Pairs with `C` (open a pane). Esc no longer removes panes, so this
@@ -796,12 +1105,7 @@ pub(crate) fn handle_conversation_key(
             if let Some(idx) = state.active_pane_index {
                 state.panes.remove(idx);
                 if state.panes.is_empty() {
-                    state.show_conversation = false;
-                    if state.conv_list_mode == ConvListMode::Live {
-                        state.selected_session = 0;
-                    }
-                    state.active_pane_index = None;
-                    state.conv_list_mode = ConvListMode::Day;
+                    crate::close_conversation_view(state);
                 } else {
                     state.active_pane_index = Some(idx.min(state.panes.len() - 1));
                 }
@@ -843,9 +1147,7 @@ pub(crate) fn handle_conversation_key(
             state.active_popup = crate::ActivePopup::Help { scroll: 0 };
         }
         KeyCode::Char('/') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            if let Some(pane) = state.active_pane_mut() {
                 pane.search_saved_scroll = Some((pane.scroll, pane.selected_message));
                 pane.search_mode = true;
                 // Reopen restores the previous query "selected" (VS Code):
@@ -919,24 +1221,7 @@ pub(crate) fn handle_conversation_key(
             }
         }
         KeyCode::BackTab if state.active_pane_index.is_none() => {
-            state.conv_list_mode = match state.conv_list_mode {
-                ConvListMode::Day => {
-                    if state.pins.entries().is_empty() {
-                        ConvListMode::All
-                    } else {
-                        ConvListMode::Pinned
-                    }
-                }
-                ConvListMode::Pinned => ConvListMode::All,
-                ConvListMode::All => ConvListMode::Day,
-                // Live mode is sticky once entered from the Live tab —
-                // S-Tab leaves it alone so j/k still navigates live rows.
-                ConvListMode::Live => ConvListMode::Live,
-            };
-            state.selected_session = 0;
-            if state.panes.len() == 1 {
-                preview_conversation_in_pane(state);
-            }
+            cycle_conv_list_mode(state, preview_conversation_in_pane);
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if state.active_pane_index.is_none() {
@@ -952,9 +1237,7 @@ pub(crate) fn handle_conversation_key(
                 if state.panes.len() == 1 {
                     preview_conversation_in_pane(state);
                 }
-            } else if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            } else if let Some(pane) = state.active_pane_mut() {
                 let msg_count = pane.message_lines.len();
                 if msg_count > 0 {
                     // Mirror the draw-time clamp: `selected_message == usize::MAX`
@@ -977,8 +1260,8 @@ pub(crate) fn handle_conversation_key(
                             .get(cur + 1)
                             .map_or(total_lines, |&(l, _)| l);
                         if sel_end > pane.scroll + vh {
-                            let step = vh.saturating_sub(2).max(1);
-                            pane.scroll = (pane.scroll + step).min(sel_end.saturating_sub(vh));
+                            pane.scroll =
+                                (pane.scroll + CONV_LINE_STEP).min(sel_end.saturating_sub(vh));
                             true
                         } else {
                             false
@@ -1003,9 +1286,7 @@ pub(crate) fn handle_conversation_key(
                 if state.panes.len() == 1 {
                     preview_conversation_in_pane(state);
                 }
-            } else if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            } else if let Some(pane) = state.active_pane_mut() {
                 let msg_count = pane.message_lines.len();
                 if msg_count > 0
                     && (pane.selected_message == usize::MAX || pane.selected_message >= msg_count)
@@ -1018,17 +1299,10 @@ pub(crate) fn handle_conversation_key(
                 // previous message only once its start is on screen (this also
                 // covers the head of the first message).
                 let sel_start = pane.message_lines.get(cur).map_or(0, |&(l, _)| l);
-                let scrolled_within = if let Some(vh) = pane.last_visible_height {
-                    if sel_start < pane.scroll {
-                        let step = vh.saturating_sub(2).max(1);
-                        pane.scroll = pane.scroll.saturating_sub(step).max(sel_start);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+                let scrolled_within = pane.last_visible_height.is_some() && sel_start < pane.scroll;
+                if scrolled_within {
+                    pane.scroll = pane.scroll.saturating_sub(CONV_LINE_STEP).max(sel_start);
+                }
                 if !scrolled_within && cur > 0 {
                     pane.selected_message -= 1;
                 }
@@ -1042,9 +1316,7 @@ pub(crate) fn handle_conversation_key(
             if state.active_pane_index.is_none() && !state.panes.is_empty() {
                 state.active_pane_index = Some(0);
             }
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            if let Some(pane) = state.active_pane_mut() {
                 pane.scroll = pane.scroll.saturating_add(20);
                 if !pane.message_lines.is_empty() {
                     let msg_idx = pane
@@ -1060,9 +1332,7 @@ pub(crate) fn handle_conversation_key(
             if state.active_pane_index.is_none() && !state.panes.is_empty() {
                 state.active_pane_index = Some(0);
             }
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            if let Some(pane) = state.active_pane_mut() {
                 pane.scroll = pane.scroll.saturating_sub(20);
                 if !pane.message_lines.is_empty() {
                     let msg_idx = pane
@@ -1075,48 +1345,17 @@ pub(crate) fn handle_conversation_key(
             }
         }
         KeyCode::Home | KeyCode::Char('g') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            if let Some(pane) = state.active_pane_mut() {
                 pane.scroll = 0;
                 pane.selected_message = 0;
             }
         }
         KeyCode::End | KeyCode::Char('G') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            if let Some(pane) = state.active_pane_mut() {
                 pane.scroll = usize::MAX;
                 let msg_count = pane.message_lines.len();
                 if msg_count > 0 {
                     pane.selected_message = msg_count - 1;
-                }
-            }
-        }
-        KeyCode::Char('n') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-                && let Some(&(next_pos, _)) = pane
-                    .message_lines
-                    .iter()
-                    .find(|&&(pos, _)| pos > pane.scroll + 2)
-            {
-                pane.scroll = next_pos;
-            }
-        }
-        KeyCode::Char('N') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
-                if let Some(&(prev_pos, _)) = pane
-                    .message_lines
-                    .iter()
-                    .rev()
-                    .find(|&&(pos, _)| pos + 2 < pane.scroll)
-                {
-                    pane.scroll = prev_pos;
-                } else {
-                    pane.scroll = 0;
                 }
             }
         }
@@ -1149,9 +1388,9 @@ pub(crate) fn handle_conversation_key(
                 }
             }
         }
-        KeyCode::Char('J') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
+        // Next / previous message start; J / K outside the Pinned list.
+        KeyCode::Char('n' | 'J') => {
+            if let Some(pane) = state.active_pane_mut()
                 && let Some(&(next_pos, _)) = pane
                     .message_lines
                     .iter()
@@ -1160,10 +1399,8 @@ pub(crate) fn handle_conversation_key(
                 pane.scroll = next_pos;
             }
         }
-        KeyCode::Char('K') => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+        KeyCode::Char('N' | 'K') => {
+            if let Some(pane) = state.active_pane_mut() {
                 if let Some(&(prev_pos, _)) = pane
                     .message_lines
                     .iter()
@@ -1208,29 +1445,14 @@ pub(crate) fn handle_conversation_key(
         KeyCode::Char('i') => {
             // Only the open path lives here; closing is owned by the
             // Session Detail popup's own handler (`i`/Esc/q/Enter).
-            state.active_popup = crate::ActivePopup::Detail;
+            state.active_popup = crate::ActivePopup::Detail { back: None };
             state.session_detail_scroll = 0;
         }
         // Open the AI summary popup for the focused pane's session, falling back
         // to the list-selected session when no pane has focus. Regenerate / write
         // resume title (`r` / `t`) then live inside that popup.
         KeyCode::Char('s') if state.summary_task.is_none() => {
-            let session = state
-                .active_pane_index
-                .and_then(|i| state.panes.get(i))
-                .and_then(|p| p.file_path.as_ref())
-                .and_then(|fp| {
-                    // Skip subagents: their .jsonl has no resume-title slot, so a
-                    // summary opened here would have a dead `t` action. Fall through
-                    // to the list selection instead (a real user session).
-                    state
-                        .daily_groups
-                        .iter()
-                        .flat_map(|g| g.sessions.iter())
-                        .find(|s| &s.file_path == fp && !s.is_subagent)
-                        .cloned()
-                })
-                .or_else(|| crate::handlers::pane::current_selected_session(state));
+            let session = conv_summary_session(state, get_conv_session_file);
             if let Some(session) = session {
                 handlers::tasks::start_session_summary(state, session, false);
             }
@@ -1247,7 +1469,6 @@ pub(crate) fn handle_default_key(
     state: &mut AppState,
     key: KeyEvent,
     preview_conversation_in_pane: fn(&mut AppState),
-    open_conversation_in_pane: fn(&mut AppState),
 ) -> bool {
     // Matching on `key.code` alone made Ctrl+F open the period filter, where
     // every other application starts a text search. Shift is deliberately not
@@ -1267,8 +1488,8 @@ pub(crate) fn handle_default_key(
             state.toast("Press q again to quit".to_string());
             state.needs_draw = true;
         }
-        KeyCode::Esc if state.daily_breakdown_focus => {
-            state.daily_breakdown_focus = false;
+        KeyCode::Esc if state.daily_breakdown_open => {
+            state.daily_breakdown_open = false;
             state.daily_breakdown_scroll = 0;
         }
         KeyCode::Char('x')
@@ -1321,93 +1542,32 @@ pub(crate) fn handle_default_key(
                 }
             }
         }
-        KeyCode::Char('i') if state.tab == Tab::Live => {
-            crate::handlers::pane::open_live_session_detail(state);
-        }
         KeyCode::Enter if state.tab == Tab::Live => {
-            let jsonl = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone());
-            if let Some(jsonl) = jsonl {
-                // Replace the active pane (or push one) with the selected JSONL.
-                // `active_pane_index` controls keyboard focus — without setting
-                // it explicitly in the empty-panes branch, Enter would open the
-                // pane but leave focus on the session list, so j/k still
-                // navigated sessions instead of scrolling messages.
-                if state.panes.is_empty() {
-                    state.panes.push(ConversationPane::load_from(&jsonl));
-                    state.active_pane_index = Some(0);
-                } else {
-                    let idx = state.active_pane_index.unwrap_or(0);
-                    state.panes[idx] = ConversationPane::load_from(&jsonl);
-                    state.active_pane_index = Some(idx);
-                }
-                // Switch the conv list to Live so j/k navigates among live
-                // sessions instead of Daily; remembered until conv view closes.
-                state.conv_list_mode = ConvListMode::Live;
-                state.show_conversation = true;
-                // selected_session is the index inside the conv list, which
-                // for Live mode counts active+paused. Mirror live_selected.
-                state.selected_session = state.live_selected;
+            // A session too new to be indexed has no detail yet; its
+            // transcript is still worth opening.
+            let indexed = crate::live_selected_session(state)
+                .and_then(|s| s.jsonl_path.clone())
+                .is_some_and(|p| {
+                    crate::handlers::pane::find_indexed_session_by_path(state, &p).is_some()
+                });
+            if indexed {
+                crate::handlers::pane::open_live_session_detail(state);
+            } else {
+                open_live_conversation(state);
             }
         }
-        KeyCode::Char('f') => {
-            let selected = if matches!(state.period_filter, PeriodFilter::Custom(_, _)) {
-                PeriodFilter::ALL_VARIANTS.len()
-            } else {
-                PeriodFilter::ALL_VARIANTS
-                    .iter()
-                    .position(|&v| v == state.period_filter)
-                    .unwrap_or(0)
-            };
-            state.active_popup = crate::ActivePopup::FilterPopup {
-                selected,
-                input_mode: false,
-                input: crate::TextInput::default(),
-                input_error: false,
-            };
-        }
-        KeyCode::Char('p') => {
-            // Preselect against the SAME sorted view the popup renders and the
-            // Enter handler indexes (`project_list_sorted`, recency by
-            // default) — using the raw `project_list` order here would land
-            // the cursor on an unrelated project and silently switch filters.
-            let selected = match &state.project_filter {
-                Some(name) => state
-                    .project_list_sorted()
-                    .iter()
-                    .position(|(n, _, _)| n == name)
-                    .map_or(0, |i| i + 1),
-                None => 0,
-            };
-            state.active_popup = crate::ActivePopup::ProjectPopup {
-                selected,
-                scroll: 0,
-            };
-        }
+        KeyCode::Char('f') => open_filter_popup(state),
+        KeyCode::Char('p') => open_project_popup(state),
         KeyCode::Char(' ') => {
             if state.tab == Tab::Daily
                 && !state.show_conversation
-                && let Some(group) = state.daily_groups.get(state.selected_day)
+                && let Some(session) = crate::current_selected_session(state)
             {
-                let sessions: Vec<_> = group.user_sessions().collect();
-                if let Some(session) = sessions.get(state.selected_session) {
-                    let p = session.file_path.clone();
-                    crate::handlers::pane::toggle_pin(state, &p);
-                }
+                crate::handlers::pane::toggle_pin(state, &session.file_path);
             }
         }
         KeyCode::Char('m') if !state.pins.entries().is_empty() => {
-            state.conv_list_mode = ConvListMode::Pinned;
-            state.selected_session = 0;
-            state.tab = Tab::Daily;
-            if !state.show_conversation {
-                state.panes.clear();
-                state.panes.push(ConversationPane::default());
-                state.show_conversation = true;
-            }
-            state.active_pane_index = None;
-            if state.panes.len() == 1 {
-                preview_conversation_in_pane(state);
-            }
+            open_pinned_view(state, preview_conversation_in_pane);
         }
         KeyCode::Char('/') => {
             // Pre-seed `filter:live ` only on clean Live-tab input; existing
@@ -1420,14 +1580,7 @@ pub(crate) fn handle_default_key(
             // so without this restored queries would render empty until
             // the user touched the input.
             if !state.search_input.text.is_empty() {
-                let ctx_owned = crate::build_search_filter_ctx(state);
-                state.search_results = search::perform_search(
-                    &state.daily_groups,
-                    &state.search_input.text,
-                    &ctx_owned.as_ref(),
-                );
-                state.search_selected = 0;
-                crate::start_content_search(state);
+                crate::rerun_search(state, crate::start_content_search);
             }
             state.search_mode = true;
             state.search_input.move_end();
@@ -1449,7 +1602,7 @@ pub(crate) fn handle_default_key(
             state.active_popup = crate::ActivePopup::None;
             state.session_detail_override = None;
             state.session_detail_live_extra = None;
-            state.daily_breakdown_focus = false;
+            state.daily_breakdown_open = false;
             state.daily_breakdown_scroll = 0;
             // No tab bar is drawn during the initial load (the splash owns
             // the whole screen), so tab switching is meaningless and would
@@ -1475,46 +1628,24 @@ pub(crate) fn handle_default_key(
         }
         KeyCode::Left | KeyCode::Char('h') => {
             if state.tab == Tab::Dashboard {
-                state.dashboard_panel = if state.dashboard_panel == 0 {
-                    6
-                } else {
-                    state.dashboard_panel - 1
-                };
+                step_dashboard_panel(state, false);
             } else if state.tab == Tab::Live {
                 step_live_view_snapshot(state, 1);
-            } else if state.tab == Tab::Daily
-                && state.selected_day < state.daily_groups.len().saturating_sub(1)
-            {
-                state.selected_day += 1;
-                state.selected_session = 0;
-                state.daily_breakdown_scroll = 0;
+            } else if state.tab == Tab::Daily {
+                step_daily_day(state, true);
             } else if state.tab == Tab::Insights {
-                state.insights_panel = if state.insights_panel == 0 {
-                    3
-                } else {
-                    state.insights_panel - 1
-                };
+                step_insights_panel(state, true);
             }
         }
         KeyCode::Right | KeyCode::Char('l') => {
             if state.tab == Tab::Dashboard {
-                state.dashboard_panel = if state.dashboard_panel >= 6 {
-                    0
-                } else {
-                    state.dashboard_panel + 1
-                };
+                step_dashboard_panel(state, true);
             } else if state.tab == Tab::Live {
                 step_live_view_snapshot(state, -1);
-            } else if state.tab == Tab::Daily && state.selected_day > 0 {
-                state.selected_day -= 1;
-                state.selected_session = 0;
-                state.daily_breakdown_scroll = 0;
+            } else if state.tab == Tab::Daily {
+                step_daily_day(state, false);
             } else if state.tab == Tab::Insights {
-                state.insights_panel = if state.insights_panel >= 3 {
-                    0
-                } else {
-                    state.insights_panel + 1
-                };
+                step_insights_panel(state, false);
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -1530,16 +1661,26 @@ pub(crate) fn handle_default_key(
                     }
                 }
             } else if state.tab == Tab::Daily {
-                if state.daily_breakdown_focus {
+                if state.daily_breakdown_open {
                     if state.daily_breakdown_scroll > 0 {
                         state.daily_breakdown_scroll -= 1;
                     }
+                } else if state.daily_panel == DailyPanel::Breakdown {
+                    // Only onto a panel the last frame drew (narrow terminals
+                    // hide Activity, short ones both).
+                    if state.layout.activity_panel_area.is_some() {
+                        state.daily_panel = DailyPanel::Activity;
+                    }
+                } else if state.daily_panel == DailyPanel::Activity {
+                    // The top panel: nothing above it to move to.
                 } else if state.selected_session > 0 {
                     state.selected_session -= 1;
+                } else if state.layout.breakdown_panel_area.is_some() {
+                    // Past the first session, ↑ moves on to the panel above.
+                    state.daily_panel = DailyPanel::Breakdown;
                 }
             } else if state.tab == Tab::Live {
-                let (lo, _) = crate::live_selectable_range(state);
-                state.live_selected = state.live_selected.saturating_sub(1).max(lo);
+                crate::step_live_selection(state, true);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1555,10 +1696,16 @@ pub(crate) fn handle_default_key(
                     }
                 }
             } else if state.tab == Tab::Daily {
-                if state.daily_breakdown_focus {
+                if state.daily_breakdown_open {
                     if state.daily_breakdown_scroll < state.daily_breakdown_max_scroll {
                         state.daily_breakdown_scroll += 1;
                     }
+                } else if state.daily_panel == DailyPanel::Activity {
+                    state.daily_panel = DailyPanel::Breakdown;
+                } else if state.daily_panel == DailyPanel::Breakdown {
+                    // Back down from the panel to the first session.
+                    state.daily_panel = DailyPanel::Sessions;
+                    state.selected_session = 0;
                 } else {
                     let max = state
                         .daily_groups
@@ -1569,61 +1716,40 @@ pub(crate) fn handle_default_key(
                     }
                 }
             } else if state.tab == Tab::Live {
-                let (_, hi) = crate::live_selectable_range(state);
-                if state.live_selected + 1 < hi {
-                    state.live_selected += 1;
-                }
+                crate::step_live_selection(state, false);
             }
         }
         KeyCode::Enter
-            if key.modifiers.contains(KeyModifiers::SHIFT)
-                && state.tab == Tab::Daily
-                && state.panes.iter().all(|p| !p.loading)
-                && state.panes.len() < MAX_PANES =>
+            if key.modifiers.contains(KeyModifiers::SHIFT) && state.tab == Tab::Daily =>
         {
-            if let Some(group) = state.daily_groups.get(state.selected_day) {
-                let sessions: Vec<_> = group.user_sessions().collect();
-                if let Some(session) = sessions.get(state.selected_session) {
-                    state
-                        .panes
-                        .push(ConversationPane::load_from(&session.file_path));
-                    state.active_pane_index = Some(state.panes.len() - 1);
-                    state.conv_list_mode = ConvListMode::Day;
-                    state.show_conversation = true;
-                }
-            }
+            open_selected_session_in_new_pane(state);
         }
         KeyCode::Enter => {
             if state.tab == Tab::Daily {
-                if state.daily_breakdown_focus {
-                    state.daily_breakdown_focus = false;
+                // Enter opens the focused panel's detail, as on Dashboard; an
+                // open Breakdown closes on it like on Esc.
+                if state.daily_breakdown_open {
+                    state.daily_breakdown_open = false;
                     state.daily_breakdown_scroll = 0;
+                } else if state.daily_panel == DailyPanel::Breakdown {
+                    state.daily_breakdown_open = true;
+                    state.daily_breakdown_scroll = 0;
+                } else if state.daily_panel == DailyPanel::Activity {
+                    state.active_popup = crate::ActivePopup::DayActivity {
+                        scroll: 0,
+                        cursor: 0,
+                    };
+                } else {
+                    state.active_popup = crate::ActivePopup::Detail { back: None };
+                    state.session_detail_scroll = 0;
                 }
-                open_conversation_in_pane(state);
             } else if state.tab == Tab::Dashboard {
-                state.active_popup = crate::ActivePopup::DashboardDetail;
+                open_dashboard_detail(state);
             } else if state.tab == Tab::Insights {
                 state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
             }
         }
-        KeyCode::Char('C') => {
-            let no_loading = state.panes.iter().all(|p| !p.loading);
-            if state.tab == Tab::Daily
-                && no_loading
-                && let Some(group) = state.daily_groups.get(state.selected_day)
-            {
-                let path = group
-                    .user_sessions()
-                    .nth(state.selected_session)
-                    .map(|s| s.file_path.clone());
-                if let Some(path) = path
-                    && open_or_focus_pane(state, &path)
-                {
-                    state.conv_list_mode = ConvListMode::Day;
-                    state.show_conversation = true;
-                }
-            }
-        }
+        KeyCode::Char('C') if state.tab == Tab::Daily => open_selected_session_in_new_pane(state),
         KeyCode::Char('S') => {
             if state.tab == Tab::Daily
                 && state.summary_task.is_none()
@@ -1639,39 +1765,15 @@ pub(crate) fn handle_default_key(
             {
                 handlers::tasks::start_session_summary(state, session, false);
             } else if state.tab == Tab::Dashboard {
-                // Rankable panels (Projects = 1, Models = 2, Languages = 4)
-                // toggle the sort key. `dashboard_scroll[N]` is the cursor
-                // into the sorted list, so reset it to 0 to avoid landing on
-                // a stale row when the order changes.
-                match state.dashboard_panel {
-                    1 => {
-                        state.dashboard_projects_sort = state.dashboard_projects_sort.toggle();
-                        state.dashboard_scroll[1] = 0;
-                        state.dashboard_viewport[1] = 0;
-                    }
-                    2 => {
-                        state.dashboard_models_sort = state.dashboard_models_sort.toggle();
-                        state.dashboard_scroll[2] = 0;
-                        state.dashboard_viewport[2] = 0;
-                    }
-                    4 => {
-                        state.dashboard_languages_sort = state.dashboard_languages_sort.toggle();
-                        state.dashboard_scroll[4] = 0;
-                        state.dashboard_viewport[4] = 0;
-                    }
-                    _ => {}
+                // The compact Ecosystem panel has no ranked list to reorder.
+                if matches!(state.dashboard_panel, 1 | 2 | 4) {
+                    toggle_panel_sort(state, state.dashboard_panel);
                 }
             }
         }
         // Regenerate (`r`) and resume-title write (`t`) moved into the Summary
         // popup (`handle_summary_popup_key`) so they sit next to the summary
         // they act on, with consistent meaning across every view.
-        KeyCode::Char('b') if state.tab == Tab::Daily => {
-            state.daily_breakdown_focus = !state.daily_breakdown_focus;
-            if state.daily_breakdown_focus {
-                state.daily_breakdown_scroll = 0;
-            }
-        }
         KeyCode::Char('T') if state.tab == Tab::Daily && !state.daily_groups.is_empty() => {
             state.selected_day = 0;
             state.selected_session = 0;
@@ -1703,13 +1805,8 @@ pub(crate) fn handle_default_key(
                 }
             }
         }
-        KeyCode::Char('i') => {
-            if state.tab == Tab::Daily {
-                state.active_popup = crate::ActivePopup::Detail;
-                state.session_detail_scroll = 0;
-            } else if state.tab == Tab::Insights {
-                state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
-            }
+        KeyCode::Char('i') if state.tab == Tab::Insights => {
+            state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
         }
         // Unbound printable key: name it instead of silently ignoring, so a
         // slip (wrong tab, key from another view) is distinguishable from a
@@ -1738,14 +1835,7 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Char(' ')
             if mcp_tab_active && state.mcp_selected_tool.is_none() =>
         {
-            let servers = crate::collect_mcp_servers(state);
-            if let Some(name) = servers.get(state.mcp_selected_server) {
-                if state.mcp_expanded_servers.contains(name) {
-                    state.mcp_expanded_servers.remove(name);
-                } else {
-                    state.mcp_expanded_servers.insert(name.clone());
-                }
-            }
+            toggle_mcp_server(state, state.mcp_selected_server);
         }
         KeyCode::Char('o') if mcp_tab_active => {
             let servers = crate::collect_mcp_servers(state);
@@ -1803,49 +1893,11 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             }
             crate::adjust_mcp_scroll(state, &servers);
         }
-        KeyCode::Char('s') if state.dashboard_panel == 1 => {
-            // Mirror of the Projects-panel toggle in normal mode so the same
-            // key works whether the popup is open or not. Cursor resets to 0
-            // since the row order changes under it.
-            state.dashboard_projects_sort = state.dashboard_projects_sort.toggle();
-            state.dashboard_scroll[1] = 0;
-            state.dashboard_viewport[1] = 0;
-        }
-        KeyCode::Char('s') if state.dashboard_panel == 2 => {
-            // Models panel popup mirror of the normal-mode toggle.
-            state.dashboard_models_sort = state.dashboard_models_sort.toggle();
-            state.dashboard_scroll[2] = 0;
-            state.dashboard_viewport[2] = 0;
-        }
-        KeyCode::Char('s') if state.dashboard_panel == 3 => {
-            // Ecosystem popup: toggle recency vs call-count across every tab
-            // and the server rows. Rows reorder under the cursor, so reset
-            // the scroll/viewport and the MCP server/tool selection.
-            state.dashboard_ecosystem_sort = state.dashboard_ecosystem_sort.toggle();
-            state.dashboard_scroll[3] = 0;
-            state.dashboard_viewport[3] = 0;
-            state.mcp_selected_server = 0;
-            state.mcp_selected_tool = None;
-        }
-        KeyCode::Char('s') if state.dashboard_panel == 4 => {
-            // Languages popup mirror of the normal-mode toggle.
-            state.dashboard_languages_sort = state.dashboard_languages_sort.toggle();
-            state.dashboard_scroll[4] = 0;
-            state.dashboard_viewport[4] = 0;
+        KeyCode::Char('s') if (1..=4).contains(&state.dashboard_panel) => {
+            toggle_panel_sort(state, state.dashboard_panel);
         }
         KeyCode::Enter if state.dashboard_panel == 1 => {
-            // Drill into the focused project. `dashboard_scroll[1]` is the
-            // cursor row in the sorted projects list (viewport-decoupled
-            // cursor); resolve it via the shared sort so cursor index lines
-            // up with the visible row across panel, popup, and click paths.
-            let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-            state.sort_projects(&mut projects);
-            if let Some((name, _)) = projects.get(state.dashboard_scroll[1]) {
-                state.active_popup = crate::ActivePopup::ProjectDetail {
-                    path: (*name).clone(),
-                    scroll: 0,
-                };
-            }
+            open_project_detail(state, state.dashboard_scroll[1]);
         }
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
             state.active_popup = crate::ActivePopup::None;
@@ -1893,46 +1945,19 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             state.dashboard_scroll[state.dashboard_panel] = max_items.saturating_sub(1);
         }
         KeyCode::Char(c @ '1'..='4') if state.dashboard_panel == 3 => {
-            state.tools_detail_section = (c as u8 - b'1') as usize;
-            state.dashboard_scroll[state.dashboard_panel] = 0;
-            if state.tools_detail_section == 0 {
-                state.mcp_selected_server = 0;
-                state.mcp_selected_tool = None;
-            }
+            set_ecosystem_section(state, (c as u8 - b'1') as usize);
         }
         // Tab/BackTab + ←/→ + h/l all cycle the Ecosystem section.
         // Forward (Tab / Right / l) advances; backward (BackTab /
         // Left / h) retreats. Mirrors number keys 1-4.
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') if state.dashboard_panel == 3 => {
-            state.tools_detail_section = (state.tools_detail_section + 1) % 4;
-            state.dashboard_scroll[state.dashboard_panel] = 0;
-            if state.tools_detail_section == 0 {
-                state.mcp_selected_server = 0;
-                state.mcp_selected_tool = None;
-            }
+            set_ecosystem_section(state, (state.tools_detail_section + 1) % 4);
         }
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') if state.dashboard_panel == 3 => {
-            state.tools_detail_section = (state.tools_detail_section + 3) % 4;
-            state.dashboard_scroll[state.dashboard_panel] = 0;
-            if state.tools_detail_section == 0 {
-                state.mcp_selected_server = 0;
-                state.mcp_selected_tool = None;
-            }
+            set_ecosystem_section(state, (state.tools_detail_section + 3) % 4);
         }
-        KeyCode::Left | KeyCode::Char('h') => {
-            state.dashboard_panel = if state.dashboard_panel == 0 {
-                6
-            } else {
-                state.dashboard_panel - 1
-            };
-        }
-        KeyCode::Right | KeyCode::Char('l') => {
-            state.dashboard_panel = if state.dashboard_panel >= 6 {
-                0
-            } else {
-                state.dashboard_panel + 1
-            };
-        }
+        KeyCode::Left | KeyCode::Char('h') => step_dashboard_panel(state, false),
+        KeyCode::Right | KeyCode::Char('l') => step_dashboard_panel(state, true),
         _ => {}
     }
 }
@@ -1976,10 +2001,57 @@ pub(crate) fn handle_summary_popup_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
+/// Enter / double-click on a search result: preview the hit's session in a
+/// pane, remembering where `/` was pressed so Esc can return there.
+pub(crate) fn open_search_hit(state: &mut AppState, open_conversation_in_pane: fn(&mut AppState)) {
+    state.search_select_all = false;
+    let result = state.search_results[state.search_selected].clone();
+    let query = state.search_input.text.clone();
+    // Persist the query so ↑ on the next `/` open recalls it.
+    state.search_history.push(&query);
+    let is_content = matches!(result.match_type, search::SearchMatchType::Content);
+    if state.search_saved_state.is_none() {
+        state.search_saved_state = Some((
+            state.tab,
+            state.selected_day,
+            state.selected_session,
+            state.show_conversation,
+        ));
+    }
+    state.selected_day = result.day_idx;
+    state.selected_session = result.session_idx;
+    state.tab = Tab::Daily;
+    state.search_mode = false;
+    state.search_preview_mode = true;
+    // The content search keeps running: its hits are there on the way back.
+    open_conversation_in_pane(state);
+    // Seed the in-pane search with the free text only: filter
+    // tokens (`filter:` / `project:` / ...) are popup syntax, and
+    // carried over verbatim they'd search for the literal token.
+    let (_, free_text) = crate::search::parse_search_query(&query);
+    if is_content
+        && !free_text.is_empty()
+        && let Some(pane) = state.active_pane_mut()
+    {
+        pane.search_input.set(free_text);
+        pane.search_mode = true;
+        // Seeded query opens "selected", like a `/` reopen: the user
+        // didn't type it here, so their first keypress replaces it
+        // instead of appending to it. Enter still walks matches
+        // (navigation keys don't consume the selection's text).
+        pane.search_select_all = true;
+        pane.search_current = 0;
+        pane.search_seed_day = result.message_date;
+        // Messages load async; the draw recomputes matches once they
+        // land and this flag then peeks + centers the first hit.
+        pane.pending_search_scroll = true;
+    }
+}
+
 /// `search_mode` branch — Esc restores prior tab/day/session, Enter jumps
-/// to the hit, char keys edit the input and re-run incrementally. Two
-/// `fn` callbacks for `start_content_search` / `open_conversation_in_pane`
-/// which live in `main.rs`.
+/// to the hit, char keys edit the input and re-run incrementally. The two
+/// `fn` callbacks (`start_content_search` / `open_conversation_in_pane`)
+/// are parameters so tests can stub them.
 pub(crate) fn handle_search_mode_key(
     state: &mut AppState,
     key: KeyEvent,
@@ -1987,71 +2059,9 @@ pub(crate) fn handle_search_mode_key(
     open_conversation_in_pane: fn(&mut AppState),
 ) {
     match key.code {
-        KeyCode::Esc => {
-            // Keep `search_input.text` populated so the next `/` restores
-            // the previous query. Drop the result list to release memory;
-            // it gets rebuilt on the next open.
-            state.search_mode = false;
-            state.search_select_all = false;
-            state.search_results.clear();
-            state.search_selected = 0;
-            state.search_task = None;
-            state.searching = false;
-            crate::supersede_content_scan();
-            state.search_history.reset_cursor();
-            if let Some((tab, day, session, show_conv)) = state.search_saved_state.take() {
-                state.tab = tab;
-                state.selected_day = day;
-                state.selected_session = session;
-                state.show_conversation = show_conv;
-            }
-            state.search_preview_mode = false;
-        }
+        KeyCode::Esc => crate::close_search(state),
         KeyCode::Enter if !state.search_results.is_empty() => {
-            state.search_select_all = false;
-            let result = state.search_results[state.search_selected].clone();
-            let query = state.search_input.text.clone();
-            // Persist the query so ↑ on the next `/` open recalls it.
-            state.search_history.push(&query);
-            let is_content = matches!(result.match_type, search::SearchMatchType::Content);
-            if state.search_saved_state.is_none() {
-                state.search_saved_state = Some((
-                    state.tab,
-                    state.selected_day,
-                    state.selected_session,
-                    state.show_conversation,
-                ));
-            }
-            state.selected_day = result.day_idx;
-            state.selected_session = result.session_idx;
-            state.tab = Tab::Daily;
-            state.search_mode = false;
-            state.search_preview_mode = true;
-            state.search_task = None;
-            state.searching = false;
-            open_conversation_in_pane(state);
-            // Seed the in-pane search with the free text only: filter
-            // tokens (`filter:` / `project:` / ...) are popup syntax, and
-            // carried over verbatim they'd search for the literal token.
-            let (_, free_text) = crate::search::parse_search_query(&query);
-            if is_content
-                && !free_text.is_empty()
-                && let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
-                pane.search_input.set(free_text);
-                pane.search_mode = true;
-                // Seeded query opens "selected", like a `/` reopen: the user
-                // didn't type it here, so their first keypress replaces it
-                // instead of appending to it. Enter still walks matches
-                // (navigation keys don't consume the selection's text).
-                pane.search_select_all = true;
-                pane.search_current = 0;
-                pane.search_seed_day = result.message_date;
-                // Messages load async; the draw recomputes matches once they
-                // land and this flag then peeks + centers the first hit.
-                pane.pending_search_scroll = true;
-            }
+            open_search_hit(state, open_conversation_in_pane);
         }
         // ↑↓ walk history only on blank input or while already recalling;
         // typing reverts ↑↓ to list nav so users aren't yanked into
@@ -2066,14 +2076,7 @@ pub(crate) fn handle_search_mode_key(
                 let draft = state.search_input.text.clone();
                 if let Some(prev) = state.search_history.step_back(&draft) {
                     state.search_input.set(prev);
-                    let ctx_owned = crate::build_search_filter_ctx(state);
-                    state.search_results = search::perform_search(
-                        &state.daily_groups,
-                        &state.search_input.text,
-                        &ctx_owned.as_ref(),
-                    );
-                    state.search_selected = 0;
-                    start_content_search(state);
+                    crate::rerun_search(state, start_content_search);
                 }
             } else if !state.search_results.is_empty() {
                 state.search_selected = state.search_results.len() - 1;
@@ -2084,14 +2087,7 @@ pub(crate) fn handle_search_mode_key(
             if state.search_history.is_browsing() && state.search_selected == 0 {
                 if let Some(next) = state.search_history.step_forward() {
                     state.search_input.set(next);
-                    let ctx_owned = crate::build_search_filter_ctx(state);
-                    state.search_results = search::perform_search(
-                        &state.daily_groups,
-                        &state.search_input.text,
-                        &ctx_owned.as_ref(),
-                    );
-                    state.search_selected = 0;
-                    start_content_search(state);
+                    crate::rerun_search(state, start_content_search);
                 }
                 // step_forward past the newest entry restores the draft and
                 // clears the cursor; the next press lands in the result-nav
@@ -2114,14 +2110,7 @@ pub(crate) fn handle_search_mode_key(
             } else {
                 state.search_input.delete_back();
             }
-            let ctx_owned = crate::build_search_filter_ctx(state);
-            state.search_results = search::perform_search(
-                &state.daily_groups,
-                &state.search_input.text,
-                &ctx_owned.as_ref(),
-            );
-            state.search_selected = 0;
-            start_content_search(state);
+            crate::rerun_search(state, start_content_search);
         }
         KeyCode::Left => {
             state.search_select_all = false;
@@ -2147,14 +2136,7 @@ pub(crate) fn handle_search_mode_key(
                 state.search_input.set(String::new());
             }
             state.search_input.insert_char(c);
-            let ctx_owned = crate::build_search_filter_ctx(state);
-            state.search_results = search::perform_search(
-                &state.daily_groups,
-                &state.search_input.text,
-                &ctx_owned.as_ref(),
-            );
-            state.search_selected = 0;
-            start_content_search(state);
+            crate::rerun_search(state, start_content_search);
         }
         _ => {}
     }
@@ -2174,21 +2156,7 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') if state.project_popup_selected() < total - 1 => {
             state.set_project_popup_selected(state.project_popup_selected() + 1);
         }
-        KeyCode::Enter => {
-            if state.project_popup_selected() == 0 {
-                state.project_filter = None;
-            } else {
-                // Selection indexes into the display-sorted view so the
-                // chosen row matches whatever the user is looking at.
-                let sorted = state.project_list_sorted();
-                if let Some((name, _, _)) = sorted.get(state.project_popup_selected() - 1).copied()
-                {
-                    state.project_filter = Some(name.clone());
-                }
-            }
-            state.apply_filter();
-            state.active_popup = crate::ActivePopup::None;
-        }
+        KeyCode::Enter => choose_project_row(state),
         _ => {}
     }
 }
@@ -2198,7 +2166,312 @@ mod tests {
     use super::*;
 
     fn press(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
-        handle_default_key(state, KeyEvent::new(code, mods), |_| {}, |_| {});
+        handle_default_key(state, KeyEvent::new(code, mods), |_| {});
+    }
+
+    #[test]
+    fn a_detail_opened_from_live_pins_the_session_it_shows() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let under_cursor = make_session("cursor", None, None);
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(
+            day,
+            vec![under_cursor.clone()],
+        )]);
+        let shown = make_session("shown", None, None);
+        state.session_detail_override = Some(shown.clone());
+        state.active_popup = crate::ActivePopup::Detail { back: None };
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Char(' ')));
+        assert!(state.pins.is_pinned(&shown.file_path));
+        assert!(!state.pins.is_pinned(&under_cursor.file_path));
+    }
+
+    #[test]
+    fn a_detail_over_the_conversation_view_pins_the_focused_panes_session() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let under_cursor = make_session("cursor", None, None);
+        let in_pane = make_session("pane", None, None);
+        let group = make_daily_group(day, vec![under_cursor.clone(), in_pane.clone()]);
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![group]);
+        state.show_conversation = true;
+        let mut pane = ConversationPane::default();
+        pane.file_path = Some(in_pane.file_path.clone());
+        state.panes = vec![pane];
+        state.active_pane_index = Some(0);
+        state.active_popup = crate::ActivePopup::Detail { back: None };
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Char(' ')));
+        assert!(state.pins.is_pinned(&in_pane.file_path));
+        assert!(!state.pins.is_pinned(&under_cursor.file_path));
+    }
+
+    #[test]
+    fn a_conversation_summary_targets_the_lists_session_not_the_day_cursor() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        fn pinned_row(_: &AppState, _: usize) -> Option<std::path::PathBuf> {
+            Some(std::path::PathBuf::from("/tmp/test/pinned/none.jsonl"))
+        }
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let group = make_daily_group(
+            day,
+            vec![
+                make_session("cursor", None, None),
+                make_session("pinned", None, None),
+            ],
+        );
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![group]);
+        state.show_conversation = true;
+        let picked = conv_summary_session(&state, pinned_row).map(|s| s.project_name);
+        assert_eq!(picked.as_deref(), Some("pinned"));
+    }
+
+    #[test]
+    fn shift_enter_focuses_the_pane_already_holding_the_session() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let session = make_session("proj", None, None);
+        let path = session.file_path.clone();
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(
+            day,
+            vec![session],
+        )]);
+        state.tab = Tab::Daily;
+        let mut open = ConversationPane::default();
+        open.file_path = Some(path);
+        state.panes = vec![open];
+        press(&mut state, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(state.panes.len(), 1, "no duplicate pane");
+        assert_eq!(state.active_pane_index, Some(0));
+    }
+
+    // A detail popup opens on the row its compact panel had selected.
+    #[test]
+    fn the_models_popup_opens_on_the_panels_cursor() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = Tab::Dashboard;
+        state.dashboard_panel = 2;
+        state.dashboard_scroll[2] = 3;
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.show_dashboard_detail());
+        assert_eq!(state.dashboard_scroll[2], 3);
+
+        state.active_popup = crate::ActivePopup::None;
+        state.dashboard_panel = 1;
+        state.dashboard_scroll[1] = 3;
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(state.dashboard_scroll[1], 3, "Projects keeps its cursor");
+    }
+
+    // The detail's Enter replaces the focused pane, so four open panes do not
+    // block it; a pane still loading does, and says so.
+    #[test]
+    fn the_details_enter_opens_with_every_pane_slot_taken() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(); // lint-ok: date-literal
+        let session = make_session("p", None, None);
+        let path = session.file_path.clone();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(
+            day,
+            vec![session],
+        )]);
+        state.tab = Tab::Daily;
+        state.panes = (0..crate::state::MAX_PANES)
+            .map(|n| {
+                let mut p = ConversationPane::default();
+                p.file_path = Some(std::path::PathBuf::from(format!("/tmp/other-{n}.jsonl")));
+                p
+            })
+            .collect();
+        state.active_pane_index = Some(1);
+        state.panes[3].loading = true;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(state.show_detail(), "a loading pane holds the open");
+        assert!(
+            state
+                .toast_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("loading")
+        );
+
+        state.panes[3].loading = false;
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(!state.show_detail());
+        assert_eq!(state.panes.len(), crate::state::MAX_PANES);
+        assert_eq!(state.panes[1].file_path.as_deref(), Some(path.as_path()));
+    }
+
+    // ↑ only reaches panels the last frame drew: a short terminal draws
+    // neither, a narrow one no Activity chart.
+    #[test]
+    fn up_skips_daily_panels_that_are_not_on_screen() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = Tab::Daily;
+        press(&mut state, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(state.daily_panel, DailyPanel::Sessions, "no panel drawn");
+        state.layout.breakdown_panel_area = Some(ratatui::layout::Rect::default());
+        press(&mut state, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(state.daily_panel, DailyPanel::Breakdown);
+        press(&mut state, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            state.daily_panel,
+            DailyPanel::Breakdown,
+            "no Activity drawn"
+        );
+    }
+
+    // Daily moves focus with ↑ / ↓ and opens the focused panel with Enter,
+    // as Dashboard does.
+    #[test]
+    fn daily_focuses_panels_and_enter_opens_the_focused_one() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = Tab::Daily;
+        // As the last frame left them: both panels on screen.
+        state.layout.breakdown_panel_area = Some(ratatui::layout::Rect::default());
+        state.layout.activity_panel_area = Some(ratatui::layout::Rect::default());
+        press(&mut state, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(state.daily_panel, DailyPanel::Breakdown, "↑ past the top");
+        press(&mut state, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(state.daily_panel, DailyPanel::Activity, "then the chart");
+        press(&mut state, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(state.daily_panel, DailyPanel::Activity, "nothing above it");
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.show_day_activity(), "Enter opens the activity detail");
+        handle_day_activity_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert!(!state.show_day_activity());
+        press(&mut state, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(state.daily_panel, DailyPanel::Breakdown);
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            state.daily_breakdown_open,
+            "Enter opens the focused breakdown"
+        );
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!state.daily_breakdown_open, "and closes it again");
+        press(&mut state, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(state.daily_panel, DailyPanel::Sessions);
+        assert_eq!(state.selected_session, 0);
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!state.daily_breakdown_open);
+        assert!(
+            state.show_detail(),
+            "sessions focus opens the session detail"
+        );
+        assert!(!state.show_conversation);
+        state.active_popup = crate::ActivePopup::None;
+        press(&mut state, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(!state.daily_breakdown_open);
+        press(&mut state, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(!state.show_detail(), "Enter is the one key for the detail");
+    }
+
+    // ←/→ in the day's activity detail steps the day as the Breakdown does,
+    // the popup staying open on the new day from its top.
+    #[test]
+    fn the_activity_detail_steps_the_day_and_stays_open() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(); // lint-ok: date-literal
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            make_daily_group(day, vec![make_session("p", None, None)]),
+            make_daily_group(day.pred_opt().unwrap(), vec![make_session("q", None, None)]),
+        ]);
+        state.tab = Tab::Daily;
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 4,
+            cursor: 0,
+        };
+        handle_day_activity_key(&mut state, KeyEvent::from(KeyCode::Left));
+        assert_eq!(state.selected_day, 1, "← is the older day");
+        assert!(state.show_day_activity());
+        assert_eq!(state.day_activity_scroll(), 0);
+        handle_day_activity_key(&mut state, KeyEvent::from(KeyCode::Left));
+        assert_eq!(state.selected_day, 1, "no day older than the last");
+        handle_day_activity_key(&mut state, KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(state.selected_day, 0);
+    }
+
+    // A detail opened from the Daily list closes to the list, not to Activity.
+    #[test]
+    fn a_detail_from_the_daily_list_closes_to_the_list() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            crate::test_helpers::helpers::make_daily_group(
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(), // lint-ok: date-literal
+                vec![crate::test_helpers::helpers::make_session("p", None, None)],
+            ),
+        ]);
+        state.tab = Tab::Daily;
+        press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.show_detail());
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.active_popup, crate::ActivePopup::None);
+    }
+
+    // The Activity popup picks a session row with ↑↓ (kept on the rows);
+    // Enter opens its detail, which closes back to that row.
+    #[test]
+    fn the_activity_detail_picks_and_opens_a_session() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(); // lint-ok: date-literal
+        let mut early = make_session("early", None, None);
+        early.day_hourly_work_tokens.insert(8, 10);
+        let mut late = make_session("late", None, None);
+        late.day_hourly_work_tokens.insert(20, 10);
+        let late_path = late.file_path.clone();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(
+            day,
+            vec![late, early],
+        )]);
+        state.tab = Tab::Daily;
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 0,
+            cursor: 0,
+        };
+        handle_day_activity_key(&mut state, KeyEvent::from(KeyCode::Down));
+        handle_day_activity_key(&mut state, KeyEvent::from(KeyCode::Down));
+        assert_eq!(state.day_activity_cursor(), 1, "kept on the last row");
+        handle_day_activity_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(
+            state.show_detail(),
+            "Enter opens the detail, not the transcript"
+        );
+        let shown = crate::current_selected_session(&state).map(|s| s.file_path);
+        assert_eq!(
+            shown,
+            Some(late_path.clone()),
+            "the row under the cursor, not list order"
+        );
+
+        // Closing the detail lands back on the Activity row it came from,
+        // also after a round trip through the title editor.
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Char('t')));
+        handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert!(state.show_detail(), "the editor returns to the detail");
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert!(state.show_day_activity(), "back to Activity, not Daily");
+        assert_eq!(state.day_activity_cursor(), 1, "on the same row");
+        handle_day_activity_key(&mut state, KeyEvent::from(KeyCode::Enter));
+
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(!state.show_detail());
+        assert!(
+            state.show_conversation,
+            "the detail's Enter opens the transcript"
+        );
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(
+            state.panes[0].file_path.as_deref(),
+            Some(late_path.as_path())
+        );
+
+        // Reopening a transcript a pane already shows focuses it, not a reload.
+        state.panes[0].loading = false;
+        state.show_conversation = false;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(state.show_conversation);
+        assert_eq!(state.panes.len(), 1);
+        assert!(!state.panes[0].loading, "the open pane was not reloaded");
     }
 
     #[test]
@@ -2278,6 +2551,7 @@ mod tests {
         state.active_popup = crate::ActivePopup::ProjectDetail {
             path: "~/proj".to_string(),
             scroll: 0,
+            cursor: 0,
         };
         handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Esc));
         assert_eq!(state.active_popup, crate::ActivePopup::DashboardDetail);
@@ -2299,7 +2573,7 @@ mod tests {
             KeyCode::Char('4'),
             KeyCode::Tab,
         ] {
-            handle_default_key(&mut state, KeyEvent::from(code), noop, noop);
+            handle_default_key(&mut state, KeyEvent::from(code), noop);
             assert!(state.tab == Tab::Dashboard, "loading must block {code:?}");
         }
     }
@@ -2332,10 +2606,13 @@ mod tests {
         state.active_popup = crate::ActivePopup::TitleEdit {
             input: crate::TextInput::default(),
             path: std::path::PathBuf::from("/tmp/x.jsonl"),
-            return_to: crate::TitleEditReturn::Detail,
+            return_to: crate::TitleEditReturn::Detail(None),
         };
         handle_title_edit_key(&mut state, KeyEvent::from(KeyCode::Esc));
-        assert_eq!(state.active_popup, crate::ActivePopup::Detail);
+        assert_eq!(
+            state.active_popup,
+            crate::ActivePopup::Detail { back: None }
+        );
 
         // A successful save restores the Summary popup for a Summary opener.
         let dir = std::env::temp_dir().join(format!("ccsight-titleret-{}", std::process::id()));
@@ -2375,9 +2652,9 @@ mod tests {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
         state.loading = false;
         state.tab = Tab::Dashboard;
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('2')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('2')), noop);
         assert!(state.tab == Tab::Live);
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('3')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('3')), noop);
         assert!(state.tab == Tab::Daily);
     }
 
@@ -2391,7 +2668,7 @@ mod tests {
                 timestamp_utc: None,
                 model: None,
                 tokens: None,
-                usage: None,
+                billed: Vec::new(),
             })
             .collect();
         crate::ConversationPane {
@@ -2408,6 +2685,70 @@ mod tests {
             0
         }
         handle_conversation_key(state, KeyEvent::from(code), noop, noop, no_file, no_count);
+    }
+
+    // Inside a message taller than the pane, ↑↓ scroll a few lines per press
+    // (a page would jump past what was being read); past its end they move
+    // to the neighbouring message.
+    #[test]
+    fn arrows_scroll_a_tall_message_a_few_lines_at_a_time() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.show_conversation = true;
+        let mut pane = conv_test_pane(&["tall", "next"]);
+        let lines: Vec<ratatui::text::Line<'static>> = (0..100).map(|_| "x".into()).collect();
+        pane.message_lines = vec![(0, 0), (80, 1)];
+        pane.rendered = Some((lines, pane.message_lines.clone(), vec![false; 100]));
+        pane.last_visible_height = Some(20);
+        pane.scroll = 0;
+        pane.selected_message = 0;
+        state.panes = vec![pane];
+        state.active_pane_index = Some(0);
+
+        conv_key(&mut state, KeyCode::Down);
+        assert_eq!(
+            (state.panes[0].scroll, state.panes[0].selected_message),
+            (CONV_LINE_STEP, 0)
+        );
+        for _ in 0..30 {
+            conv_key(&mut state, KeyCode::Down);
+            if state.panes[0].selected_message == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            state.panes[0].scroll, 60,
+            "stopped with the message's end on screen"
+        );
+        assert_eq!(
+            state.panes[0].selected_message, 1,
+            "then on to the next message"
+        );
+
+        state.panes[0].selected_message = 0;
+        state.panes[0].scroll = 30;
+        conv_key(&mut state, KeyCode::Up);
+        assert_eq!(state.panes[0].scroll, 30 - CONV_LINE_STEP);
+        assert_eq!(state.panes[0].selected_message, 0);
+    }
+
+    #[test]
+    fn n_and_capital_j_both_step_to_the_next_message_start() {
+        for code in [KeyCode::Char('n'), KeyCode::Char('J')] {
+            let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+            state.show_conversation = true;
+            let mut pane = conv_test_pane(&["a", "b", "c"]);
+            pane.message_lines = vec![(0, 0), (10, 1), (20, 2)];
+            pane.scroll = 0;
+            state.panes = vec![pane];
+            state.active_pane_index = Some(0);
+            conv_key(&mut state, code);
+            assert_eq!(state.panes[0].scroll, 10, "{code:?}");
+            for back in [KeyCode::Char('N'), KeyCode::Char('K')] {
+                state.panes[0].scroll = 20;
+                conv_key(&mut state, back);
+                assert_eq!(state.panes[0].scroll, 10, "{back:?}");
+            }
+        }
     }
 
     // The pins / preview list already loads the cursor's session into pane 0,
@@ -2608,7 +2949,7 @@ mod tests {
     fn search_popup_reopen_restores_query_selected_and_first_char_replaces() {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
         state.search_input.set("resume".to_string());
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('/')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('/')), noop);
         assert!(state.search_mode);
         assert!(state.search_select_all, "restored query opens selected");
         handle_search_mode_key(&mut state, KeyEvent::from(KeyCode::Char('x')), noop, noop);
@@ -2623,7 +2964,7 @@ mod tests {
     fn search_popup_live_tab_seed_stays_appendable() {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
         state.tab = crate::Tab::Live;
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('/')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('/')), noop);
         assert_eq!(state.search_input.text, "filter:live ");
         assert!(
             !state.search_select_all,
@@ -2670,7 +3011,7 @@ mod tests {
         let mut state = make_test_app_state(groups);
         state.tab = Tab::Daily;
         state.selected_day = 1;
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('t')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('t')), noop);
         assert!(
             matches!(
                 state.active_popup,
@@ -2684,7 +3025,7 @@ mod tests {
 
         state.active_popup = crate::ActivePopup::None;
         state.selected_day = 1;
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('T')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('T')), noop);
         assert_eq!(state.selected_day, 0, "T keeps the jump-to-today binding");
         assert!(!state.show_title_edit());
     }
@@ -2696,12 +3037,59 @@ mod tests {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
         state.tab = Tab::Live;
         state.live_view_snapshot_offset = 3;
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('T')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('T')), noop);
         assert_eq!(
             state.live_view_snapshot_offset, 0,
             "T returns to the now view"
         );
         assert!(!state.show_title_edit());
+    }
+
+    #[test]
+    fn live_enter_opens_the_detail_and_its_enter_the_live_conversation() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let mut indexed = make_session("live", None, None);
+        let jsonl = std::path::PathBuf::from("/tmp/live-detail.jsonl");
+        indexed.file_path = jsonl.clone();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(
+            day,
+            vec![indexed],
+        )]);
+        state.tab = Tab::Live;
+        state
+            .live_active
+            .push(crate::infrastructure::live_sessions::LiveSession {
+                session_id: "sess-1".to_string(),
+                jsonl_path: Some(jsonl.clone()),
+                cwd: std::path::PathBuf::from("/tmp"),
+                name: None,
+                status: None,
+                pid: 1,
+                started_at: None,
+                updated_at: None,
+                jsonl_mtime: None,
+                is_live: true,
+                was_recently_live: false,
+            });
+        state.live_selected = 0;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Enter), noop);
+        assert!(state.show_detail(), "Enter opens the detail");
+        assert!(!state.show_conversation);
+
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(!state.show_detail());
+        assert!(state.show_conversation);
+        assert!(matches!(state.conv_list_mode, ConvListMode::Live));
+        assert_eq!(state.panes[0].file_path.as_deref(), Some(jsonl.as_path()));
+
+        // Not indexed yet: no detail to show, so Enter opens the transcript.
+        state.show_conversation = false;
+        state.panes.clear();
+        state.original_daily_groups.clear();
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Enter), noop);
+        assert!(!state.show_detail());
+        assert!(state.show_conversation);
     }
 
     #[test]
@@ -2724,7 +3112,7 @@ mod tests {
                 was_recently_live: false,
             });
         state.live_selected = 0;
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('t')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('t')), noop);
         assert!(
             !state.show_title_edit(),
             "no editor without an indexed session"
@@ -2744,7 +3132,7 @@ mod tests {
     fn unbound_printable_key_names_itself_in_a_toast() {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
         state.tab = Tab::Dashboard;
-        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('Z')), noop, noop);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('Z')), noop);
         assert!(
             state.toast_message.as_deref().unwrap_or("").contains("'Z'"),
             "unbound key is named: {:?}",
@@ -2755,7 +3143,7 @@ mod tests {
         state.toast_message = None;
         let mut ev = KeyEvent::from(KeyCode::Char('z'));
         ev.modifiers = KeyModifiers::CONTROL;
-        handle_default_key(&mut state, ev, noop, noop);
+        handle_default_key(&mut state, ev, noop);
         assert!(state.toast_message.is_none(), "ctrl chord must not toast");
     }
 
@@ -2785,21 +3173,68 @@ mod tests {
         assert_eq!(state.help_scroll(), 0);
     }
 
-    #[test]
-    fn project_detail_scroll_saturates_at_zero() {
-        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+    /// A project detail over 30 one-session days of `proj`.
+    fn project_detail_state() -> AppState {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let today = chrono::Local::now().date_naive();
+        let groups = (0..30)
+            .map(|d| {
+                make_daily_group(
+                    today - chrono::Duration::days(d),
+                    vec![make_session("proj", None, None)],
+                )
+            })
+            .collect();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(groups);
         state.active_popup = crate::ActivePopup::ProjectDetail {
-            path: "~/proj".to_string(),
+            path: "proj".to_string(),
             scroll: 0,
+            cursor: 0,
         };
-        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
-        assert_eq!(state.project_detail_scroll(), 0);
-        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('u')));
-        assert_eq!(state.project_detail_scroll(), 0);
+        state
+    }
+
+    // Enter opens the Session Detail of the row under the cursor; closing it
+    // lands back on the same row.
+    #[test]
+    fn a_project_rows_enter_opens_its_detail_and_esc_returns() {
+        let mut state = project_detail_state();
+        let rows: Vec<std::path::PathBuf> = crate::ui::project_session_rows(&state, "proj")
+            .iter()
+            .map(|(_, s)| s.file_path.clone())
+            .collect();
         handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
-        assert_eq!(state.project_detail_scroll(), 1);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert!(state.show_detail());
+        let shown = state
+            .session_detail_override
+            .as_ref()
+            .map(|s| s.file_path.clone());
+        assert_eq!(
+            shown,
+            Some(rows[2].clone()),
+            "the cursor's row, not the first"
+        );
+        handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert!(
+            state.show_project_detail(),
+            "back to the project, not the list"
+        );
+        assert_eq!(state.project_detail_cursor(), 2);
+    }
+
+    #[test]
+    fn project_detail_cursor_saturates_at_zero() {
+        let mut state = project_detail_state();
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(state.project_detail_cursor(), 0);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('u')));
+        assert_eq!(state.project_detail_cursor(), 0);
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(state.project_detail_cursor(), 1);
         handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Char('d')));
-        assert_eq!(state.project_detail_scroll(), 11);
+        assert_eq!(state.project_detail_cursor(), 11);
     }
 
     #[test]
@@ -2827,19 +3262,15 @@ mod tests {
     // future popup can't end up with a narrower set than its siblings.
     #[test]
     fn project_detail_supports_page_and_edge_keys() {
-        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
-        state.active_popup = crate::ActivePopup::ProjectDetail {
-            path: "~/proj".to_string(),
-            scroll: 5,
-        };
+        let mut state = project_detail_state();
         handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::End));
-        assert_eq!(state.project_detail_scroll(), usize::MAX);
+        assert_eq!(state.project_detail_cursor(), 29, "kept on the last row");
         handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Home));
-        assert_eq!(state.project_detail_scroll(), 0);
+        assert_eq!(state.project_detail_cursor(), 0);
         handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::PageDown));
-        assert_eq!(state.project_detail_scroll(), 10);
+        assert_eq!(state.project_detail_cursor(), 10);
         handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::PageUp));
-        assert_eq!(state.project_detail_scroll(), 0);
+        assert_eq!(state.project_detail_cursor(), 0);
     }
 
     #[test]
@@ -2857,7 +3288,7 @@ mod tests {
     #[test]
     fn session_detail_supports_page_and_edge_keys() {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
-        state.active_popup = crate::ActivePopup::Detail;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
         state.session_detail_scroll = 5;
         handle_session_detail_key(&mut state, KeyEvent::from(KeyCode::PageDown));
         assert_eq!(state.session_detail_scroll, 15);
@@ -2881,13 +3312,17 @@ mod tests {
 
     #[test]
     fn insights_detail_panel_cycle_wraps_and_resets_scroll() {
-        // h/l cycle the 4 panels with wraparound; every switch resets the
+        // h/l cycle the panels with wraparound; every switch resets the
         // body scroll so the new panel starts at its top.
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
         state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 5 };
         state.insights_panel = 0;
         handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('h')));
-        assert_eq!(state.insights_panel, 3, "left from panel 0 wraps to last");
+        assert_eq!(
+            state.insights_panel,
+            crate::ui::INSIGHTS_PANELS - 1,
+            "left from panel 0 wraps to last"
+        );
         assert_eq!(state.insights_detail_scroll(), 0, "switch resets scroll");
         handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('l')));
         assert_eq!(state.insights_panel, 0, "right from last panel wraps to 0");
@@ -3149,7 +3584,7 @@ mod tests {
             ),
             (
                 "session_detail",
-                crate::ActivePopup::Detail,
+                crate::ActivePopup::Detail { back: None },
                 handle_session_detail_key,
             ),
         ];

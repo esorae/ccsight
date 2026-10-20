@@ -7,22 +7,75 @@ mod tests {
     use chrono::Datelike;
     use std::time::Instant;
 
-    /// Sum every session's per-model token fields (the DailyGrouper path) into
-    /// one `TokenStats` for comparison with the StatsAggregator total. Routes
-    /// through `TokenStats::merge` so a field added to the struct is folded
-    /// here without this helper knowing about it.
-    fn sum_grouper_tokens(
+    /// A walk from an empty cache, then one rebuilding every file from that
+    /// cache after a disk-shape round trip; nothing reaches disk. The count is
+    /// files the second walk re-parsed: one that changed in between is no
+    /// cache rebuild, so a comparison over it proves nothing.
+    fn fresh_then_cached(
+        files: &[std::path::PathBuf],
+    ) -> (
+        Vec<crate::aggregator::DailyGroup>,
+        Vec<crate::aggregator::DailyGroup>,
+        usize,
+    ) {
+        let mut cache = Some(crate::infrastructure::Cache::new_empty());
+        let fresh = DailyGrouper::group_by_date_with_shared_cache(files, &mut cache);
+        let mut cache = cache.map(crate::infrastructure::Cache::through_disk_shape);
+        let (cached, counts) = DailyGrouper::group_by_date_counted(files, &mut cache);
+        (fresh, cached, counts.parsed_files)
+    }
+
+    /// Real files not written in the last ten minutes — ones a live session is
+    /// unlikely to touch while a comparison runs.
+    fn quiet_files(files: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+        let quiet = std::time::Duration::from_secs(600);
+        let now = std::time::SystemTime::now();
+        files
+            .into_iter()
+            .filter(|p| {
+                std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .is_some_and(|age| age >= quiet)
+            })
+            .collect()
+    }
+
+    /// Every per-slice field a view reads, keyed by day and transcript, with
+    /// maps sorted so HashMap order can't differ between two equal walks.
+    fn slice_digest(
         groups: &[crate::aggregator::DailyGroup],
-    ) -> crate::aggregator::TokenStats {
-        let mut g = crate::aggregator::TokenStats::default();
-        for group in groups {
-            for session in &group.sessions {
-                for ts in session.day_tokens_by_model.values() {
-                    g.merge(ts);
-                }
-            }
+    ) -> std::collections::BTreeMap<(chrono::NaiveDate, std::path::PathBuf), String> {
+        fn sorted<K: Ord + std::fmt::Debug, V: std::fmt::Debug>(
+            m: &std::collections::HashMap<K, V>,
+        ) -> String {
+            let mut v: Vec<_> = m.iter().collect();
+            v.sort_by(|a, b| a.0.cmp(b.0));
+            format!("{v:?}")
         }
-        g
+        groups
+            .iter()
+            .flat_map(|g| g.sessions.iter().map(move |s| (g.date, s)))
+            .map(|(date, s)| {
+                let digest = format!(
+                    "{:?}",
+                    (
+                        (s.day_input_tokens, s.day_output_tokens, sorted(&s.day_tokens_by_model)),
+                        (s.day_user_msgs, s.day_prompts, s.day_assistant_msgs),
+                        (s.day_tool_errors, s.day_tool_successes, s.line_churn),
+                        (sorted(&s.day_tool_usage), sorted(&s.day_language_usage)),
+                        (sorted(&s.day_extension_usage), sorted(&s.day_hourly_activity)),
+                        (sorted(&s.day_hourly_work_tokens), s.day_first_timestamp, s.day_last_timestamp),
+                        (&s.project_name, &s.git_branch, &s.model, s.is_subagent, &s.parent_path),
+                        (&s.summary, &s.custom_title, &s.ai_title),
+                        (&s.first_user_message, &s.last_user_message, &s.verified_cwd),
+                        (s.session_first_timestamp, s.is_continued),
+                    )
+                );
+                ((date, s.file_path.clone()), digest)
+            })
+            .collect()
     }
 
     #[test]
@@ -78,6 +131,10 @@ mod tests {
     /// The developer's cache, read but never written: `load_data` saves the
     /// cache it aggregates with, and a test build with a different
     /// `CACHE_VERSION` would leave the installed release a cache it rejects.
+    fn files_walked(data: &LoadedData) -> usize {
+        data.cache_stats.cached_files + data.cache_stats.parsed_files
+    }
+
     fn real_cache_read_only() -> crate::infrastructure::Cache {
         crate::infrastructure::Cache::load() // lint-ok: real-cache
             .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty())
@@ -87,24 +144,17 @@ mod tests {
     #[test]
     fn test_load_data_performance() {
         let result = load_data_with(20, real_cache_read_only()).unwrap();
-        if result.file_count == 0 {
+        if files_walked(&result) == 0 {
             return; // No data available (CI environment)
         }
-        assert!(result.file_count <= 20);
+        assert!(files_walked(&result) <= 20);
     }
 
     #[test]
     #[ignore] // Deletes cache file — run manually with `cargo test -- --ignored`
     fn test_cache_speedup() {
-        std::fs::remove_file(
-            std::path::PathBuf::from(
-                std::env::var("HOME")
-                    .or_else(|_| std::env::var("USERPROFILE"))
-                    .unwrap_or_else(|_| "/tmp".to_string()),
-            )
-            .join(".ccsight/cache.json"),
-        )
-        .ok();
+        // Every version's file: the run below reads the current one.
+        let _ = crate::infrastructure::Cache::clear_all();
 
         let start1 = Instant::now();
         let result1 = load_data(20).unwrap(); // lint-ok: real-cache
@@ -112,7 +162,7 @@ mod tests {
         // No ~/.claude data on this runner → nothing to cache or time; no-op
         // like the other real-data #[ignore] tests so the release ignored-test
         // job stays green on a clean runner.
-        if result1.file_count == 0 {
+        if files_walked(&result1) == 0 {
             return;
         }
         let _cache1 = result1.cache_stats;
@@ -132,11 +182,10 @@ mod tests {
     #[test]
     fn test_load_data_integration() {
         let result = load_data_with(5, real_cache_read_only()).unwrap();
-        if result.file_count == 0 {
+        if files_walked(&result) == 0 {
             return; // No data available (CI environment)
         }
 
-        assert!(!result.stats.daily_activity.is_empty());
         assert!(!result.stats.project_stats.is_empty());
         assert!(
             result.models_without_pricing.is_empty(),
@@ -151,14 +200,13 @@ mod tests {
         }
     }
 
-    /// Real-data twin of `stats_and_grouper_agree_on_fixture`: both aggregation
-    /// paths must agree EXACTLY over `~/.claude`. Exact, not fuzzy — a tolerance
-    /// encodes one machine's data size and write rate and hides regressions.
-    /// Recently written files are excluded (live sessions) and the rest are
-    /// identity-checked afterwards; if any moved, the run is inconclusive.
+    /// Real-data twin of `fresh_and_cached_walks_agree_on_fixture`: a fresh
+    /// parse and a rebuild from the cache it wrote must agree EXACTLY over
+    /// `~/.claude`. Recently written files are excluded (live sessions) and the
+    /// rest are identity-checked afterwards; if any moved, the run is inconclusive.
     #[test]
     #[ignore = "real-data agreement check — reads all of ~/.claude; run via --ignored"]
-    fn test_stats_and_grouper_agree_on_token_totals() {
+    fn test_fresh_and_cached_walks_agree_on_real_data() {
         use std::time::{Duration, SystemTime};
         // A filter, not a tolerance: a file untouched this long is unlikely to
         // be mid-write, and the post-run identity check catches any that was.
@@ -180,12 +228,7 @@ mod tests {
         let before: Vec<_> = files.iter().map(|p| identity(p)).collect();
 
         let started = Instant::now();
-        let cache = real_cache_read_only();
-        let (stats, _, cache) =
-            crate::aggregator::StatsAggregator::aggregate_with_shared_cache(&files, cache);
-        let mut cache = Some(cache);
-        let groups =
-            crate::aggregator::DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
+        let (fresh, cached, reparsed) = fresh_then_cached(&files);
         let elapsed = started.elapsed();
 
         let moved = files
@@ -205,14 +248,14 @@ mod tests {
             elapsed.as_secs_f64()
         );
         assert!(
-            moved == 0,
+            moved == 0 && reparsed == 0,
             "inconclusive: {moved} file(s) changed while the passes ran, so the totals are \
              not comparable — nothing is claimed either way. Re-run when no session is writing."
         );
         assert_eq!(
-            sum_grouper_tokens(&groups),
-            stats.total_tokens,
-            "aggregation paths diverged on a frozen input set"
+            slice_digest(&fresh),
+            slice_digest(&cached),
+            "a cache rebuild diverged from the fresh parse on a frozen input set"
         );
     }
 
@@ -220,7 +263,7 @@ mod tests {
     #[ignore = "perf measurement — run via --ignored --nocapture"]
     fn measure_per_tab_draw() {
         let data = load_data_with(0, real_cache_read_only()).unwrap();
-        if data.file_count == 0 {
+        if files_walked(&data) == 0 {
             return;
         }
         let mut state = crate::AppState::new_initial(0);
@@ -284,10 +327,10 @@ mod tests {
     /// Deterministic, fast per-commit twin of the real-data check above. A
     /// fixture exercises the divergence-prone paths: cross-file
     /// `(msg_id, requestId)` dedup, a subagent (`isSidechain`), the cache
-    /// 5m/1h split, two models. Static data → the paths must agree EXACTLY
-    /// and the deduped totals are known, so it also pins absolute correctness.
+    /// 5m/1h split, two models. Static data → fresh and cached must agree
+    /// EXACTLY and the deduped totals are known, so it also pins absolute values.
     #[test]
-    fn stats_and_grouper_agree_on_fixture() {
+    fn fresh_and_cached_walks_agree_on_fixture() {
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("ccsight_agree_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -334,32 +377,11 @@ mod tests {
         .unwrap();
 
         let files = vec![file_a, file_b];
-        let (stats, _, _) = StatsAggregator::aggregate_with_shared_cache(
-            &files,
-            crate::infrastructure::Cache::new_empty(),
-        );
-        let mut cache = Some(crate::infrastructure::Cache::new_empty());
-        let groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
-
-        let g = sum_grouper_tokens(&groups);
+        let (groups, cached, reparsed) = fresh_then_cached(&files);
+        assert_eq!(reparsed, 0, "the second walk re-parsed instead of hitting");
+        assert_eq!(slice_digest(&groups), slice_digest(&cached), "cache rebuild diverged");
+        let stats = crate::aggregator::Stats::from_groups(&groups);
         let s = &stats.total_tokens;
-
-        // Deterministic data → the two paths must agree EXACTLY.
-        assert_eq!(g.input_tokens, s.input_tokens, "input agreement");
-        assert_eq!(g.output_tokens, s.output_tokens, "output agreement");
-        assert_eq!(
-            g.cache_creation_tokens, s.cache_creation_tokens,
-            "cache_w agreement"
-        );
-        assert_eq!(g.cache_read_tokens, s.cache_read_tokens, "cache_r agreement");
-        assert_eq!(
-            g.cache_creation_5m_tokens, s.cache_creation_5m_tokens,
-            "cache_5m agreement"
-        );
-        assert_eq!(
-            g.cache_creation_1h_tokens, s.cache_creation_1h_tokens,
-            "cache_1h agreement"
-        );
 
         // Absolute totals after dedup (req-1/msg-1 counted once):
         // input 1000+50+100, output 500+20+40, cache_w 300, cache_r 200.
@@ -370,10 +392,9 @@ mod tests {
         assert_eq!(s.cache_creation_5m_tokens, 200, "5m split");
         assert_eq!(s.cache_creation_1h_tokens, 100, "1h split");
 
-        // Overview's total (priced once per model from StatsAggregator) and
-        // the Costs panel's sum (priced per session-day-model from
-        // DailyGrouper) are independent paths the token checks above don't
-        // cover — pin that they reconcile to the same total.
+        // Overview's total (priced once per model over the folded totals) and
+        // the Costs panel's sum (priced per session-day-model) round
+        // differently — pin that they reconcile to the same total.
         let calculator = CostCalculator::global();
         let overview_cost: f64 = calculator
             .calculate_costs_by_model(&stats.model_tokens)
@@ -389,68 +410,6 @@ mod tests {
         assert!(
             (overview_cost - daily_panel_cost).abs() < 0.001,
             "Overview cost {overview_cost} must match Costs-panel sum {daily_panel_cost}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Cross-path cache consistency: StatsAggregator and DailyGrouper must write
-    /// IDENTICAL per-day `CachedDailyStats` (one path's cache is read by the other).
-    /// The token-agreement tests check only token TOTALS; this pins EVERY per-day
-    /// field (tool_usage, language, msgs, hourly) so a future `fold_entry` merge of
-    /// the two entry-walk loops can't silently diverge them.
-    #[test]
-    fn both_paths_write_identical_cached_daily_stats() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("ccsight_harness_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("proj.jsonl");
-        let mut f = std::fs::File::create(&file).unwrap();
-        // User turn + assistant carrying usage AND a ToolUse(Read x.rs): exercises
-        // user_msgs / assistant_msgs / tool_usage / language / extension / tokens
-        // / hourly — the per-day fields the two loops populate via different code.
-        writeln!(
-            f,
-            r#"{{"type":"user","uuid":"u1","timestamp":"2026-01-01T10:00:00Z","sessionId":"s","cwd":"/tmp/proj","message":{{"role":"user","content":"hi"}}}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T10:00:01Z","sessionId":"s","requestId":"r1","message":{{"id":"m1","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"tool_use","id":"t1","name":"Read","input":{{"file_path":"/tmp/x.rs"}}}}],"usage":{{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":30,"cache_read_input_tokens":20,"cache_creation":{{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":10}}}}}}}}"#
-        )
-        .unwrap();
-        // NOTE: a synthetic-model (`<...>`) ToolUse would diverge — DailyGrouper
-        // counts its tool while StatsAggregator's is_real_model `continue` skips
-        // it (stats.rs's documented intent). That combo doesn't occur in real
-        // data (synthetic entries carry no tool_use), so it stays latent; a
-        // fold_entry merge must pick one behavior and extend this fixture.
-        let files = vec![file.clone()];
-
-        // StatsAggregator consumes its cache; persist to a temp file and read back.
-        let temp_stats = dir.join("stats_cache.json");
-        let _ = StatsAggregator::aggregate_with_shared_cache(
-            &files,
-            crate::infrastructure::Cache::empty_at(temp_stats.clone()),
-        );
-        let stats_data: crate::infrastructure::CacheData =
-            serde_json::from_str(&std::fs::read_to_string(&temp_stats).unwrap()).unwrap();
-
-        // DailyGrouper takes `&mut Option<Cache>`; inspect it in-memory.
-        let mut group_cache =
-            Some(crate::infrastructure::Cache::empty_at(dir.join("group_cache.json")));
-        let _ = DailyGrouper::group_by_date_with_shared_cache(&files, &mut group_cache);
-        let group_cache = group_cache.unwrap();
-
-        let key = file.to_string_lossy().to_string();
-        let stats_daily = &stats_data.files[&key].daily_stats;
-        let group_daily = &group_cache.get(&file).unwrap().daily_stats;
-
-        // Order-independent (HashMaps): compare serialized JSON values.
-        assert_eq!(
-            serde_json::to_value(stats_daily).unwrap(),
-            serde_json::to_value(group_daily).unwrap(),
-            "StatsAggregator vs DailyGrouper per-day CachedDailyStats diverge"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -501,82 +460,27 @@ mod tests {
         sample
     }
 
-    #[test]
-    fn stats_pass_cache_satisfies_grouper_hit_precondition() {
-        // Cold-start single-parse invariant: after the stats pass, every
-        // file's cache entry must validate AND carry daily_stats — the two
-        // conditions the grouper's hit path checks. If either fails, the
-        // grouper silently re-parses everything the stats pass just parsed.
-        let dir = std::env::temp_dir().join(format!("ccsight-handoff-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("s.jsonl");
-        std::fs::write(
-            &file,
-            r#"{"type":"assistant","uuid":"u1","timestamp":"2026-01-01T10:00:00Z","sessionId":"s","requestId":"r1","message":{"id":"m1","role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
-        )
-        .unwrap();
-        let files = vec![file.clone()];
-
-        let (_stats, cache_stats, cache) = StatsAggregator::aggregate_with_shared_cache(
-            &files,
-            crate::infrastructure::Cache::new_empty(),
-        );
-        assert_eq!(cache_stats.parsed_files, 1);
-        assert!(
-            cache.is_valid(&file),
-            "stats-written entry must validate for the grouper"
-        );
-        assert!(
-            !cache.get(&file).unwrap().daily_stats.is_empty(),
-            "daily_stats must be populated so the grouper hit path engages"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Real-data agreement check kept in the per-commit gate by running the two
-    /// aggregators over a SAMPLE of real files (not `load_data`-ing everything).
-    /// Catches shapes the hand-built fixture can't anticipate; no-ops on CI.
-    /// The fixture twin guards CI + pins absolute values; the pre-push hook runs
+    /// Real-data twin kept in the per-commit gate: fresh vs cached over a
+    /// SAMPLE of real files (not `load_data`-ing everything). Catches shapes the
+    /// hand-built fixture can't anticipate; no-ops on CI. The pre-push hook runs
     /// the `#[ignore]`d exhaustive all-files version over ALL of `~/.claude`.
     #[test]
-    fn stats_and_grouper_agree_on_sampled_real_files() {
+    fn fresh_and_cached_walks_agree_on_sampled_real_files() {
         // Small sample keeps this in the per-commit gate; the time-seeded
         // randomness broadens shape coverage across runs.
-        let sample = sample_real_jsonl(12, 2);
+        let sample = quiet_files(sample_real_jsonl(12, 2));
         if sample.is_empty() {
             return;
         }
-        let (stats, _, _) = StatsAggregator::aggregate_with_shared_cache(
-            &sample,
-            crate::infrastructure::Cache::new_empty(),
-        );
-        let mut cache = Some(crate::infrastructure::Cache::new_empty());
-        let groups = DailyGrouper::group_by_date_with_shared_cache(&sample, &mut cache);
-
-        let g = sum_grouper_tokens(&groups);
-        let s = &stats.total_tokens;
-        let pairs: [(u64, u64, &str); 6] = [
-            (g.input_tokens, s.input_tokens, "input"),
-            (g.output_tokens, s.output_tokens, "output"),
-            (g.cache_creation_tokens, s.cache_creation_tokens, "cache_w"),
-            (g.cache_read_tokens, s.cache_read_tokens, "cache_r"),
-            (g.cache_creation_5m_tokens, s.cache_creation_5m_tokens, "cache_5m"),
-            (g.cache_creation_1h_tokens, s.cache_creation_1h_tokens, "cache_1h"),
-        ];
-        for (gv, sv, name) in pairs {
-            let max = gv.max(sv);
-            let diff = gv.abs_diff(sv);
-            // 0.5% + 1024 floor: a live ccsight session can mutate a sampled
-            // file between the two aggregator passes; real regressions are
-            // multi-megatoken, so this stays sharp.
-            let allowed = (max / 200).max(1024);
-            assert!(
-                diff <= allowed,
-                "{name}: grouper={gv} stats={sv} diff={diff} > allowed={allowed} \
-                 — the two aggregation paths diverged on sampled real files."
-            );
+        let (fresh, cached, reparsed) = fresh_then_cached(&sample);
+        if reparsed > 0 {
+            return; // A sampled file changed between the walks: inconclusive.
         }
+        assert_eq!(
+            slice_digest(&fresh),
+            slice_digest(&cached),
+            "a cache rebuild diverged from the fresh parse on sampled real files"
+        );
     }
 
     #[test]
@@ -760,7 +664,7 @@ mod tests {
     #[test]
     fn test_render_text_with_highlighting() {
         let text = "Hello\n```rust\nfn main() {\n    println!(\"test\");\n}\n```\nWorld";
-        let (lines, flags) = render_text_with_highlighting(text, 80);
+        let (lines, flags) = render_text_with_highlighting(text, 80, usize::MAX);
 
         println!("Rendered {} lines:", lines.len());
         for (i, line) in lines.iter().enumerate() {
@@ -809,7 +713,7 @@ mod tests {
 
         assert!(found_code, "Should find at least one code block");
 
-        let (lines, _flags) = render_text_with_highlighting(text, 80);
+        let (lines, _flags) = render_text_with_highlighting(text, 80, usize::MAX);
         println!("\nRendered {} lines", lines.len());
 
         let all_text: String = lines
@@ -1398,9 +1302,8 @@ mod tests {
     }
 
     // ── Property tests: aggregation totals ─────────────────────────────────────
-    // A third, independent oracle alongside the StatsAggregator↔DailyGrouper
-    // differential: both share one entry-walk, so a bug there moves them in
-    // lockstep.
+    // An independent oracle alongside the fresh-vs-cached differential: both
+    // come from the one entry walk, so a bug there moves them in lockstep.
     mod agg_prop {
         use proptest::prelude::*;
 
@@ -1408,7 +1311,7 @@ mod tests {
             #![proptest_config(ProptestConfig::with_cases(48))]
 
             // Independent per-entry re-sum (computed here, via neither
-            // aggregator) equals StatsAggregator's total. Unique request/message
+            // aggregator) equals the folded total. Unique request/message
             // ids prevent dedup so every usage bills once; the cache_creation
             // breakdown is always present so 5m/1h take the structured branch
             // (input/output/cw/cr/e5/e1 are then independent and sum exactly).
@@ -1450,14 +1353,14 @@ mod tests {
                 }
                 drop(f);
                 let files = vec![file];
-                let (stats, _, _) = crate::aggregator::StatsAggregator::aggregate_with_shared_cache(
-                    &files,
-                    crate::infrastructure::Cache::new_empty(),
-                );
-                let (stats2, _, _) = crate::aggregator::StatsAggregator::aggregate_with_shared_cache(
-                    &files,
-                    crate::infrastructure::Cache::new_empty(),
-                );
+                let walk = || {
+                    let mut cache = Some(crate::infrastructure::Cache::new_empty());
+                    crate::aggregator::Stats::from_groups(
+                        &crate::aggregator::DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache),
+                    )
+                };
+                let stats = walk();
+                let stats2 = walk();
                 let _ = std::fs::remove_dir_all(&dir);
                 let t = &stats.total_tokens;
                 prop_assert_eq!(t.input_tokens, ni, "input");
@@ -1527,6 +1430,108 @@ mod tests {
             is_live: true,
             was_recently_live: false,
         }
+    }
+
+    #[test]
+    fn a_wheel_in_a_single_pane_live_mode_stays_on_that_panes_rows() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = Tab::Live;
+        state.live_active = vec![live("a"), live("b")];
+        state.live_paused = vec![live("p")];
+        state.live_pane_mode = crate::LivePaneMode::ActiveOnly;
+        state.live_selected = 1;
+        crate::handlers::mouse::handle_mouse_scroll(&mut state, 5, 5, false);
+        assert_eq!(state.live_selected, 1, "wheel reached a hidden paused row");
+
+        state.live_pane_mode = crate::LivePaneMode::PausedOnly;
+        state.live_selected = 2;
+        crate::handlers::mouse::handle_mouse_scroll(&mut state, 5, 5, true);
+        assert_eq!(state.live_selected, 2, "wheel reached a hidden active row");
+    }
+
+    // A click-away closes the search exactly as Esc does: a result set left
+    // behind a closed popup keeps a file scan running and the ↑ history
+    // cursor mid-walk.
+    #[test]
+    fn a_click_away_closes_the_search_like_esc() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.search_mode = true;
+        state.search_select_all = true;
+        state.search_saved_state = Some((Tab::Insights, 0, 0, false));
+        dismiss_overlay(&mut state);
+        assert!(!state.search_mode);
+        assert!(!state.search_select_all);
+        assert!(state.tab == Tab::Insights, "back where `/` was pressed");
+    }
+
+    // A result list emptied while a hit was previewed (a data reload clears
+    // it) comes back filled for the query, not blank until the next edit.
+    #[test]
+    fn returning_from_a_preview_refills_an_emptied_result_list() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::Local::now().date_naive();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(
+            day,
+            vec![make_session("~/proj-x", None, None)],
+        )]);
+        state.search_input.set("proj-x".to_string());
+        state.search_saved_state = Some((Tab::Dashboard, 0, 0, false));
+        state.search_preview_mode = true;
+        state.show_conversation = true;
+        state.search_results.clear();
+        return_to_search(&mut state);
+        assert!(state.search_mode);
+        assert_eq!(state.search_results.len(), 1, "the query's hits are back");
+    }
+
+    // Opening a hit leaves the content search running, so its later hits are
+    // in the list on the way back.
+    #[test]
+    fn opening_a_search_hit_keeps_the_content_search_running() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session};
+        let day = chrono::Local::now().date_naive();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![make_daily_group(
+            day,
+            vec![make_session("~/proj-x", None, None)],
+        )]);
+        state.search_input.set("proj-x".to_string());
+        crate::rerun_search(&mut state, |_| {});
+        let (_tx, rx) = mpsc::channel();
+        state.search_task = Some((rx, state.search_input.text.clone()));
+        state.searching = true;
+        crate::handlers::keyboard::open_search_hit(&mut state, |_| {});
+        assert!(state.search_task.is_some() && state.searching);
+    }
+
+    #[test]
+    fn closing_a_search_preview_returns_to_the_results_and_q_ends_it() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        let enter_preview = |state: &mut AppState| {
+            state.search_saved_state = Some((Tab::Insights, 0, 0, false));
+            state.search_preview_mode = true;
+            state.show_conversation = true;
+            state.tab = Tab::Daily;
+            state.panes = vec![crate::ConversationPane::default()];
+            state.active_pane_index = Some(0);
+        };
+        enter_preview(&mut state);
+        dismiss_overlay(&mut state);
+        assert!(state.search_mode, "click-away skipped the result list");
+        assert!(!state.show_conversation);
+
+        state.search_mode = false;
+        enter_preview(&mut state);
+        crate::handlers::keyboard::handle_conversation_key(
+            &mut state,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('Q')),
+            |_| {},
+            |_| {},
+            |_, _| None,
+            |_| 0,
+        );
+        assert!(!state.show_conversation);
+        assert!(!state.search_preview_mode);
+        assert!(state.search_saved_state.is_none(), "a later `/` would restore it");
     }
 
     /// Deliver one Live poll whose active rows arrive in `order`.
@@ -1626,7 +1631,6 @@ mod tests {
             models_without_pricing: Default::default(),
             daily_groups: groups,
             daily_costs: Vec::new(),
-            file_count: 0,
             cache_stats: crate::aggregator::CacheStats {
                 cached_files: 0,
                 parsed_files: 0,
@@ -1640,4 +1644,171 @@ mod tests {
         assert_eq!(state.selected_day, 1, "left its day when a new one arrived");
         assert_eq!(state.selected_session, 0, "stayed on an index, not on /b");
     }
+}
+
+/// A reload delivering `groups`, inside the index-build throttle so the
+/// reload does not write the developer's real index.
+fn deliver_reload(state: &mut AppState, groups: Vec<crate::aggregator::DailyGroup>) {
+    state.last_index_build = Some(Instant::now());
+    let data = LoadedData {
+        stats: Default::default(),
+        cost: 0.0,
+        model_costs: Vec::new(),
+        aggregated_model_tokens: Default::default(),
+        models_without_pricing: Default::default(),
+        daily_groups: groups,
+        daily_costs: Vec::new(),
+        cache_stats: crate::aggregator::CacheStats {
+            cached_files: 0,
+            parsed_files: 0,
+        },
+    };
+    let (tx, rx) = mpsc::channel();
+    tx.send(Ok(data)).unwrap();
+    state.data_reload_task = Some(rx);
+    poll_data_reload_task(state);
+}
+
+fn session_at(path: &str, title: Option<&str>) -> crate::aggregator::SessionInfo {
+    let mut s = crate::test_helpers::helpers::make_session("~/projects/a", None, None);
+    s.file_path = std::path::PathBuf::from(path);
+    s.custom_title = title.map(str::to_string);
+    s
+}
+
+// Where `/` was pressed follows its day and session through a reload, so Esc
+// returns there even after a new day pushed the old one down the list.
+#[test]
+fn the_search_origin_follows_its_session_through_a_reload() {
+    use crate::test_helpers::helpers::{make_daily_group, make_test_app_state};
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(); // lint-ok: date-literal
+    let mut state = make_test_app_state(vec![make_daily_group(
+        day,
+        vec![session_at("/a", None), session_at("/b", None)],
+    )]);
+    state.search_input.set("zzz".to_string());
+    state.search_saved_state = Some((Tab::Daily, 0, 1, false));
+    state.search_preview_mode = true;
+    deliver_reload(
+        &mut state,
+        vec![
+            make_daily_group(day + chrono::Duration::days(1), vec![session_at("/new", None)]),
+            make_daily_group(day, vec![session_at("/b", None), session_at("/a", None)]),
+        ],
+    );
+    let (_, d, s, _) = state.search_saved_state.unwrap();
+    assert_eq!((d, s), (1, 0), "still on /b of the original day");
+}
+
+// A content hit under the cursor before a reload is under it again once the
+// rebuilt list's content hits arrive.
+#[test]
+fn a_reload_keeps_the_cursor_on_a_content_hit() {
+    use crate::test_helpers::helpers::{make_daily_group, make_test_app_state};
+    let day = chrono::Local::now().date_naive();
+    let groups = || {
+        vec![make_daily_group(
+            day,
+            vec![
+                session_at("/a", Some("needle a")),
+                session_at("/b", Some("needle b")),
+                session_at("/c", None),
+            ],
+        )]
+    };
+    let mut state = make_test_app_state(groups());
+    state.search_input.set("needle".to_string());
+    state.search_mode = true;
+    let content_hit = || crate::search::SearchResult {
+        day_idx: 0,
+        session_idx: 2,
+        snippet: None,
+        match_type: crate::search::SearchMatchType::Content,
+        session_path: Some("/c".to_string()),
+        message_date: None,
+    };
+    crate::rerun_search(&mut state, |_| {});
+    state.search_results.push(content_hit());
+    state.search_selected = 2;
+
+    deliver_reload(&mut state, groups());
+    assert_eq!(state.search_reselect.as_deref(), Some(std::path::Path::new("/c")));
+    let (tx, rx) = mpsc::channel();
+    tx.send(vec![content_hit()]).unwrap();
+    state.search_task = Some((rx, state.search_input.text.clone()));
+    poll_search_task(&mut state);
+    assert_eq!(state.search_selected, 2, "back on /c, not on the first row");
+    assert!(state.search_reselect.is_none());
+}
+
+// A reader at the bottom of a growing transcript stays at its bottom across
+// a reload, even when the last row is an expanded tool run far taller than
+// the pane; one reading higher up keeps the old place.
+#[test]
+fn a_reload_keeps_the_bottom_in_view_when_the_reader_was_there() {
+    use crate::{ConversationBlock, ConversationMessage, ConversationPane};
+    let msg = |blocks: Vec<ConversationBlock>| ConversationMessage {
+        role: "assistant".to_string(),
+        blocks,
+        timestamp: Some("10:00".to_string()),
+        timestamp_utc: None,
+        model: None,
+        tokens: None,
+        billed: Vec::new(),
+    };
+    let run = |lines: usize| {
+        msg(vec![ConversationBlock::ToolResult {
+            tool_use_id: String::new(),
+            content: (0..lines).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n"),
+            is_error: false,
+        }])
+    };
+    let draw = |state: &mut crate::AppState| {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, state)).unwrap();
+    };
+    let reload = |state: &mut crate::AppState, lines: usize| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(std::sync::Arc::new(vec![
+            msg(vec![ConversationBlock::Text("hello".into())]),
+            run(lines),
+        ]))
+        .unwrap();
+        state.panes[0].load_task = Some(rx);
+        poll_pane_loads(state);
+        draw(state);
+    };
+    let at_bottom = |state: &crate::AppState| {
+        let pane = &state.panes[0];
+        let total = pane.rendered.as_ref().map_or(0, |r| r.0.len());
+        pane.scroll + pane.last_visible_height.unwrap_or(0) >= total
+    };
+
+    let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+    state.show_conversation = true;
+    let mut pane = ConversationPane {
+        messages: std::sync::Arc::new(vec![
+            msg(vec![ConversationBlock::Text("hello".into())]),
+            run(100),
+        ]),
+        ..Default::default()
+    };
+    pane.expanded.insert(1);
+    state.panes = vec![pane];
+    state.active_pane_index = Some(0);
+    draw(&mut state);
+    // On the last row, scrolled to its end.
+    state.panes[0].selected_message = 1;
+    state.panes[0].scroll = usize::MAX - 1;
+    draw(&mut state);
+    assert!(at_bottom(&state), "fixture starts at the bottom");
+
+    reload(&mut state, 150);
+    assert!(at_bottom(&state), "followed to the new bottom");
+
+    state.panes[0].scroll = 10;
+    draw(&mut state);
+    reload(&mut state, 200);
+    assert!(!at_bottom(&state), "a reader higher up is not dragged down");
 }

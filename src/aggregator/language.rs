@@ -1,6 +1,6 @@
 //! Filename / extension / glob → programming-language classification.
 //!
-//! Used by `StatsAggregator` (to attribute Read/Edit/Write/Glob/Grep tool calls
+//! Used by the entry walk (to attribute Read/Edit/Write/Glob/Grep tool calls
 //! to a language) and by the Languages panel UI (to decide whether an extension
 //! is "known" or should be displayed as a raw `.xyz` row). Lives in its own
 //! module so the 250 lines of static lookup tables don't drown out the actual
@@ -361,6 +361,65 @@ pub(crate) fn parse_extensions_from_glob(pattern: &str) -> Vec<String> {
     clean_ext(filename).into_iter().collect()
 }
 
+/// Language a tool call touches, read off its path / glob / type argument.
+pub(crate) fn from_tool_input(tool_name: &str, input: &serde_json::Value) -> Option<&'static str> {
+    match tool_name {
+        "Read" | "Edit" | "Write" | "MultiEdit" => {
+            let path = input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())?;
+            from_path(path)
+        }
+        "NotebookEdit" => {
+            let path = input.get("notebook_path").and_then(|v| v.as_str())?;
+            from_path(path)
+        }
+        "Glob" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str())?;
+            from_glob_pattern(pattern)
+        }
+        "Grep" => {
+            let glob = input.get("glob").and_then(|v| v.as_str());
+            if let Some(g) = glob {
+                return from_glob_pattern(g);
+            }
+            let type_filter = input.get("type").and_then(|v| v.as_str())?;
+            from_type_filter(type_filter)
+        }
+        _ => None,
+    }
+}
+
+/// Raw extensions a tool call touches, for the unknown-extension rows.
+pub(crate) fn extensions_from_tool_input(
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Vec<String> {
+    match tool_name {
+        "Read" | "Edit" | "Write" | "MultiEdit" => {
+            let path = input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str());
+            path.and_then(extension_from_path).into_iter().collect()
+        }
+        "NotebookEdit" => {
+            let path = input.get("notebook_path").and_then(|v| v.as_str());
+            path.and_then(extension_from_path).into_iter().collect()
+        }
+        "Glob" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str());
+            pattern.map(parse_extensions_from_glob).unwrap_or_default()
+        }
+        "Grep" => {
+            let glob = input.get("glob").and_then(|v| v.as_str());
+            glob.map(parse_extensions_from_glob).unwrap_or_default()
+        }
+        _ => vec![],
+    }
+}
+
 #[cfg(test)]
 mod glob_ext_tests {
     use super::parse_extensions_from_glob as p;
@@ -454,5 +513,109 @@ mod path_ext_tests {
     fn extensionless_files_are_none() {
         assert_eq!(e("README"), None);
         assert_eq!(e("LICENSE"), None);
+    }
+}
+
+#[cfg(test)]
+mod tool_input_tests {
+    use super::*;
+
+    #[test]
+    fn test_get_language_from_path_extensions() {
+        assert_eq!(from_path("/src/main.rs"), Some("Rust"));
+        assert_eq!(from_path("/app.tsx"), Some("TypeScript"));
+        assert_eq!(from_path("/script.py"), Some("Python"));
+        assert_eq!(from_path("/data.json"), Some("JSON"));
+        assert_eq!(from_path("/data.jsonl"), Some("JSON"));
+        assert_eq!(from_path("/style.scss"), Some("CSS"));
+        assert_eq!(from_path("/page.vue"), Some("Vue"));
+    }
+
+    #[test]
+    fn test_get_language_from_path_new_extensions() {
+        assert_eq!(from_path("/readme.txt"), Some("Text"));
+        assert_eq!(from_path("/data.csv"), Some("CSV"));
+        assert_eq!(from_path("/icon.png"), Some("Image"));
+        assert_eq!(from_path("/logo.svg"), Some("Image"));
+        assert_eq!(from_path("/notebook.ipynb"), Some("Jupyter"));
+        assert_eq!(from_path("/Cargo.lock"), Some("Lock"));
+        assert_eq!(from_path("/app.conf"), Some("Other"));
+        assert_eq!(from_path("/test.snap"), Some("Snapshot"));
+        assert_eq!(from_path("/template.hbs"), Some("Handlebars"));
+    }
+
+    #[test]
+    fn test_get_language_from_path_dotfiles() {
+        assert_eq!(from_path("/project/.gitignore"), Some("Other"));
+        assert_eq!(from_path("/project/.editorconfig"), Some("Other"));
+        assert_eq!(from_path("/project/.env"), Some("Other"));
+        assert_eq!(from_path("/project/.prettierrc"), Some("Other"));
+        assert_eq!(from_path("/project/.node-version"), Some("Other"));
+    }
+
+    #[test]
+    fn test_get_language_from_path_extensionless_files() {
+        assert_eq!(from_path("/project/Makefile"), Some("Makefile"));
+        assert_eq!(from_path("/project/Dockerfile"), Some("Docker"));
+        assert_eq!(from_path("/project/Gemfile"), Some("Ruby"));
+        assert_eq!(from_path("/project/Justfile"), Some("Makefile"));
+    }
+
+    #[test]
+    fn test_get_language_from_path_unknown_extensionless() {
+        assert_eq!(from_path("/project/LICENSE"), Some("Other"));
+        assert_eq!(from_path("/project/CHANGELOG"), Some("Other"));
+    }
+
+    #[test]
+    fn test_get_language_from_path_real_world_other() {
+        assert_eq!(from_path("/config.kdl"), Some("KDL"));
+        assert_eq!(from_path("/.envrc"), Some("Other"));
+        assert_eq!(from_path("/.env.example"), Some("Other"));
+        assert_eq!(from_path("/project/.claude"), Some("Other"));
+    }
+
+    #[test]
+    fn test_extract_language_glob_uses_pattern() {
+        let input = serde_json::json!({"pattern": "**/*.rs", "path": "/src"});
+        assert_eq!(from_tool_input("Glob", &input), Some("Rust"));
+    }
+
+    #[test]
+    fn test_extract_language_glob_brace_pattern() {
+        let input = serde_json::json!({"pattern": "**/*.{ts,js}", "path": "/src"});
+        assert_eq!(from_tool_input("Glob", &input), Some("TypeScript"));
+        let input2 = serde_json::json!({"pattern": "**/*.{json,yaml}", "path": "/"});
+        assert_eq!(from_tool_input("Glob", &input2), Some("JSON"));
+    }
+
+    #[test]
+    fn test_extract_language_grep_brace_glob() {
+        let input = serde_json::json!({"pattern": "TODO", "glob": "*.{js,json}"});
+        assert_eq!(from_tool_input("Grep", &input), Some("JavaScript"));
+    }
+
+    #[test]
+    fn test_extract_language_grep_uses_glob_field() {
+        let input = serde_json::json!({"pattern": "fn main", "glob": "*.py", "path": "/src"});
+        assert_eq!(from_tool_input("Grep", &input), Some("Python"));
+    }
+
+    #[test]
+    fn test_extract_language_grep_uses_type_filter() {
+        let input = serde_json::json!({"pattern": "fn main", "type": "rust", "path": "/src"});
+        assert_eq!(from_tool_input("Grep", &input), Some("Rust"));
+    }
+
+    #[test]
+    fn test_extract_language_grep_dir_only_returns_none() {
+        let input = serde_json::json!({"pattern": "fn main", "path": "/src"});
+        assert_eq!(from_tool_input("Grep", &input), None);
+    }
+
+    #[test]
+    fn test_extract_language_read_uses_file_path() {
+        let input = serde_json::json!({"file_path": "/src/main.rs"});
+        assert_eq!(from_tool_input("Read", &input), Some("Rust"));
     }
 }

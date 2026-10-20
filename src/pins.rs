@@ -21,15 +21,19 @@ pub struct PinEntry {
 }
 
 pub struct Pins {
-    data_path: PathBuf,
+    /// Where `save` writes. `Some` only for pins read from disk by `load`:
+    /// an in-memory set never overwrites a file it did not come from.
+    data_path: Option<PathBuf>,
     entries: Vec<PinEntry>,
     lookup: HashSet<PathBuf>,
 }
 
 impl Pins {
+    /// An in-memory set that `save` refuses to write: the fallback when the
+    /// pins file could not be read, and the set every test state starts with.
     pub fn empty() -> Self {
         Self {
-            data_path: Self::default_path().unwrap_or_else(|_| PathBuf::from("/dev/null")),
+            data_path: None,
             entries: Vec::new(),
             lookup: HashSet::new(),
         }
@@ -74,27 +78,24 @@ impl Pins {
         };
 
         Ok(Self {
-            data_path,
+            data_path: Some(data_path),
             entries,
             lookup,
         })
     }
 
     pub fn save(&self) -> Result<()> {
-        // Reject the `/dev/null` placeholder used by `Pins::empty()` when HOME is unset.
-        // Saving to /dev/null on Linux silently succeeds but never persists, masking the
-        // failure. Surface it as an error so callers can inform the user.
-        if self.data_path.as_os_str() == "/dev/null" {
+        let Some(path) = &self.data_path else {
             return Err(anyhow::anyhow!(
-                "Cannot save pins: HOME is not set (data_path is /dev/null fallback)"
+                "pins were not read from disk; not saving over the pins file"
             ));
-        }
+        };
         let data = PinsData {
             version: PINS_VERSION,
             pins: self.entries.clone(),
         };
         let bytes = serde_json::to_vec(&data)?;
-        crate::infrastructure::atomic_write(&self.data_path, &bytes)?;
+        crate::infrastructure::atomic_write(path, &bytes)?;
         Ok(())
     }
 
@@ -259,21 +260,14 @@ mod tests {
         assert_eq!(pins.entries[1].path, p1);
     }
 
+    // A set not read from disk (an unreadable pins file, every test state)
+    // must never write: saving it would replace the user's pins with it.
     #[test]
-    fn test_empty_pins_save_returns_error() {
-        // Regression: Pins::empty() falls back to /dev/null when HOME is unset. save()
-        // must return an error rather than silently writing to /dev/null.
-        let pins = Pins::empty();
-        if pins.data_path.as_os_str() == "/dev/null" {
-            let err = pins
-                .save()
-                .expect_err("save() should fail on /dev/null fallback");
-            assert!(
-                err.to_string().contains("HOME is not set"),
-                "error message should mention HOME, got: {err}"
-            );
-        }
-        // If HOME is set, default path is real and save would succeed; skip the assertion.
+    fn pins_not_read_from_disk_refuse_to_save() {
+        let mut pins = Pins::empty();
+        pins.toggle(Path::new("/tmp/a.jsonl"));
+        let err = pins.save().expect_err("an in-memory set must not save");
+        assert!(err.to_string().contains("not read from disk"), "{err}");
     }
 
     #[test]
@@ -288,7 +282,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut pins = Pins {
-            data_path: path.clone(),
+            data_path: Some(path.clone()),
             entries: Vec::new(),
             lookup: HashSet::new(),
         };

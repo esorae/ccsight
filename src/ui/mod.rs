@@ -1,5 +1,6 @@
 pub(crate) mod dashboard;
 mod insights;
+pub(crate) use insights::INSIGHTS_PANELS;
 
 use std::sync::OnceLock;
 
@@ -541,7 +542,6 @@ pub fn warmup_syntax_highlighting() {
     let _ = get_theme_set();
 }
 
-pub use crate::conversation::load_conversation;
 pub use crate::text::{TextSegment, parse_text_with_code_blocks};
 
 fn syntect_to_ratatui_color(color: syntect::highlighting::Color) -> Color {
@@ -752,7 +752,9 @@ pub fn render_tool_result_with_highlighting(
             wrap_flags.push(false);
         }
     } else {
-        let (wrapped, flags) = wrap_text_with_continuation(content, max_width);
+        // Only the first rows show; wrapping the rest of a long result is waste.
+        let head = content.lines().take(30).collect::<Vec<_>>().join("\n");
+        let (wrapped, flags) = wrap_text_with_continuation(&head, max_width);
         for line in wrapped.into_iter().take(30) {
             lines.push(Line::from(Span::styled(
                 line,
@@ -765,9 +767,12 @@ pub fn render_tool_result_with_highlighting(
     (lines, wrap_flags)
 }
 
+/// Renders at most `max_lines` lines: callers show only a message's head, and
+/// highlighting the tail of a long text is most of the cost.
 pub fn render_text_with_highlighting(
     text: &str,
     max_width: usize,
+    max_lines: usize,
 ) -> (Vec<Line<'static>>, Vec<bool>) {
     use crate::text::wrap_text_with_continuation;
 
@@ -780,13 +785,17 @@ pub fn render_text_with_highlighting(
     let mut wrap_flags = Vec::new();
 
     for segment in segments {
+        if lines.len() >= max_lines {
+            break;
+        }
         match segment {
             TextSegment::Plain(plain) => {
                 let (wrapped, flags) = wrap_text_with_continuation(&plain, max_width);
-                for line in wrapped {
-                    lines.push(highlight_xml_tags(&line));
+                let room = max_lines - lines.len();
+                for (line, flag) in wrapped.iter().zip(flags).take(room) {
+                    lines.push(highlight_xml_tags(line));
+                    wrap_flags.push(flag);
                 }
-                wrap_flags.extend(flags);
             }
             TextSegment::Code { lang, content } => {
                 lines.push(Line::from(Span::styled(
@@ -802,7 +811,8 @@ pub fn render_text_with_highlighting(
                     .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
                 let mut highlighter = HighlightLines::new(syntax, theme);
 
-                for code_line in content.lines().take(30) {
+                let room = max_lines.saturating_sub(lines.len());
+                for code_line in content.lines().take(room.min(30)) {
                     let spans = highlight_code_line(code_line, &mut highlighter, syntax_set);
                     lines.push(Line::from(spans));
                     wrap_flags.push(false);
@@ -823,6 +833,8 @@ pub fn render_text_with_highlighting(
             }
         }
     }
+    lines.truncate(max_lines);
+    wrap_flags.truncate(max_lines);
 
     (lines, wrap_flags)
 }
@@ -856,10 +868,13 @@ pub fn extract_message_text(msg: &ConversationMessage) -> String {
             ConversationBlock::ToolUse {
                 name,
                 input_summary,
+                ..
             } => {
                 parts.push(format!("[Tool: {name}] {input_summary}"));
             }
-            ConversationBlock::ToolResult { content, is_error } => {
+            ConversationBlock::ToolResult {
+                content, is_error, ..
+            } => {
                 let prefix = if *is_error { "[Error] " } else { "" };
                 parts.push(format!("{prefix}{content}"));
             }
@@ -1058,6 +1073,36 @@ fn apply_bg_ranges(
     out
 }
 
+/// Columns the loading logo walks across, split between its two sides.
+const LOGO_WALK_SPAN: usize = 8;
+/// Animation cycle by which every logo character has locked in.
+const LOGO_FORMED: usize = 12;
+/// Cycles the formed logo walks: whole round trips, so it stops at home.
+const LOGO_WALK: std::ops::Range<usize> = 14..112;
+
+/// Where the loading logo stands in its animation `cycle`: the left padding
+/// (of [`LOGO_WALK_SPAN`]) and, while it walks, the leg row for this step.
+/// It walks sideways once it has fully formed — out, back across, home to the
+/// centre — so the glitch-out that follows starts from where it formed.
+fn logo_walk(cycle: usize) -> (usize, Option<&'static str>) {
+    const LEGS: [&str; 2] = ["  ▘▘ ▝▝  ", "  ▝▝ ▘▘  "];
+    let home = LOGO_WALK_SPAN / 2;
+    if !LOGO_WALK.contains(&cycle) {
+        return (home, None);
+    }
+    let step = (cycle - LOGO_WALK.start) / 2;
+    let reach = home as isize;
+    let phase = (step % (4 * home)) as isize;
+    let offset = if phase <= reach {
+        phase
+    } else if phase <= 3 * reach {
+        2 * reach - phase
+    } else {
+        phase - 4 * reach
+    };
+    ((reach + offset) as usize, Some(LEGS[step % 2]))
+}
+
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
     state.layout.active_popup_area = None;
@@ -1065,6 +1110,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     state.layout.tools_panel_category_areas.clear();
     state.layout.mcp_server_row_areas.clear();
     state.layout.project_detail_row_areas.clear();
+    state.layout.cursor_row_areas.clear();
 
     let show_warning =
         state.retention_warning.is_some() && !state.retention_warning_dismissed && !state.loading;
@@ -1109,7 +1155,9 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         let fragment_chars = ['░', '▒', '▓', '█', '▄', '▀', '▌', '▐', '▖', '▗', '▘', '▝'];
 
         // Build logo from random fragments assembling into final form
-        // Animation cycle: 0-5 blank, 5-20 chaos starts, 20-80 lock-in, 80-120 visible, 120-150 fade out
+        // Animation cycle: blank, fragments, lock-in by `LOGO_FORMED`, then the
+        // walk (`LOGO_WALK`) and a pause, then the glitch-out from `fade_start`.
+        // A cached start finishes in seconds, so the logo forms early.
         let cycle_total = 150;
         let cycle = slow % cycle_total;
         let fade_start = 120;
@@ -1127,8 +1175,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
 
                     // Pseudo-random seed for this character position
                     let seed = (i * 17 + line_idx * 31 + 7) % 100;
-                    // Character locks in at this frame (spread across frames 20-80)
-                    let lock_frame = 20 + (seed * 60 / 100);
+                    // Each character locks in at its own frame before `LOGO_FORMED`.
+                    let lock_frame = 4 + seed * (LOGO_FORMED - 4) / 100;
 
                     // Glitch-out phase (frames 120-150): characters randomly break
                     if cycle >= fade_start {
@@ -1192,7 +1240,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
 
                         let color = theme::primary_with_intensity((shimmer as f64).min(1.17));
                         Span::styled(c.to_string(), Style::default().fg(color))
-                    } else if cycle >= 5 {
+                    } else if cycle >= 2 {
                         // Chaos phase - show random fragments that shift around
                         let chaos_seed = (slow + i * 13 + line_idx * 23) % fragment_chars.len();
                         let fragment = fragment_chars[chaos_seed];
@@ -1215,9 +1263,17 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                 .collect()
         };
 
-        let logo1_spans = build_logo_line(logo_lines[0], 0);
-        let logo2_spans = build_logo_line(logo_lines[1], 1);
-        let logo3_spans = build_logo_line(logo_lines[2], 2);
+        let (left, legs) = logo_walk(cycle);
+        let pad = |line: &str| {
+            format!(
+                "{}{line}{}",
+                " ".repeat(left),
+                " ".repeat(LOGO_WALK_SPAN.saturating_sub(left))
+            )
+        };
+        let logo1_spans = build_logo_line(&pad(logo_lines[0]), 0);
+        let logo2_spans = build_logo_line(&pad(logo_lines[1]), 1);
+        let logo3_spans = build_logo_line(&pad(legs.unwrap_or(logo_lines[2])), 2);
 
         // Claude Code style star field with spinner characters
         let star_chars = ['·', '✢', '✳', '✶', '✻', '✽'];
@@ -1413,6 +1469,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         insights::draw_insights_detail_popup(frame, area, state);
     }
 
+    if state.show_day_activity() {
+        draw_day_activity_popup(frame, area, state);
+    }
+
     if state.show_conversation {
         // The tab bar is not redrawn in conv view, so any tab-bar triggers
         // captured the last time draw_tabs ran are stale. They sit on the
@@ -1429,7 +1489,6 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
 
         if !state.panes.is_empty() {
             let pane_count = state.panes.len();
-            let min_pane_width = crate::MIN_PANE_WIDTH;
 
             // Dynamic session list width based on available space
             let session_list_width = if conv_area.width >= 100 {
@@ -1443,15 +1502,6 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             };
 
             let show_session_list = !state.session_list_hidden && session_list_width > 0;
-
-            let available_for_panes = if show_session_list {
-                conv_area.width.saturating_sub(session_list_width)
-            } else {
-                conv_area.width
-            };
-
-            let pane_width = available_for_panes / pane_count as u16;
-            let layout_too_narrow = pane_width < min_pane_width && pane_count > 1;
 
             let mut constraints = Vec::new();
             if show_session_list {
@@ -1491,14 +1541,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                     pane_area,
                     &mut state.panes[i],
                     is_active,
-                    &state.toast_time,
-                    layout_too_narrow,
                     selecting,
                     sessions,
                     &state.original_daily_groups,
                     &state.pins,
                     &state.project_labels,
                     &state.session_titles,
+                    state.animation_frame,
                 );
                 if is_active {
                     state.layout.conversation_content_area = ca;
@@ -1545,38 +1594,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         frame.render_widget(help_line, help_area);
 
         if state.show_detail() {
-            let fp = state
-                .active_pane_index
-                .and_then(|i| state.panes.get(i))
-                .and_then(|p| p.file_path.clone())
-                .or_else(|| crate::get_conv_session_file(state, state.selected_session));
-            let session = fp.and_then(|fp| {
-                state
-                    .original_daily_groups
-                    .iter()
-                    .find_map(|g| g.sessions.iter().find(|s| s.file_path == fp))
-            });
-            if let Some(session) = session {
-                let pinned = state.pins.is_pinned(&session.file_path);
-                let cumulative =
-                    compute_session_cumulative(&session.file_path, &state.original_daily_groups);
-                let pa = draw_session_detail(
-                    frame,
-                    area,
-                    session,
-                    " Space: pin  y: copy resume  s: summary  t: title  C: pane  ↑↓: scroll  i/Esc: close ",
-                    pinned,
-                    state.session_detail_scroll,
-                    &state.project_labels,
-                    &state.session_titles,
-                    &cumulative,
-                    crate::aggregator::day_subagent_spend(session, &state.original_daily_groups),
-                    None,
-                    state.session_detail_recent.as_deref(),
-                    state.resume_dir(&session.file_path).as_deref(),
-                );
-                state.layout.active_popup_area = Some(pa);
-            }
+            draw_detail_popup(frame, area, state);
         }
     }
 
@@ -1699,7 +1717,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     // which users mistook for a load failure when the span was hidden. The
     // cache / index spans below stay visible while loading.
     if !state.loading {
-        let session_count = crate::aggregator::distinct_user_session_count(&state.daily_groups);
+        let session_count = state.stats.total_sessions_count;
         spans.push(Span::styled(
             format!("  ·  {session_count} sessions"),
             Style::default().fg(dim),
@@ -2254,18 +2272,8 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Stash each frame's inner rect + scroll so mouse clicks resolve to a
     // session index. Active = rows 0..active_count; paused = global index
     // active_count + row.
-    let active_inner = ratatui::layout::Rect {
-        x: active_area.x + 1,
-        y: active_area.y + 1,
-        width: active_area.width.saturating_sub(2),
-        height: active_area.height.saturating_sub(2),
-    };
-    let paused_inner = ratatui::layout::Rect {
-        x: paused_area.x + 1,
-        y: paused_area.y + 1,
-        width: paused_area.width.saturating_sub(2),
-        height: paused_area.height.saturating_sub(2),
-    };
+    let active_inner = active_area.inner(ratatui::layout::Margin::new(1, 1));
+    let paused_inner = paused_area.inner(ratatui::layout::Margin::new(1, 1));
     // Only the visible pane(s) accept mouse hits — a hidden (zero-height) frame
     // must not resolve clicks to a row it isn't showing.
     state.layout.live_list_area =
@@ -2281,8 +2289,7 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ("?", "help"),
             ("q", "quit"),
             ("↑↓", "session"),
-            ("i", "info"),
-            ("Enter", "view"),
+            ("Enter", "info"),
             ("Space", "pin"),
             ("y", "copy-resume"),
             ("t", "title"),
@@ -2501,8 +2508,7 @@ fn draw_live_past(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ("?", "help"),
             ("q", "quit"),
             ("↑↓", "session"),
-            ("i", "info"),
-            ("Enter", "view"),
+            ("Enter", "info"),
             ("Space", "pin"),
             ("y", "copy-resume"),
             ("t", "title"),
@@ -2666,18 +2672,8 @@ fn render_live_row<'a>(
         } else {
             ("· ", theme::SUBDUED)
         }
-    } else if !is_active_section {
-        if s.was_recently_live {
-            ("⟳ ", theme::ACCENT)
-        } else {
-            ("⏸ ", theme::LABEL)
-        }
-    } else if s.status.as_deref() == Some("busy") {
-        ("🟢", theme::SUCCESS)
-    } else if crate::infrastructure::live_sessions::is_today(last, now) {
-        ("◉ ", theme::WARNING)
     } else {
-        ("○ ", theme::LABEL)
+        live_glyph(s, is_active_section, last, now)
     };
     // Polling cadence is coarser than 1s; collapse sub-minute to fixed. The
     // age is "time since the last conversation entry" — the transcript's
@@ -2781,26 +2777,12 @@ fn render_live_row<'a>(
         Span::styled(rank_str, rank_style),
         Span::styled(marker, marker_style),
     ];
-    if is_pinned {
-        line1_spans.push(Span::styled("*", Style::default().fg(theme::WARNING)));
-        line1_spans.push(Span::styled(
-            if is_continued { "»" } else { "·" },
-            Style::default().fg(if is_continued {
-                theme::PRIMARY
-            } else {
-                theme::SUCCESS
-            }),
-        ));
-    } else {
-        line1_spans.push(Span::styled(
-            if is_continued { " »" } else { " ·" },
-            Style::default().fg(if is_continued {
-                theme::PRIMARY
-            } else {
-                theme::SUCCESS
-            }),
-        ));
-    }
+    line1_spans.extend(pin_marks(
+        is_pinned,
+        is_continued,
+        Style::default().fg(theme::WARNING),
+        continued_color(is_continued),
+    ));
     line1_spans.push(Span::styled(glyph, Style::default().fg(glyph_color)));
     line1_spans.push(Span::styled(
         format!(" {age:>9}  "),
@@ -2843,47 +2825,31 @@ fn render_live_row<'a>(
         cost_style_marked(session_cost, session_unpriced),
     ));
     // Model badge is the lowest-priority trailing element — drop it
-    // entirely on rows so tight that even `[i]` would otherwise be clipped.
-    let info_btn_width = 3usize;
+    // entirely on rows too tight to hold it.
     let pre_model_width: usize = spans_width(&line1_spans);
     if let Some(ms) = model_short {
         let badge = format!(" [{ms}]");
         let badge_w = unicode_width::UnicodeWidthStr::width(badge.as_str());
-        if pre_model_width + badge_w + info_btn_width <= row_inner_width {
+        if pre_model_width + badge_w <= row_inner_width {
             line1_spans.push(Span::styled(badge, Style::default().fg(model_clr)));
         }
     }
-    // Reserve 3 cols for `[i]` and ≥1 col of separation; the session_id
-    // column flexes to whatever's left so the action button always stays
-    // visible even when projects / titles eat the row. When even a single-
-    // char id won't fit, drop the id span entirely.
+    // The session_id column takes whatever width is left after its two-space
+    // lead plus a spare column; when even a single-char id won't fit, drop
+    // the id span entirely.
     let prefix_width: usize = spans_width(&line1_spans);
-    let id_budget = row_inner_width.saturating_sub(prefix_width + info_btn_width + 3);
-    let id_chars = s.session_id.chars().count();
-    let id_width = if id_budget == 0 {
-        0
-    } else if id_chars <= id_budget {
-        let display = s.session_id.clone();
-        let width = unicode_width::UnicodeWidthStr::width(display.as_str());
+    let id_budget = row_inner_width.saturating_sub(prefix_width + 3);
+    if id_budget > 0 {
+        let display = if s.session_id.chars().count() <= id_budget {
+            s.session_id.clone()
+        } else {
+            crate::text::truncate_with_ellipsis(&s.session_id, id_budget)
+        };
         line1_spans.push(Span::styled(
             format!("  {display}"),
             Style::default().fg(theme::SESSION_ID),
         ));
-        width + 2
-    } else {
-        let display = crate::text::truncate_with_ellipsis(&s.session_id, id_budget);
-        let width = unicode_width::UnicodeWidthStr::width(display.as_str());
-        line1_spans.push(Span::styled(
-            format!("  {display}"),
-            Style::default().fg(theme::SESSION_ID),
-        ));
-        width + 2
-    };
-    let pad = row_inner_width.saturating_sub(prefix_width + id_width + info_btn_width);
-    if pad > 0 {
-        line1_spans.push(Span::raw(" ".repeat(pad)));
     }
-    line1_spans.push(Span::styled("[i]", Style::default().fg(theme::PRIMARY)));
 
     let mut line1 = Line::from(line1_spans);
 
@@ -3070,7 +3036,9 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
         let mut session_total: u64 = 0;
         for (model, ts) in &s.day_tokens_by_model {
             let model_total = ts.work_tokens();
-            *model_tokens.entry(model.clone()).or_insert(0) += model_total;
+            *model_tokens
+                .entry(crate::aggregator::normalize_model_name(model))
+                .or_insert(0) += model_total;
             session_total += model_total;
         }
         for (tool, count) in &s.day_tool_usage {
@@ -3132,9 +3100,21 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
     } else {
         (None, None)
     };
+    // A resize can hide the focused panel; focus falls back to one on screen
+    // so ↑↓ and Enter never act on a panel the reader cannot see.
+    use crate::state::DailyPanel;
+    if state.daily_panel == DailyPanel::Activity && timeline_area.is_none() {
+        state.daily_panel = DailyPanel::Breakdown;
+    }
+    if state.daily_panel == DailyPanel::Breakdown && breakdown_area.is_none() {
+        state.daily_panel = DailyPanel::Sessions;
+    }
+    if breakdown_area.is_none() {
+        state.daily_breakdown_open = false;
+    }
+    state.layout.activity_panel_area = timeline_area;
 
     if let Some(timeline_rect) = timeline_area {
-        let bar_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
         let inner_height = timeline_rect.height.saturating_sub(4) as usize;
 
         let mut timeline_lines: Vec<Line> = Vec::new();
@@ -3142,7 +3122,6 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
         let has_data = max_hourly_raw > 0;
         let y_label_width = if has_data { 6 } else { 0 };
         for row in (0..inner_height).rev() {
-            let threshold = (row as f64 + 0.5) / inner_height as f64;
             let y_label = if !has_data {
                 String::new()
             } else if row == inner_height - 1 {
@@ -3150,25 +3129,8 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             } else {
                 " ".repeat(y_label_width)
             };
-            let mut row_chars = String::new();
-            for hour in 0..24u8 {
-                let tokens = hourly_tokens.get(&hour).copied().unwrap_or(0);
-                let ratio = if max_hourly > 0 {
-                    tokens as f64 / max_hourly as f64
-                } else {
-                    0.0
-                };
-                if ratio >= threshold {
-                    row_chars.push(bar_chars[7]);
-                } else if ratio >= threshold - (1.0 / inner_height as f64) && ratio > 0.0 {
-                    let sub_level = ((ratio - (threshold - 1.0 / inner_height as f64))
-                        * inner_height as f64
-                        * 8.0) as usize;
-                    row_chars.push(bar_chars[sub_level.min(7)]);
-                } else {
-                    row_chars.push(' ');
-                }
-            }
+            let row_chars =
+                dashboard::hourly_bar_row(&hourly_tokens, max_hourly, row, inner_height);
             timeline_lines.push(Line::from(vec![
                 Span::styled(y_label, Style::default().fg(theme::META)),
                 Span::styled(row_chars, Style::default().fg(theme::PRIMARY)),
@@ -3200,27 +3162,85 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             } else {
                 String::new()
             };
-            timeline_lines.push(
-                Line::from(vec![
-                    Span::styled(
-                        format!("active:{active_hours}h"),
-                        Style::default().fg(theme::TIME),
-                    ),
-                    Span::styled(peak_info, Style::default().fg(theme::WARM)),
-                    Span::styled(" ", Style::default().fg(theme::LABEL)),
-                    Span::styled(
+            // Least essential first out when the line overflows: the peak
+            // hour, the subagent share, the usual-weekday share, then active
+            // hours. Tokens and cost always stay, so no figure is cut mid-way.
+            let vs_usual = {
+                use chrono::Timelike;
+                crate::aggregator::day_vs_usual(
+                    &state.daily_groups,
+                    group.date,
+                    today,
+                    chrono::Local::now().hour() as u8,
+                )
+            };
+            let usual_spans: Vec<Span<'static>> = vs_usual
+                .as_ref()
+                .and_then(|v| v.pct().map(|pct| (pct, v.through.is_some())))
+                .map(|(pct, so_far)| {
+                    vec![
+                        Span::styled(" · ", Style::default().fg(theme::SEPARATOR)),
+                        Span::styled(format!("{pct}%"), Style::default().fg(theme::TOKENS)),
+                        Span::styled(
+                            format!(
+                                " of usual {}{}",
+                                group.date.format("%a"),
+                                if so_far { " by now" } else { "" }
+                            ),
+                            Style::default().fg(theme::LABEL),
+                        ),
+                    ]
+                })
+                .unwrap_or_default();
+            let compose =
+                |active: bool, peak: bool, sub: bool, usual: bool| -> Vec<Span<'static>> {
+                    let mut spans = Vec::new();
+                    if active {
+                        spans.push(Span::styled(
+                            format!("active:{active_hours}h"),
+                            Style::default().fg(theme::TIME),
+                        ));
+                    }
+                    if peak {
+                        spans.push(Span::styled(
+                            peak_info.clone(),
+                            Style::default().fg(theme::WARM),
+                        ));
+                    }
+                    if active || peak {
+                        spans.push(Span::styled(" ", Style::default().fg(theme::LABEL)));
+                    }
+                    spans.push(Span::styled(
                         crate::format_number(total_day_tokens),
                         Style::default().fg(theme::PRIMARY),
-                    ),
-                    Span::styled(sub_suffix, Style::default().fg(theme::META)),
-                    Span::styled(" ", Style::default().fg(theme::LABEL)),
-                    Span::styled(
+                    ));
+                    if sub {
+                        spans.push(Span::styled(
+                            sub_suffix.clone(),
+                            Style::default().fg(theme::META),
+                        ));
+                    }
+                    spans.push(Span::styled(" ", Style::default().fg(theme::LABEL)));
+                    spans.push(Span::styled(
                         format_cost_marked(total_day_cost, day_unpriced, 0),
                         cost_style_marked(total_day_cost, day_unpriced),
-                    ),
-                ])
-                .alignment(ratatui::layout::Alignment::Center),
-            );
+                    ));
+                    if usual {
+                        spans.extend(usual_spans.iter().cloned());
+                    }
+                    spans
+                };
+            let spans = [
+                (true, true, true, true),
+                (true, false, true, true),
+                (true, false, false, true),
+                (true, false, false, false),
+            ]
+            .into_iter()
+            .map(|(a, p, s, u)| compose(a, p, s, u))
+            .find(|spans| spans_width(spans) <= inner_width)
+            .unwrap_or_else(|| compose(false, false, false, false));
+            timeline_lines.push(Line::from(spans).alignment(ratatui::layout::Alignment::Center));
         } else {
             timeline_lines.push(
                 Line::from(vec![
@@ -3237,10 +3257,15 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             );
         }
 
+        let focused = state.daily_panel == crate::state::DailyPanel::Activity;
         let timeline = Paragraph::new(timeline_lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::BORDER))
+                .border_style(Style::default().fg(if focused {
+                    theme::PRIMARY
+                } else {
+                    theme::BORDER
+                }))
                 .title(Span::styled(
                     " Activity ",
                     Style::default().fg(theme::PRIMARY),
@@ -3290,9 +3315,13 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     let total_items = all_items.len();
 
+    /// One breakdown column. `color_of` picks each row's bar color from the
+    /// row's key, so the Tools column can color `agent:Explore` as a Subagent;
+    /// `label_of` turns the key into the name shown.
     fn render_column_items(
         items: &[(String, String, f64)],
-        color: Color,
+        color_of: impl Fn(&str) -> Color,
+        label_of: impl Fn(&str) -> String,
         max_lines: usize,
         col_width: usize,
     ) -> Vec<Line<'static>> {
@@ -3303,37 +3332,9 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 let bar_len = breakdown_bar_len(*pct);
                 let bar = "█".repeat(bar_len);
                 let max_name = col_width.saturating_sub(bar_len + info.len() + 3);
-                let short = truncate_with_ellipsis(name, max_name);
+                let short = truncate_with_ellipsis(&label_of(name), max_name);
                 Line::from(vec![
-                    Span::styled(format!(" {bar}"), Style::default().fg(color)),
-                    Span::styled(
-                        format!(" {short} {info}"),
-                        Style::default().fg(theme::TEXT_BRIGHT),
-                    ),
-                ])
-            })
-            .collect()
-    }
-
-    /// Per-row colored variant of `render_column_items` — bar color from
-    /// each tool key's category. Keeps `agent:Explore` colored as
-    /// Subagent in the Daily breakdown rather than uniform Tools.
-    fn render_tool_column_items(
-        items: &[(String, String, f64)],
-        max_lines: usize,
-        col_width: usize,
-    ) -> Vec<Line<'static>> {
-        items
-            .iter()
-            .take(max_lines)
-            .map(|(name, info, pct)| {
-                let bar_len = breakdown_bar_len(*pct);
-                let bar = "█".repeat(bar_len);
-                let max_name = col_width.saturating_sub(bar_len + info.len() + 3);
-                let short = truncate_with_ellipsis(name, max_name);
-                let color = tool_category_color(name);
-                Line::from(vec![
-                    Span::styled(format!(" {bar}"), Style::default().fg(color)),
+                    Span::styled(format!(" {bar}"), Style::default().fg(color_of(name))),
                     Span::styled(
                         format!(" {short} {info}"),
                         Style::default().fg(theme::TEXT_BRIGHT),
@@ -3345,11 +3346,16 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     state.layout.breakdown_panel_area = breakdown_area;
     let breakdown_popup_data = if let Some(breakdown_rect) = breakdown_area {
+        let focused = state.daily_panel == crate::state::DailyPanel::Breakdown;
         let outer_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::BORDER))
+            .border_style(Style::default().fg(if focused {
+                theme::PRIMARY
+            } else {
+                theme::BORDER
+            }))
             .title(Span::styled(
-                format!(" Breakdown ({total_items}) [b] "),
+                format!(" Breakdown ({total_items}) "),
                 Style::default().fg(theme::PRIMARY),
             ));
         let inner = outer_block.inner(breakdown_rect);
@@ -3402,15 +3408,27 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             })
             .collect();
 
-        let proj_lines =
-            render_column_items(&proj_items, theme::WARM, max_lines, cols[0].width as usize);
+        let proj_lines = render_column_items(
+            &proj_items,
+            |_| theme::WARM,
+            str::to_string,
+            max_lines,
+            cols[0].width as usize,
+        );
         let model_lines = render_column_items(
             &model_items,
-            theme::PRIMARY,
+            |_| theme::PRIMARY,
+            str::to_string,
             max_lines,
             cols[1].width as usize,
         );
-        let tool_lines = render_tool_column_items(&tool_items, max_lines, cols[2].width as usize);
+        let tool_lines = render_column_items(
+            &tool_items,
+            tool_category_color,
+            crate::aggregator::format_tool_short,
+            max_lines,
+            cols[2].width as usize,
+        );
 
         let proj_title = format!(" Projects({}) ", sorted_projects.len());
         let model_title = format!(" Models({}) ", sorted_models.len());
@@ -3437,7 +3455,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             cols[2],
         );
 
-        if state.daily_breakdown_focus {
+        if state.daily_breakdown_open {
             Some((all_items, sorted_projects.len(), tools_start_idx))
         } else {
             None
@@ -3450,9 +3468,9 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let max_summary_len = content_width.saturating_sub(4).max(15);
 
     let session_calculator = CostCalculator::global();
-    // [i] button: 3-cell hit zone right-aligned in the list inner area, mouse-only entry point for session details.
-    let inner_width = sessions_chunk.width.saturating_sub(2) as usize;
-    let info_btn_width = 3usize;
+    // The cursor row is only marked while the list holds focus; with a panel
+    // above focused, a marked row would claim the keys that panel takes.
+    let sessions_focused = state.daily_panel == crate::state::DailyPanel::Sessions;
 
     let subagents_by_parent = group.subagent_spend_by_parent();
     let items: Vec<ListItem> = sessions
@@ -3485,7 +3503,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             );
             let model_clr = s.model.as_ref().map_or(theme::LABEL, |m| model_color(m));
 
-            let is_selected = i == state.selected_session;
+            let is_selected = sessions_focused && i == state.selected_session;
             let is_updating = state.updating_session == Some((state.selected_day, i));
             let now = chrono::Utc::now();
             let is_recent = (now - s.day_last_timestamp).num_minutes() < 5;
@@ -3515,26 +3533,12 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
             let mut line1_spans = vec![Span::raw(prefix)];
             let pinned = state.pins.is_pinned(&s.file_path);
-            if pinned {
-                line1_spans.push(Span::styled("*", Style::default().fg(theme::WARNING)));
-                line1_spans.push(Span::styled(
-                    if s.is_continued { "»" } else { "·" },
-                    Style::default().fg(if s.is_continued {
-                        theme::PRIMARY
-                    } else {
-                        theme::SUCCESS
-                    }),
-                ));
-            } else {
-                line1_spans.push(Span::styled(
-                    if s.is_continued { " »" } else { " ·" },
-                    Style::default().fg(if s.is_continued {
-                        theme::PRIMARY
-                    } else {
-                        theme::SUCCESS
-                    }),
-                ));
-            }
+            line1_spans.extend(pin_marks(
+                pinned,
+                s.is_continued,
+                Style::default().fg(theme::WARNING),
+                continued_color(s.is_continued),
+            ));
             line1_spans.push(Span::styled(format!("{time_str} "), time_style));
             line1_spans.push(Span::styled(
                 project_short.clone(),
@@ -3558,13 +3562,6 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 format!(" [{model_short}]"),
                 Style::default().fg(model_clr),
             ));
-
-            let line1_width: usize = spans_width(&line1_spans);
-            let pad = inner_width.saturating_sub(line1_width + info_btn_width);
-            if pad > 0 {
-                line1_spans.push(Span::raw(" ".repeat(pad)));
-            }
-            line1_spans.push(Span::styled("[i]", Style::default().fg(theme::PRIMARY)));
 
             let line1 = Line::from(line1_spans);
 
@@ -3626,14 +3623,22 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let list = List::new(visible_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::BORDER))
+            .border_style(Style::default().fg(if sessions_focused {
+                theme::PRIMARY
+            } else {
+                theme::BORDER
+            }))
             .title(Line::from(vec![
                 Span::styled(
-                    format!(
-                        " Sessions ({}/{}) ",
-                        state.selected_session + 1,
-                        sessions.len()
-                    ),
+                    if sessions_focused {
+                        format!(
+                            " Sessions ({}/{}) ",
+                            state.selected_session + 1,
+                            sessions.len()
+                        )
+                    } else {
+                        format!(" Sessions ({}) ", sessions.len())
+                    },
                     Style::default().fg(theme::PRIMARY),
                 ),
                 Span::styled(
@@ -3671,12 +3676,17 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ("q", "quit"),
             ("←→", "day"),
             ("↑↓", "session"),
-            ("i", "info"),
-            ("Enter", "view"),
+            (
+                "Enter",
+                match state.daily_panel {
+                    crate::state::DailyPanel::Breakdown => "breakdown",
+                    crate::state::DailyPanel::Activity => "activity",
+                    crate::state::DailyPanel::Sessions => "info",
+                },
+            ),
             ("s", "summary"),
             ("S", "day-summary"),
             ("t", "title"),
-            ("b", "breakdown"),
             ("/", "search"),
             ("Space", "pin"),
             ("m", "pins"),
@@ -3685,19 +3695,16 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
     frame.render_widget(help_line, help_chunk);
 
     if let Some((items, models_start, tools_start)) = breakdown_popup_data {
-        draw_breakdown_detail_popup(frame, area, &items, models_start, tools_start, state);
+        // The whole frame, as every detail popup is centred in.
+        let frame_area = frame.area();
+        draw_breakdown_detail_popup(frame, frame_area, &items, models_start, tools_start, state);
     }
 }
 
 fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, is_active: bool) {
     use ratatui::widgets::{List, ListItem};
 
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
+    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
     let item_height: usize = 2;
 
     let border_color = if is_active {
@@ -3812,18 +3819,8 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
                     .or_else(|| s.name.clone());
                 let now = chrono::Utc::now();
                 let last = live_session_last_activity(state, s, now);
-                // Mirror render_live_row: 5-tier glyph (busy / today / older /
-                // snapshot-recovered paused / paused) so the conv-pane list
-                // tells the same story as the Live tab itself.
-                let glyph = if !is_active {
-                    if s.was_recently_live { "⟳" } else { "⏸" }
-                } else if s.status.as_deref() == Some("busy") {
-                    "🟢"
-                } else if crate::infrastructure::live_sessions::is_today(last, now) {
-                    "◉"
-                } else {
-                    "○"
-                };
+                // The Live tab's glyph, so both lists tell the same story.
+                let glyph = live_glyph(s, is_active, last, now).0.trim_end();
                 let pinned = s
                     .jsonl_path
                     .as_ref()
@@ -3962,23 +3959,14 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
             };
 
             let mut line1_spans = vec![Span::styled(prefix, style)];
-            if sd.is_pinned {
-                line1_spans.push(Span::styled(
-                    "*",
-                    Style::default()
-                        .fg(theme::WARNING)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                line1_spans.push(Span::styled(
-                    if sd.is_continued { "»" } else { "·" },
-                    Style::default().fg(state_color),
-                ));
-            } else {
-                line1_spans.push(Span::styled(
-                    if sd.is_continued { " »" } else { " ·" },
-                    Style::default().fg(state_color),
-                ));
-            }
+            line1_spans.extend(pin_marks(
+                sd.is_pinned,
+                sd.is_continued,
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+                state_color,
+            ));
             line1_spans.push(Span::styled(format!("{} ", sd.time_or_date), time_style));
             line1_spans.push(Span::styled(proj_display, style));
             let line1 = Line::from(line1_spans);
@@ -4094,19 +4082,62 @@ fn scope_day_label(day_first: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
+/// A loading pane's body: spinner + label, then a bar with the share of the
+/// transcript read and its size. Once every byte is read the label turns to
+/// "Preparing", since parsing the last batch and building messages remain.
+fn pane_loading_lines(read: u64, total: u64, tick: usize, width: u16) -> Vec<Line<'static>> {
+    const SPINNER: [char; 6] = ['·', '✢', '✳', '✶', '✻', '✽'];
+    let done = total > 0 && read >= total;
+    let label = if done {
+        "Preparing conversation"
+    } else {
+        "Loading conversation"
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{} ", SPINNER[(tick / 8) % SPINNER.len()]),
+            Style::default().fg(theme::PRIMARY),
+        ),
+        Span::styled(label, Style::default().fg(theme::TITLE)),
+    ])];
+    if total == 0 {
+        return lines;
+    }
+    let pct = (read.min(total) as f64 / total as f64 * 100.0) as u64;
+    let bar_w = usize::from(width.saturating_sub(8)).min(40);
+    let filled = bar_w * pct as usize / 100;
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("━".repeat(filled), Style::default().fg(theme::PRIMARY)),
+        Span::styled(
+            "─".repeat(bar_w.saturating_sub(filled)),
+            Style::default().fg(theme::SEPARATOR),
+        ),
+        Span::styled(format!(" {pct:>3}%"), Style::default().fg(theme::VALUE)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} / {}",
+            crate::text::format_bytes(read.min(total)),
+            crate::text::format_bytes(total)
+        ),
+        Style::default().fg(theme::LABEL),
+    )));
+    lines
+}
+
 fn draw_conversation_pane(
     frame: &mut Frame,
     area: Rect,
     pane: &mut ConversationPane,
     is_active: bool,
-    _toast_time: &Option<std::time::Instant>,
-    _layout_too_narrow: bool,
     selecting: bool,
     sessions: &[SessionInfo],
     all_groups: &[crate::aggregator::DailyGroup],
     pins_ref: &crate::pins::Pins,
     project_labels: &std::collections::HashMap<String, String>,
     session_titles: &std::collections::HashMap<std::path::PathBuf, String>,
+    animation_frame: usize,
 ) -> Option<Rect> {
     use ratatui::widgets::Clear;
 
@@ -4222,8 +4253,25 @@ fn draw_conversation_pane(
 
     if pane.messages.is_empty() {
         if pane.loading {
-            let loading = Paragraph::new("Loading…").style(Style::default().fg(theme::PLACEHOLDER));
-            frame.render_widget(loading, inner);
+            // Centered on the whole pane body: the info rows are still empty.
+            let body = Rect {
+                x: area.x + 1,
+                y: area.y + 1,
+                width: area.width.saturating_sub(2),
+                height: area.height.saturating_sub(2),
+            };
+            let read = pane.load_read.load(std::sync::atomic::Ordering::Relaxed);
+            let lines = pane_loading_lines(read, pane.load_total, animation_frame, body.width);
+            let top = body.height.saturating_sub(lines.len() as u16) / 2;
+            let rect = Rect {
+                y: body.y + top,
+                height: body.height.saturating_sub(top),
+                ..body
+            };
+            frame.render_widget(
+                Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+                rect,
+            );
             draw_block(frame, "", pane);
         } else if pane.file_path.is_none() {
             let hint = Paragraph::new("Select a session (Enter)")
@@ -4390,7 +4438,9 @@ fn draw_conversation_pane(
         .get(selected_msg_idx + 1)
         .map_or(total_lines, |&(line, _)| line);
 
-    if pane.scroll == usize::MAX {
+    if std::mem::take(&mut pane.follow_tail) {
+        pane.scroll = max_scroll;
+    } else if pane.scroll == usize::MAX {
         if let Some(&(last_pos, _)) = cached.1.last() {
             pane.scroll = last_pos.min(max_scroll);
         } else {
@@ -4505,15 +4555,7 @@ fn draw_conversation_pane(
 
     let can_scroll_up = scroll > 0;
     let can_scroll_down = scroll < max_scroll;
-    let scroll_indicator = if can_scroll_up && can_scroll_down {
-        "▲▼ "
-    } else if can_scroll_up {
-        "▲ "
-    } else if can_scroll_down {
-        "▼ "
-    } else {
-        ""
-    };
+    let scroll_indicator = scroll_arrows(can_scroll_up, can_scroll_down, "", " ");
     // Named, because the bar beside it is also `n/m`: a message index next to
     // a line offset reads as two of the same thing.
     let scroll_info = format!(
@@ -4546,13 +4588,8 @@ fn draw_conversation_pane(
         // session_first can predate the displayed day by weeks, which would
         // turn a single-day range like 00:00–09:47 into a multi-hundred-hour
         // duration that misrepresents activity for the day.
-        let duration_mins =
-            (session.day_last_timestamp - session.day_first_timestamp).num_minutes();
-        let dur = if duration_mins >= 60 {
-            format!("{}h{}m", duration_mins / 60, duration_mins % 60)
-        } else {
-            format!("{duration_mins}m")
-        };
+        let duration_mins = session.day_duration_mins();
+        let dur = crate::text::format_duration_mins(duration_mins);
         let subagents = crate::aggregator::day_subagent_spend(session, all_groups);
         let work_tokens = session.work_tokens() + subagents.work_tokens;
         let cost: f64 = session.cost(calculator) + subagents.cost;
@@ -4681,6 +4718,35 @@ fn draw_conversation_pane(
     Some(content_area)
 }
 
+/// Drops whole messages off the front until at most `max` lines remain,
+/// always keeping the last message. One drain, so a long conversation does
+/// not shift the buffer once per dropped message.
+fn trim_front_messages(
+    lines: &mut Vec<Line<'static>>,
+    wrap_flags: &mut Vec<bool>,
+    positions: &mut Vec<(usize, usize)>,
+    max: usize,
+) {
+    let total = lines.len();
+    let last = positions.len().saturating_sub(1);
+    let keep = positions[..last]
+        .iter()
+        .position(|&(line, _)| total - line <= max)
+        .unwrap_or(last);
+    let Some(&(cut, _)) = positions.get(keep) else {
+        return;
+    };
+    if keep == 0 {
+        return;
+    }
+    lines.drain(..cut);
+    wrap_flags.drain(..cut);
+    positions.drain(..keep);
+    for pos in positions.iter_mut() {
+        pos.0 -= cut;
+    }
+}
+
 fn render_conversation_lines(
     messages: &[ConversationMessage],
     width: u16,
@@ -4704,17 +4770,16 @@ fn render_conversation_lines(
     }
 
     while i < messages.len() {
-        // Anchor the rendered window to the end of the conversation: when the
-        // buffer overflows the cap, drop earliest messages rather than stopping
-        // at the front. Users typically need to see the latest exchange.
-        while lines.len() > MAX_TOTAL_LINES && message_positions.len() > 1 {
-            let next_start = message_positions[1].0;
-            lines.drain(..next_start);
-            wrap_flags.drain(..next_start);
-            message_positions.remove(0);
-            for pos in &mut message_positions {
-                pos.0 = pos.0.saturating_sub(next_start);
-            }
+        // Anchor the rendered window to the end of the conversation: drop the
+        // earliest messages, not the latest exchange. Trimming only at twice the
+        // cap keeps memory bounded while each trim stays amortized O(1) per line.
+        if lines.len() > 2 * MAX_TOTAL_LINES {
+            trim_front_messages(
+                &mut lines,
+                &mut wrap_flags,
+                &mut message_positions,
+                MAX_TOTAL_LINES,
+            );
         }
         let msg = &messages[i];
 
@@ -4729,10 +4794,13 @@ fn render_conversation_lines(
                         ConversationBlock::ToolUse {
                             name,
                             input_summary,
+                            ..
                         } => {
                             tool_uses.push((name.as_str(), input_summary.as_str()));
                         }
-                        ConversationBlock::ToolResult { content, is_error } => {
+                        ConversationBlock::ToolResult {
+                            content, is_error, ..
+                        } => {
                             tool_results.push((content.as_str(), *is_error));
                         }
                         _ => {}
@@ -4890,12 +4958,16 @@ fn render_conversation_lines(
             }
         }
 
-        // Per-turn cost via CostCalculator (1h/5m cache split correct).
-        // Skipped when usage / model absent or cost is zero. Position:
+        // Per-turn cost over every billed attempt. Skipped when any attempt
+        // is unpriced or the sum is zero. Position:
         // `seconds → $ → tokens` so cost sits next to its latency.
-        if let (Some(usage), Some(model)) = (msg.usage.as_ref(), msg.model.as_deref())
-            && let Some(cost) =
-                crate::aggregator::CostCalculator::global().calculate_cost(usage, Some(model))
+        if let Some(cost) = msg
+            .billed
+            .iter()
+            .map(|(key, usage)| {
+                crate::aggregator::CostCalculator::global().calculate_cost(usage, Some(key))
+            })
+            .sum::<Option<f64>>()
             && cost > 0.0
         {
             // `calculate_cost` returned a figure, so the model is priced.
@@ -4918,7 +4990,15 @@ fn render_conversation_lines(
                 crate::format_number(output)
             );
             if line_max_width >= 90
-                && let Some(usage) = msg.usage.as_ref()
+                && let Some(usage) =
+                    msg.billed
+                        .iter()
+                        .map(|(_, t)| t)
+                        .cloned()
+                        .reduce(|mut a, b| {
+                            a.merge(&b);
+                            a
+                        })
             {
                 if usage.cache_creation_tokens > 0 {
                     text.push_str(&format!(
@@ -4953,7 +5033,11 @@ fn render_conversation_lines(
 
             match block {
                 ConversationBlock::Text(text) => {
-                    let (hl_lines, hl_flags) = render_text_with_highlighting(text, content_width);
+                    let (hl_lines, hl_flags) = render_text_with_highlighting(
+                        text,
+                        content_width,
+                        max_lines.saturating_sub(line_count),
+                    );
                     for (hl_line, flag) in hl_lines.into_iter().zip(hl_flags) {
                         if line_count >= max_lines {
                             break;
@@ -5000,6 +5084,7 @@ fn render_conversation_lines(
                 ConversationBlock::ToolUse {
                     name,
                     input_summary,
+                    ..
                 } => {
                     let tool_line = if input_summary.is_empty() {
                         format!("  [Tool] {name}")
@@ -5017,7 +5102,9 @@ fn render_conversation_lines(
                         line_count += 1;
                     }
                 }
-                ConversationBlock::ToolResult { content, is_error } => {
+                ConversationBlock::ToolResult {
+                    content, is_error, ..
+                } => {
                     let result_style = if *is_error {
                         Style::default().fg(theme::ERROR)
                     } else {
@@ -5048,16 +5135,12 @@ fn render_conversation_lines(
         i += 1;
     }
 
-    // Final drain pass: trim the front after the last message has been pushed.
-    while lines.len() > MAX_TOTAL_LINES && message_positions.len() > 1 {
-        let next_start = message_positions[1].0;
-        lines.drain(..next_start);
-        wrap_flags.drain(..next_start);
-        message_positions.remove(0);
-        for pos in &mut message_positions {
-            pos.0 = pos.0.saturating_sub(next_start);
-        }
-    }
+    trim_front_messages(
+        &mut lines,
+        &mut wrap_flags,
+        &mut message_positions,
+        MAX_TOTAL_LINES,
+    );
 
     // If messages above the window were dropped, prepend a placeholder so
     // the user can see how many preceding messages are not shown.
@@ -5099,10 +5182,12 @@ fn compact_message_summary(msg: &ConversationMessage) -> String {
             ConversationBlock::ToolUse {
                 name,
                 input_summary,
+                ..
             } if input_summary.is_empty() => Some(name.clone()),
             ConversationBlock::ToolUse {
                 name,
                 input_summary,
+                ..
             } => Some(format!("{name} {input_summary}")),
             _ => None,
         })
@@ -5120,6 +5205,256 @@ fn compact_message_summary(msg: &ConversationMessage) -> String {
         }
     }
     String::new()
+}
+
+/// Each tool call's name and when it was made, by call id: a result names
+/// its call and how long it ran, though the two sit in different messages.
+type ToolCalls<'a> =
+    std::collections::HashMap<&'a str, (&'a str, Option<chrono::DateTime<chrono::Utc>>)>;
+
+fn tool_calls_by_id(messages: &[ConversationMessage]) -> ToolCalls<'_> {
+    messages
+        .iter()
+        .flat_map(|m| m.blocks.iter().map(move |b| (m, b)))
+        .filter_map(|(m, b)| match b {
+            ConversationBlock::ToolUse { id, name, .. } if !id.is_empty() => {
+                Some((id.as_str(), (name.as_str(), m.timestamp_utc)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `0.4s`, `12.3s`, `2m05s`: how long a tool call took to answer.
+fn format_elapsed(d: chrono::Duration) -> String {
+    let ms = d.num_milliseconds().max(0);
+    if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m{:02}s", ms / 60_000, ms / 1000 % 60)
+    }
+}
+
+/// Lines of `text` without its leading / trailing blank lines, and with each
+/// run of blank lines folded to one: the expanded view spends no rows on gaps.
+fn tidy_lines(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let blank = line.trim().is_empty();
+        if blank && out.last().is_none_or(|l| l.trim().is_empty()) {
+            continue;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+/// `source` wrapped to `width` with its leading indentation kept on every
+/// piece: code in a tool's output reads by its indentation, which the shared
+/// wrapper drops. A tab counts as four columns; at most half the width goes
+/// to indentation, so a deeply nested line still has room.
+fn wrap_keeping_indent(source: &str, width: usize) -> Vec<String> {
+    let body = source.trim_start();
+    let lead: String = source[..source.len() - body.len()].replace('\t', "    ");
+    let lead: String = lead.chars().take(width / 2).collect();
+    let room = width.saturating_sub(lead.len()).max(8);
+    crate::text::wrap_text_with_continuation(body, room)
+        .0
+        .into_iter()
+        .map(|piece| format!("{lead}{piece}"))
+        .collect()
+}
+
+/// Columns an expanded tool call's fields and output start at: under the
+/// tool's name in its `  ⚙ Name` header.
+const TOOL_BODY_INDENT: &str = "    ";
+
+/// One block of an expanded tool run, with its message's time.
+type ToolStep<'a> = (&'a ConversationBlock, Option<chrono::DateTime<chrono::Utc>>);
+
+/// An expanded tool run, call by call: a call's header carries its result's
+/// status and run time, then the input fields its title does not already
+/// show, then the output. A result whose call sits outside `steps` (in an
+/// preceding message) keeps a header of its own.
+fn push_tool_steps(
+    steps: &[ToolStep<'_>],
+    calls: &ToolCalls<'_>,
+    text_w: usize,
+    lines: &mut Vec<Line<'static>>,
+    flags: &mut Vec<bool>,
+) {
+    let mut shown = vec![false; steps.len()];
+    for (k, &(block, at)) in steps.iter().enumerate() {
+        if shown[k] {
+            continue;
+        }
+        match block {
+            ConversationBlock::ToolUse {
+                id,
+                name,
+                input_summary,
+                input,
+            } => {
+                let answer = steps.iter().enumerate().skip(k + 1).find(|(_, (b, _))| {
+                    matches!(b, ConversationBlock::ToolResult { tool_use_id, .. }
+                        if !id.is_empty() && tool_use_id == id)
+                });
+                let description = input
+                    .iter()
+                    .find(|(key, _)| key == "description")
+                    .map(|(_, v)| v.as_str());
+                let title = description.unwrap_or(input_summary);
+                let mut head = vec![Span::styled(
+                    format!("  ⚙ {name}"),
+                    Style::default().fg(theme::PRIMARY),
+                )];
+                if let Some((r, &(ConversationBlock::ToolResult { is_error, .. }, end))) = answer {
+                    shown[r] = true;
+                    head.extend(result_status_spans(*is_error, at, end));
+                }
+                let used = spans_width(&head) + 2;
+                head.push(Span::styled(
+                    format!(
+                        "  {}",
+                        truncate_with_ellipsis(title, text_w.saturating_sub(used).max(8))
+                    ),
+                    Style::default().fg(theme::VALUE),
+                ));
+                lines.push(Line::from(head));
+                flags.push(false);
+                for (key, value) in input {
+                    if value == title || (description.is_some() && key == "description") {
+                        continue;
+                    }
+                    push_tool_field(key, value, text_w, lines, flags);
+                }
+                if let Some((
+                    _,
+                    &(
+                        ConversationBlock::ToolResult {
+                            content, is_error, ..
+                        },
+                        _,
+                    ),
+                )) = answer
+                {
+                    push_tool_output(content, *is_error, text_w, lines, flags);
+                }
+            }
+            ConversationBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                let call = calls.get(tool_use_id.as_str());
+                let mut head = vec![
+                    Span::styled("  ↳ ", Style::default().fg(theme::META)),
+                    Span::styled(
+                        call.map_or("result", |c| c.0).to_string(),
+                        Style::default().fg(theme::LABEL),
+                    ),
+                ];
+                head.extend(result_status_spans(*is_error, call.and_then(|c| c.1), at));
+                lines.push(Line::from(head));
+                flags.push(false);
+                push_tool_output(content, *is_error, text_w, lines, flags);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// ` ✓ 1.8s`: a result's status, and its run time when both ends are known.
+fn result_status_spans(
+    is_error: bool,
+    start: Option<chrono::DateTime<chrono::Utc>>,
+    end: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<Span<'static>> {
+    let (icon, color) = if is_error {
+        ("✗", theme::ERROR)
+    } else {
+        ("✓", theme::SUCCESS)
+    };
+    let mut spans = vec![Span::styled(format!(" {icon}"), Style::default().fg(color))];
+    if let (Some(start), Some(end)) = (start, end) {
+        spans.push(Span::styled(
+            format!(" {}", format_elapsed(end - start)),
+            Style::default().fg(theme::TIME),
+        ));
+    }
+    spans
+}
+
+/// `key: value`, the value wrapped back to the body indent rather than
+/// under itself, so a long command keeps the full width.
+fn push_tool_field(
+    key: &str,
+    value: &str,
+    text_w: usize,
+    lines: &mut Vec<Line<'static>>,
+    flags: &mut Vec<bool>,
+) {
+    let lead = format!("{TOOL_BODY_INDENT}{key}: ");
+    let lead_w = unicode_width::UnicodeWidthStr::width(lead.as_str());
+    let value_style = Style::default().fg(theme::VALUE);
+    for (n, source) in tidy_lines(value).into_iter().enumerate() {
+        // The first line shares its row with the key; the rest start at the indent.
+        let width = if n == 0 {
+            text_w.saturating_sub(lead_w)
+        } else {
+            text_w.saturating_sub(TOOL_BODY_INDENT.len())
+        };
+        for (k, piece) in wrap_keeping_indent(source, width.max(8))
+            .into_iter()
+            .enumerate()
+        {
+            let lead_span = if n == 0 && k == 0 {
+                Span::styled(lead.clone(), Style::default().fg(theme::LABEL))
+            } else {
+                Span::raw(TOOL_BODY_INDENT)
+            };
+            lines.push(Line::from(vec![
+                lead_span,
+                Span::styled(piece, value_style),
+            ]));
+            flags.push(k > 0);
+        }
+    }
+}
+
+/// A result's output under a rule, blank runs folded; `(no output)` if none.
+fn push_tool_output(
+    content: &str,
+    is_error: bool,
+    text_w: usize,
+    lines: &mut Vec<Line<'static>>,
+    flags: &mut Vec<bool>,
+) {
+    let bar = "  │ ";
+    let bar_w = unicode_width::UnicodeWidthStr::width(bar);
+    let text_style = Style::default().fg(if is_error { theme::ERROR } else { theme::VALUE });
+    let rows = tidy_lines(content);
+    if rows.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(bar, Style::default().fg(theme::SEPARATOR)),
+            Span::styled("(no output)", Style::default().fg(theme::PLACEHOLDER)),
+        ]));
+        flags.push(false);
+        return;
+    }
+    for source in rows {
+        let width = text_w.saturating_sub(bar_w).max(8);
+        for (k, piece) in wrap_keeping_indent(source, width).into_iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(bar, Style::default().fg(theme::SEPARATOR)),
+                Span::styled(piece, text_style),
+            ]));
+            flags.push(k > 0);
+        }
+    }
 }
 
 /// Compact conversation render: one summary line per message, the messages in
@@ -5140,6 +5475,7 @@ fn render_compact_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut positions: Vec<(usize, usize)> = Vec::new();
     let mut wrap_flags: Vec<bool> = Vec::new();
+    let calls = tool_calls_by_id(messages);
 
     // Header prefix (caret + time + role) shared by both branches.
     let header_prefix = |is_open: bool, msg: &ConversationMessage| {
@@ -5189,17 +5525,8 @@ fn render_compact_lines(
         // A long stretch of `⚙ Read · ⚙ Edit · ⚙ Bash …` collapses to a single
         // `⚙ Read×2 · Edit · Bash ✓` line; expanding shows each call's detail.
         if is_tool_only_message(&messages[i]) {
-            // A group interleaves uses and results from SEPARATE messages
-            // (a result can even lead the group when it answers the previous
-            // mixed message's call), so details keep message order — a
-            // use↔result pairing by index would misattribute them.
-            enum ToolDetail {
-                Use(String, String),
-                Result(bool, String),
-            }
             let group_start = i;
             let mut uses: Vec<(String, String)> = Vec::new();
-            let mut details: Vec<ToolDetail> = Vec::new();
             let mut any_err = false;
             let mut n_results = 0usize;
             while i < messages.len() && is_tool_only_message(&messages[i]) {
@@ -5208,14 +5535,11 @@ fn render_compact_lines(
                         ConversationBlock::ToolUse {
                             name,
                             input_summary,
-                        } => {
-                            uses.push((name.clone(), input_summary.clone()));
-                            details.push(ToolDetail::Use(name.clone(), input_summary.clone()));
-                        }
-                        ConversationBlock::ToolResult { content, is_error } => {
+                            ..
+                        } => uses.push((name.clone(), input_summary.clone())),
+                        ConversationBlock::ToolResult { is_error, .. } => {
                             any_err |= *is_error;
                             n_results += 1;
-                            details.push(ToolDetail::Result(*is_error, content.clone()));
                         }
                         _ => {}
                     }
@@ -5283,46 +5607,14 @@ fn render_compact_lines(
             wrap_flags.push(false);
 
             if is_open {
-                // Result content renders too (same `↳` form as expanded
-                // single messages) so text inside tool results is visible —
-                // and search-highlightable — when peeked.
-                for d in &details {
-                    match d {
-                        ToolDetail::Use(name, arg) => {
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    "{BODY_INDENT}⚙ {name}  {}",
-                                    truncate_with_ellipsis(
-                                        arg,
-                                        text_w.saturating_sub(name.len() + 6).max(8)
-                                    )
-                                ),
-                                Style::default().fg(theme::PRIMARY),
-                            )));
-                        }
-                        ToolDetail::Result(err, content) => {
-                            let one = content.split_whitespace().collect::<Vec<_>>().join(" ");
-                            let short =
-                                truncate_with_ellipsis(&one, text_w.saturating_sub(4).max(8));
-                            let (icon, c) = if *err {
-                                ("✗", theme::ERROR)
-                            } else {
-                                ("✓", theme::SUCCESS)
-                            };
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!("{BODY_INDENT}↳ "),
-                                    Style::default().fg(theme::META),
-                                ),
-                                Span::styled(short, Style::default().fg(theme::LABEL)),
-                                Span::styled(format!(" {icon}"), Style::default().fg(c)),
-                            ]));
-                        }
-                    }
-                    wrap_flags.push(false);
-                }
-                lines.push(Line::from(""));
-                wrap_flags.push(false);
+                // Uses and results come from separate messages (a result can
+                // even lead the group), so they keep message order and pair
+                // up through `calls` by id rather than by position.
+                let steps: Vec<ToolStep<'_>> = messages[group_start..i]
+                    .iter()
+                    .flat_map(|m| m.blocks.iter().map(move |b| (b, m.timestamp_utc)))
+                    .collect();
+                push_tool_steps(&steps, &calls, text_w, &mut lines, &mut wrap_flags);
             }
             continue;
         }
@@ -5346,9 +5638,14 @@ fn render_compact_lines(
             continue;
         }
 
+        // Text renders in place; each stretch of tool blocks between texts
+        // renders as one run, so a call there still pairs with its result.
+        let mut steps: Vec<ToolStep<'_>> = Vec::new();
         for block in &msg.blocks {
             match block {
                 ConversationBlock::Text(t) | ConversationBlock::Thinking(t) => {
+                    push_tool_steps(&steps, &calls, text_w, &mut lines, &mut wrap_flags);
+                    steps.clear();
                     if t.trim().is_empty() {
                         continue;
                     }
@@ -5367,39 +5664,12 @@ fn render_compact_lines(
                         wrap_flags.push(wi > 0);
                     }
                 }
-                ConversationBlock::ToolUse {
-                    name,
-                    input_summary,
-                } => {
-                    let arg = truncate_with_ellipsis(
-                        input_summary,
-                        text_w.saturating_sub(name.len() + 6).max(8),
-                    );
-                    lines.push(Line::from(Span::styled(
-                        format!("{BODY_INDENT}⚙ {name}  {arg}"),
-                        Style::default().fg(theme::PRIMARY),
-                    )));
-                    wrap_flags.push(false);
-                }
-                ConversationBlock::ToolResult { content, is_error } => {
-                    let one = content.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let short = truncate_with_ellipsis(&one, text_w.saturating_sub(4).max(8));
-                    let (icon, c) = if *is_error {
-                        ("✗", theme::ERROR)
-                    } else {
-                        ("✓", theme::SUCCESS)
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{BODY_INDENT}↳ "), Style::default().fg(theme::META)),
-                        Span::styled(short, Style::default().fg(theme::LABEL)),
-                        Span::styled(format!(" {icon}"), Style::default().fg(c)),
-                    ]));
-                    wrap_flags.push(false);
+                ConversationBlock::ToolUse { .. } | ConversationBlock::ToolResult { .. } => {
+                    steps.push((block, msg.timestamp_utc));
                 }
             }
         }
-        lines.push(Line::from(""));
-        wrap_flags.push(false);
+        push_tool_steps(&steps, &calls, text_w, &mut lines, &mut wrap_flags);
         i += 1;
     }
     (lines, positions, wrap_flags)
@@ -5666,9 +5936,89 @@ pub(super) fn detail_popup_area(area: Rect) -> Rect {
     // `insights_detail_metrics_fit_the_popup_width` pins it.
     let width = 104u16.min(area.width.saturating_sub(4));
     let height = 36u16.min(area.height.saturating_sub(4));
+    centered(area, width, height)
+}
+
+/// The filled part of a `width`-cell bar, `filled` capped at `width`.
+/// Pairs with [`bar_empty`] so the track keeps one color everywhere.
+pub(crate) fn bar_fill(filled: usize, width: usize, color: Color) -> Span<'static> {
+    Span::styled("█".repeat(filled.min(width)), Style::default().fg(color))
+}
+
+/// The unfilled track after [`bar_fill`].
+pub(crate) fn bar_empty(filled: usize, width: usize) -> Span<'static> {
+    Span::styled(
+        "░".repeat(width.saturating_sub(filled)),
+        Style::default().fg(theme::SEPARATOR),
+    )
+}
+
+/// `▲` / `▼` for content above / below the viewport, wrapped in `pre` and
+/// `post`; empty when everything fits, so the title shows no stray padding.
+pub(crate) fn scroll_arrows(up: bool, down: bool, pre: &str, post: &str) -> String {
+    let arrows = match (up, down) {
+        (true, true) => "▲▼",
+        (true, false) => "▲",
+        (false, true) => "▼",
+        (false, false) => return String::new(),
+    };
+    format!("{pre}{arrows}{post}")
+}
+
+/// The two leading columns of a session row: `*` when pinned (a blank
+/// otherwise), then `»` for a session spanning more than one day or `·`.
+fn pin_marks(
+    pinned: bool,
+    continued: bool,
+    pin_style: Style,
+    mark_color: Color,
+) -> [Span<'static>; 2] {
+    [
+        Span::styled(if pinned { "*" } else { " " }, pin_style),
+        Span::styled(
+            if continued { "»" } else { "·" },
+            Style::default().fg(mark_color),
+        ),
+    ]
+}
+
+fn continued_color(continued: bool) -> Color {
+    if continued {
+        theme::PRIMARY
+    } else {
+        theme::SUCCESS
+    }
+}
+
+/// A today-view Live row's state glyph, two columns wide: busy / today /
+/// older for active rows; `⟳` (alive at the last snapshot) / `⏸` for paused.
+/// `is_today` is the tier boundary the Live sort also uses.
+fn live_glyph(
+    s: &crate::infrastructure::live_sessions::LiveSession,
+    is_active: bool,
+    last: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (&'static str, Color) {
+    if !is_active {
+        if s.was_recently_live {
+            ("⟳ ", theme::ACCENT)
+        } else {
+            ("⏸ ", theme::LABEL)
+        }
+    } else if s.status.as_deref() == Some("busy") {
+        ("🟢", theme::SUCCESS)
+    } else if crate::infrastructure::live_sessions::is_today(last, now) {
+        ("◉ ", theme::WARNING)
+    } else {
+        ("○ ", theme::LABEL)
+    }
+}
+
+/// A `width` x `height` rect centred in `area`.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
     }
@@ -5778,12 +6128,8 @@ fn draw_session_detail(
     // (other fields in this popup — tokens, cost, tools — are also day-only).
     let session_start = session.day_first_timestamp.with_timezone(&chrono::Local);
     let end = session.day_last_timestamp.with_timezone(&chrono::Local);
-    let duration_mins = (session.day_last_timestamp - session.day_first_timestamp).num_minutes();
-    let duration_str = if duration_mins >= 60 {
-        format!("{}h{}m", duration_mins / 60, duration_mins % 60)
-    } else {
-        format!("{duration_mins}m")
-    };
+    let duration_mins = session.day_duration_mins();
+    let duration_str = crate::text::format_duration_mins(duration_mins);
 
     let cache_write: u64 = session
         .day_tokens_by_model
@@ -6184,19 +6530,33 @@ fn draw_session_detail(
     lines.push(Line::from(""));
 
     // Model breakdown
-    if session.day_tokens_by_model.len() > 1 {
+    // One row per model: a model's pricing keys fold into its display name.
+    let mut models: Vec<(String, crate::aggregator::TokenStats, Option<f64>)> = Vec::new();
+    for (key, tokens) in &session.day_tokens_by_model {
+        let name = crate::aggregator::normalize_model_name(key);
+        let cost = calculator.calculate_cost(tokens, Some(key));
+        match models.iter_mut().find(|m| m.0 == name) {
+            Some(m) => {
+                m.1.merge(tokens);
+                m.2 = m.2.zip(cost).map(|(a, b)| a + b);
+            }
+            None => models.push((name, tokens.clone(), cost)),
+        }
+    }
+    if models.len() > 1 {
         lines.push(Line::from(Span::styled(
             "  Models",
             Style::default().fg(theme::PRIMARY).bold(),
         )));
-        let mut models: Vec<_> = session.day_tokens_by_model.iter().collect();
-        models.sort_by_key(|m| std::cmp::Reverse(m.1.work_tokens()));
-        for (model, tokens) in &models {
-            let normalized = crate::aggregator::normalize_model_name(model);
-            let clr = model_color(model);
+        models.sort_by(|a, b| {
+            b.1.work_tokens()
+                .cmp(&a.1.work_tokens())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (normalized, tokens, model_cost) in &models {
+            let clr = model_color(normalized);
             // `None` here is the per-model unpriced signal — render "$?" so
             // the row can't read as a free model next to the marked Cost row.
-            let model_cost = calculator.calculate_cost(tokens, Some(model));
             let unknown = model_cost.is_none();
             let model_cost = model_cost.unwrap_or(0.0);
             lines.push(Line::from(vec![
@@ -6277,19 +6637,8 @@ fn draw_session_detail(
 }
 
 fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    // Live tab pushes a SessionInfo into `session_detail_override` so the
-    // popup can render sessions that fall outside the active filter.
-    let session = if let Some(ref s) = state.session_detail_override {
-        s.clone()
-    } else {
-        let Some(group) = state.daily_groups.get(state.selected_day) else {
-            return;
-        };
-        let sessions: Vec<_> = group.user_sessions().collect();
-        let Some(session) = sessions.get(state.selected_session) else {
-            return;
-        };
-        (*session).clone()
+    let Some(session) = crate::handlers::pane::detail_session(state) else {
+        return;
     };
     let pinned = state.pins.is_pinned(&session.file_path);
     // Aggregate across all days (using original groups so cumulative is
@@ -6300,7 +6649,7 @@ fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         frame,
         area,
         &session,
-        " Space: pin  y: copy resume  s: summary  t: title  C: pane  ↑↓: scroll  i/Esc: close ",
+        " Enter: open  Space: pin  y: copy resume  s: summary  t: title  C: new pane  ↑↓: scroll  i/Esc: close ",
         pinned,
         state.session_detail_scroll,
         &state.project_labels,
@@ -6318,6 +6667,313 @@ fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
 // source of truth shared with MCP); the TUI just indexes it.
 use crate::aggregator::{SessionCumulative, compute_session_cumulative};
 
+/// Work tokens per clock hour summed over `sessions`.
+fn hours_of(sessions: &[&crate::aggregator::SessionInfo]) -> [u64; 24] {
+    let mut hours = [0u64; 24];
+    for s in sessions {
+        for (h, t) in &s.day_hourly_work_tokens {
+            if let Some(cell) = hours.get_mut(usize::from(*h)) {
+                *cell += t;
+            }
+        }
+    }
+    hours
+}
+
+/// The Activity popup's session rows, in display order: each user session of
+/// `group` with its subagents' hours folded in, earliest first. The popup and
+/// its keys share it, so the cursor names the row on screen.
+pub(crate) fn day_activity_rows(
+    state: &AppState,
+    group: &crate::aggregator::DailyGroup,
+) -> Vec<(std::path::PathBuf, String, [u64; 24])> {
+    let mut rows: Vec<_> = group
+        .user_sessions()
+        .map(|s| {
+            let mut own: Vec<&crate::aggregator::SessionInfo> = vec![s];
+            own.extend(group.sessions.iter().filter(|c| {
+                c.is_subagent && c.parent_path.as_deref() == Some(s.file_path.as_path())
+            }));
+            // The title tells apart sessions of one project.
+            let project = state.project_label(&s.project_name);
+            let name = match resolved_title(&state.session_titles, s) {
+                Some(title) => format!("{project} · {title}"),
+                None => project,
+            };
+            (s.file_path.clone(), name, hours_of(&own))
+        })
+        .collect();
+    // A session with no hour at all goes last, not before midnight's.
+    rows.sort_by_key(|(_, name, hours)| {
+        (
+            hours.iter().position(|t| *t > 0).unwrap_or(hours.len()),
+            name.clone(),
+        )
+    });
+    rows
+}
+
+/// Records where each `(first line, height)` cursor row of a bordered,
+/// scrolled popup lands on screen, clipped to the visible lines.
+fn record_cursor_rows(state: &mut AppState, popup: Rect, rows: &[(usize, usize)], scroll: usize) {
+    let visible = usize::from(popup.height.saturating_sub(2));
+    for (i, &(start, height)) in rows.iter().enumerate() {
+        let top = start.max(scroll);
+        let bottom = (start + height).min(scroll + visible);
+        if top >= bottom {
+            continue;
+        }
+        let y = popup.y + 1 + u16::try_from(top - scroll).unwrap_or(u16::MAX);
+        let h = u16::try_from(bottom - top).unwrap_or(u16::MAX);
+        let area = Rect::new(popup.x + 1, y, popup.width.saturating_sub(2), h);
+        state.layout.cursor_row_areas.push((i, area));
+    }
+}
+
+/// The selected Daily day's activity: the day's hours against its usual
+/// weekday, then each session's hours on the same 24-hour axis, a session's
+/// subagents folded into its row.
+fn draw_day_activity_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    use chrono::Datelike;
+    use ratatui::widgets::Clear;
+    let Some(group) = state.daily_groups.get(state.selected_day).cloned() else {
+        return;
+    };
+    // The popup widens past the shared detail size until the longest name
+    // fits beside the 24 hour cells and the row total, up to the terminal.
+    const HOURS_W: usize = 24 * 2;
+    const TOTAL_W: usize = 8;
+    let rows = day_activity_rows(state, &group);
+    let longest = rows
+        .iter()
+        .map(|(_, name, _)| 2 + unicode_width::UnicodeWidthStr::width(name.as_str()))
+        .max()
+        .unwrap_or(0);
+    let shared = detail_popup_area(area);
+    let wanted = u16::try_from(2 + 4 + longest + HOURS_W + TOTAL_W).unwrap_or(u16::MAX);
+    let width = wanted.clamp(shared.width, area.width.saturating_sub(4).max(shared.width));
+    let popup_area = centered(area, width, shared.height);
+    state.layout.active_popup_area = Some(popup_area);
+    frame.render_widget(Clear, popup_area);
+    let room =
+        usize::from(popup_area.width.saturating_sub(2)).saturating_sub(4 + HOURS_W + TOTAL_W);
+    let name_w = longest.clamp(16, room.max(16));
+    let lead = 2 + name_w + 2;
+    // The day chart carries only its scale on the left, not the name column.
+    const CHART_LABEL_W: usize = 6;
+    let chart_lead = 2 + CHART_LABEL_W + 2;
+    let axis_at = |lead: usize| {
+        Line::from(vec![
+            Span::raw(" ".repeat(lead)),
+            Span::styled(
+                "0           6           12          18          24",
+                Style::default().fg(theme::TIME),
+            ),
+        ])
+    };
+    let axis = axis_at(lead);
+    let label = |text: String, color: Color| {
+        Span::styled(
+            format!("  {}  ", crate::text::fit_width(&text, name_w)),
+            Style::default().fg(color),
+        )
+    };
+
+    // The day against the average of its weekday before it, one scale.
+    let all: Vec<&crate::aggregator::SessionInfo> = group.sessions.iter().collect();
+    let day = hours_of(&all);
+    let weekday = group.date.weekday();
+    let usual = crate::aggregator::weekday_hour_avg(&state.daily_groups, group.date)
+        [weekday.num_days_from_monday() as usize];
+    let top = day.iter().chain(&usual).copied().max().unwrap_or(0).max(1);
+    let mut header = vec![Span::styled(
+        format!(
+            " {} against a usual {} · {} vs {}",
+            group.date.format("%Y-%m-%d"),
+            group.date.format("%a"),
+            crate::format_number(day.iter().sum()),
+            crate::format_number(usual.iter().sum())
+        ),
+        Style::default().fg(theme::HEADER),
+    )];
+    let vs_usual = {
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        crate::aggregator::day_vs_usual(
+            &state.daily_groups,
+            group.date,
+            now.date_naive(),
+            now.hour() as u8,
+        )
+    };
+    if let Some(v) = vs_usual {
+        if let Some(hour) = v.through {
+            header.push(Span::styled(
+                format!(
+                    " · by {}:00 {} vs {}",
+                    hour + 1,
+                    crate::format_number(v.day),
+                    crate::format_number(v.usual)
+                ),
+                Style::default().fg(theme::HEADER),
+            ));
+        }
+        if let Some(pct) = v.pct() {
+            header.push(Span::styled(
+                format!(" ({pct}%)"),
+                Style::default().fg(theme::TOKENS),
+            ));
+        }
+    }
+    let mut lines = vec![
+        Line::from(header),
+        Line::from(vec![
+            Span::raw(" ".repeat(chart_lead)),
+            Span::styled(
+                "██",
+                Style::default().fg(theme::primary_with_intensity(USUAL_TONE)),
+            ),
+            Span::styled(" within usual  ", Style::default().fg(theme::LABEL)),
+            Span::styled("██", Style::default().fg(theme::TOKENS)),
+            Span::styled(" above usual  ", Style::default().fg(theme::LABEL)),
+            Span::styled(
+                "░░",
+                Style::default().fg(theme::primary_with_intensity(USUAL_TONE)),
+            ),
+            Span::styled(" short of usual", Style::default().fg(theme::LABEL)),
+        ]),
+    ];
+    // One scale for the day and its usual: each hour fills to the higher of
+    // the two, so where they part shows without a line drawn over the bars.
+    const CHART_ROWS: usize = 8;
+    const USUAL_TONE: f64 = 0.35;
+    let level = |t: u64| t as f64 / top as f64 * CHART_ROWS as f64;
+    for row in (0..CHART_ROWS).rev() {
+        let y_label = if row == CHART_ROWS - 1 {
+            crate::format_number(top)
+        } else {
+            String::new()
+        };
+        let mut spans = vec![Span::styled(
+            format!("  {y_label:>CHART_LABEL_W$}  "),
+            Style::default().fg(theme::META),
+        )];
+        for (d, u) in day.iter().zip(&usual) {
+            let (dl, ul) = (level(*d), level(*u));
+            let r = row as f64;
+            // Up to both heights: muted. The day past its usual: full. The
+            // usual past the day: shaded, the hour's shortfall.
+            let lo = dl.min(ul);
+            let cell = if lo >= r + 1.0 {
+                Span::styled(
+                    "██",
+                    Style::default().fg(theme::primary_with_intensity(USUAL_TONE)),
+                )
+            } else if dl >= r + 1.0 || (dl > ul && dl > r) {
+                let fill = if dl >= r + 1.0 {
+                    '█'
+                } else {
+                    let ramp = dashboard::BLOCK_RAMP;
+                    ramp[(((dl - r) * ramp.len() as f64) as usize).min(ramp.len() - 1)]
+                };
+                Span::styled(format!("{fill}{fill}"), Style::default().fg(theme::TOKENS))
+            } else if ul > r && *u > 0 {
+                Span::styled(
+                    "░░",
+                    Style::default().fg(theme::primary_with_intensity(USUAL_TONE)),
+                )
+            } else {
+                Span::raw("  ")
+            };
+            spans.push(cell);
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(axis_at(chart_lead));
+    lines.push(Line::from(""));
+
+    let cell_top = rows
+        .iter()
+        .flat_map(|(_, _, h)| h.iter())
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    lines.push(Line::from(Span::styled(
+        format!(" Sessions ({})", rows.len()),
+        Style::default().fg(theme::HEADER),
+    )));
+    lines.push(axis);
+    let cursor = state
+        .day_activity_cursor()
+        .min(rows.len().saturating_sub(1));
+    state.set_day_activity_cursor(cursor);
+    let first_row_line = lines.len();
+    for (i, (_, name, hours)) in rows.iter().enumerate() {
+        let selected = i == cursor;
+        let mut name_span = label(
+            format!("{}{name}", if selected { "▶ " } else { "" }),
+            if selected {
+                theme::TITLE
+            } else {
+                theme::PROJECT
+            },
+        );
+        if selected {
+            name_span.style = name_span.style.bg(theme::SELECTED_BG);
+        }
+        let mut spans = vec![name_span];
+        for t in hours {
+            if *t == 0 {
+                spans.push(Span::styled(
+                    format!("{} ", dashboard::SPARK_CHARS[0]),
+                    Style::default().fg(theme::SEPARATOR),
+                ));
+            } else {
+                let ratio = *t as f64 / cell_top as f64;
+                spans.push(Span::styled(
+                    "██",
+                    Style::default().fg(theme::primary_with_intensity(theme::bar_intensity(ratio))),
+                ));
+            }
+        }
+        spans.push(Span::styled(
+            format!("  {}", crate::format_number(hours.iter().sum())),
+            Style::default().fg(theme::TOKENS),
+        ));
+        lines.push(Line::from(spans));
+    }
+
+    // The view moves only when the cursor row leaves it; scrolling down past
+    // the first rows carries the chart above away.
+    let visible = usize::from(popup_area.height.saturating_sub(2));
+    let max_scroll = lines.len().saturating_sub(visible);
+    let mut scroll = state.day_activity_scroll().min(max_scroll);
+    let cursor_line = first_row_line + cursor;
+    if !rows.is_empty() {
+        // The first row shows the chart above it too, when both fit.
+        if cursor == 0 && cursor_line < visible {
+            scroll = 0;
+        } else if cursor_line < scroll {
+            scroll = cursor_line;
+        } else if cursor_line >= scroll + visible {
+            scroll = cursor_line + 1 - visible;
+        }
+    }
+    state.set_day_activity_scroll(scroll);
+    let row_lines: Vec<(usize, usize)> = (0..rows.len()).map(|i| (first_row_line + i, 1)).collect();
+    record_cursor_rows(state, popup_area, &row_lines, scroll);
+    let popup = Paragraph::new(lines).scroll((scroll as u16, 0)).block(
+        popup_block(&format!(" Activity · {} ", group.date.format("%Y-%m-%d"))).title_bottom(
+            Line::from(Span::styled(
+                " ←→: day  ↑↓: session  Enter: info  Esc: close ",
+                Style::default().fg(theme::LABEL),
+            )),
+        ),
+    );
+    frame.render_widget(popup, popup_area);
+}
+
 fn draw_breakdown_detail_popup(
     frame: &mut Frame,
     area: Rect,
@@ -6328,16 +6984,10 @@ fn draw_breakdown_detail_popup(
 ) {
     use ratatui::widgets::Clear;
 
-    let popup_width = 80.min(area.width.saturating_sub(4));
-    let item_count = items.len() as u16;
-    let popup_height = (item_count + 4).min(area.height.saturating_sub(4)).min(30);
-
-    let popup_area = Rect {
-        x: area.width.saturating_sub(popup_width) / 2,
-        y: area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    // The size every detail popup shares, so a long breakdown is not read
+    // through a small window.
+    let popup_area = detail_popup_area(area);
+    let popup_height = popup_area.height;
 
     frame.render_widget(Clear, popup_area);
 
@@ -6384,7 +7034,13 @@ fn draw_breakdown_detail_popup(
                 } else {
                     "          "
                 };
-                (label, theme::SUCCESS, name.clone(), count.to_string(), *pct)
+                (
+                    label,
+                    tool_category_color(name),
+                    crate::aggregator::format_tool_short(name),
+                    count.to_string(),
+                    *pct,
+                )
             }
         };
 
@@ -6406,17 +7062,12 @@ fn draw_breakdown_detail_popup(
     let total_items = items.len();
     let can_scroll_up = scroll > 0;
     let can_scroll_down = scroll + visible_height < total_items;
-    let scroll_indicator = match (can_scroll_up, can_scroll_down) {
-        (true, true) => " ▲▼ ",
-        (true, false) => " ▲ ",
-        (false, true) => " ▼ ",
-        (false, false) => "",
-    };
+    let scroll_indicator = scroll_arrows(can_scroll_up, can_scroll_down, " ", " ");
 
     let popup = Paragraph::new(lines).block(
         popup_block(&format!(" Breakdown ({total_items}) ")).title_bottom(Line::from(vec![
             Span::styled(
-                " ↑↓: scroll  b/Esc: close ",
+                " ←→: day  ↑↓: scroll  Enter/Esc: close ",
                 Style::default().fg(theme::LABEL),
             ),
             Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
@@ -6441,12 +7092,7 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
     let popup_width = 60.min(area.width.saturating_sub(4));
     let popup_height = (total_items as u16 + 4 + extra_lines).min(area.height.saturating_sub(4));
 
-    let popup_area = Rect {
-        x: area.width.saturating_sub(popup_width) / 2,
-        y: area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = centered(area, popup_width, popup_height);
 
     state.layout.filter_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
@@ -6545,12 +7191,7 @@ fn draw_title_edit_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppSt
 
     let popup_width = 72u16.min(area.width.saturating_sub(4));
     let popup_height = 5u16.min(area.height.saturating_sub(4));
-    let popup_area = Rect {
-        x: area.width.saturating_sub(popup_width) / 2,
-        y: area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = centered(area, popup_width, popup_height);
     // Without this, `handle_mouse_click` sees no popup area and treats a
     // click INSIDE the editor as outside → dismisses and drops the edit.
     state.layout.active_popup_area = Some(popup_area);
@@ -6587,12 +7228,7 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
         .min(area.height.saturating_sub(4))
         .min(23);
 
-    let popup_area = Rect {
-        x: area.width.saturating_sub(popup_width) / 2,
-        y: area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = centered(area, popup_width, popup_height);
 
     state.layout.project_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
@@ -6608,16 +7244,6 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
         scroll_val = sel + 1 - inner_height;
     }
     state.set_project_popup_scroll(scroll_val);
-
-    // Detect basename collisions so we can disambiguate two projects that
-    // share a final path segment. Colliding entries get the parent directory
-    // appended in dim brackets.
-    let mut basename_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
-    for (name, _, _) in &state.project_list {
-        let base = name.rsplit('/').next().unwrap_or(name.as_str());
-        *basename_counts.entry(base).or_insert(0) += 1;
-    }
 
     // Row order follows the Projects panel sort mode. `project_list_sorted`
     // is the single source of truth so panel and popup agree on rank.
@@ -6644,24 +7270,7 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
         } else if let Some((name, tokens, last_date)) = sorted.get(i - 1).copied() {
             let is_current = state.project_filter.as_ref() == Some(name);
             let marker = if is_current { "\u{25cf}" } else { " " };
-            let basename = name.rsplit('/').next().unwrap_or(name.as_str());
-            // When two projects share a basename, append the immediate parent
-            // directory in parentheses to disambiguate.
-            let short_owned: String = if basename_counts.get(basename).copied().unwrap_or(0) > 1 {
-                let parent = name
-                    .rsplit_once('/')
-                    .map_or("", |(p, _)| p)
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("");
-                if parent.is_empty() {
-                    basename.to_string()
-                } else {
-                    format!("{basename} ({parent})")
-                }
-            } else {
-                basename.to_string()
-            };
+            let short_owned = state.project_label(name);
             let short = short_owned.as_str();
             let token_str = crate::format_number(*tokens);
             let date_str = last_date.format("%Y-%m-%d").to_string();
@@ -6709,122 +7318,21 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
     frame.render_widget(popup, popup_area);
 }
 
-/// Per-day metric value, used by trends to build sparklines and the
-/// trailing-window averages shown alongside them.
-pub(crate) struct DailyTrendValue {
-    /// Numerator (e.g., cache_read tokens).
-    pub num: f64,
-    /// Denominator (e.g., input + cache_read tokens). Skipped when 0.
-    pub den: f64,
-}
-
-/// How a calendar day with no activity enters a trend series. A per-day rate
-/// (`$/day`, `Sessions/day`) must count it as zero, or the trailing average
-/// silently becomes a per-active-day figure and disagrees with every other
-/// per-day number. A per-session rate must skip it — a day with no sessions
-/// has no ratio to contribute.
-#[derive(Clone, Copy)]
-pub(crate) enum MissingDay {
-    Zero,
-    Skip,
-}
-
-pub(crate) fn metric_per_day(
-    state: &AppState,
-    today: chrono::NaiveDate,
-    days: usize,
-    missing: MissingDay,
-    mut sample: impl FnMut(&crate::aggregator::DailyGroup) -> DailyTrendValue,
-) -> Vec<(chrono::NaiveDate, Option<f64>)> {
-    let by_date: std::collections::HashMap<chrono::NaiveDate, &crate::aggregator::DailyGroup> =
-        state.daily_groups.iter().map(|g| (g.date, g)).collect();
-    (0..days)
-        .rev()
-        .map(|offset| {
-            let date = today - chrono::Duration::days(offset as i64);
-            // A zero denominator is "not computable", never zero — it stays
-            // `None` regardless of how absent days are treated.
-            let value = match by_date.get(&date) {
-                Some(g) => {
-                    let v = sample(g);
-                    (v.den > 0.0).then(|| v.num / v.den)
-                }
-                None => match missing {
-                    MissingDay::Zero => Some(0.0),
-                    MissingDay::Skip => None,
-                },
-            };
-            (date, value)
-        })
-        .collect()
-}
-
-pub(crate) fn tokens_per_session_value(group: &crate::aggregator::DailyGroup) -> DailyTrendValue {
-    let mut tokens = 0u64;
-    let mut sess = 0u64;
-    for s in &group.sessions {
-        if s.is_subagent {
-            continue;
-        }
-        tokens += s.work_tokens();
-        sess += 1;
-    }
-    DailyTrendValue {
-        num: tokens as f64,
-        den: sess as f64,
-    }
-}
-
-pub(crate) fn sessions_per_day_value(group: &crate::aggregator::DailyGroup) -> DailyTrendValue {
-    let sess = group.sessions.iter().filter(|s| !s.is_subagent).count();
-    // Den=1 so the sample IS the session count; metric_per_day will return
-    // `Some(sess)` only when `den > 0`, which is always true here.
-    DailyTrendValue {
-        num: sess as f64,
-        den: 1.0,
-    }
-}
-
-/// Returns (recent_avg, baseline_avg) where recent = last 7 samples and
-/// baseline = all 30 samples. Both averages drop missing days (None) so
-/// gaps don't drag values toward zero.
-pub(crate) fn summarise_series(
-    samples: &[(chrono::NaiveDate, Option<f64>)],
-) -> (Option<f64>, Option<f64>) {
-    fn avg(values: &[f64]) -> Option<f64> {
-        if values.is_empty() {
-            None
-        } else {
-            Some(values.iter().sum::<f64>() / values.len() as f64)
-        }
-    }
-    let recent: Vec<f64> = samples
+/// A project's session rows, newest day first (ties keep the data's order):
+/// one per (session, day), user sessions only. The popup and its keys share
+/// it, so the row a cursor names is the row that opens.
+pub(crate) fn project_session_rows<'a>(
+    state: &'a AppState,
+    path: &str,
+) -> Vec<(&'a crate::aggregator::DailyGroup, &'a SessionInfo)> {
+    let mut rows: Vec<_> = state
+        .daily_groups
         .iter()
-        .rev()
-        .take(7)
-        .filter_map(|(_, v)| *v)
+        .flat_map(|g| g.user_sessions().map(move |s| (g, s)))
+        .filter(|(_, s)| s.project_name == path)
         .collect();
-    let baseline: Vec<f64> = samples.iter().filter_map(|(_, v)| *v).collect();
-    (avg(&recent), avg(&baseline))
-}
-
-/// Render the recent-vs-baseline delta as a percent change. Uniform across
-/// every metric in the popup so absolute units (%, tokens, sess) don't leak
-/// into the delta column.
-pub(crate) fn fmt_delta_pct(recent: Option<f64>, baseline: Option<f64>) -> String {
-    match (recent, baseline) {
-        (Some(r), Some(b)) if b.abs() > f64::EPSILON => {
-            let pct = ((r - b) / b) * 100.0;
-            if pct.abs() < 5.0 {
-                "≈".to_string()
-            } else if pct > 0.0 {
-                format!("↑+{pct:.0}%")
-            } else {
-                format!("↓{pct:.0}%")
-            }
-        }
-        _ => "—".to_string(),
-    }
+    rows.sort_by_key(|(g, _)| std::cmp::Reverse(g.date));
+    rows
 }
 
 /// Per-project drilldown popup. Aggregates data for the single project
@@ -6841,14 +7349,10 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         return;
     }
 
-    let popup_width = 90.min(area.width.saturating_sub(4));
-    let popup_height = 30.min(area.height.saturating_sub(4));
-    let popup_area = Rect {
-        x: area.width.saturating_sub(popup_width) / 2,
-        y: area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    // The size every detail popup shares, so drilling in from the Projects
+    // list does not shrink the view.
+    let popup_area = detail_popup_area(area);
+    let (popup_width, popup_height) = (popup_area.width, popup_area.height);
     state.layout.active_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
@@ -6876,27 +7380,15 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         std::collections::HashMap::new();
     let mut active_days_set: std::collections::HashSet<chrono::NaiveDate> =
         std::collections::HashSet::new();
-    // (date, project-label, tokens, cost, model, session_file_path, branch, duration_mins)
-    let mut sessions_rev: Vec<(
-        chrono::NaiveDate,
-        u64,
-        f64,
-        bool, // unpriced — cost is a lower bound, mark it
-        Option<String>,
-        std::path::PathBuf,
-        Option<String>,
-        i64,
-    )> = Vec::new();
     let mut project_unpriced = false;
     let mut unpriced_models: std::collections::HashSet<String> = std::collections::HashSet::new();
     for group in &state.daily_groups {
-        let mut by_parent = None;
         for session in &group.sessions {
             if session.project_name != path {
                 continue;
             }
-            // Money, tokens and models include subagents, as the Projects
-            // panel and Overview do; session counts and turns stay the user's.
+            // The subagent rule: what a session spends or does counts its
+            // subagents; session counts, turns and the rows stay the user's.
             let sess_tokens = session.work_tokens();
             let sess_cost: f64 = session.cost(calculator);
             let sess_unpriced = session.has_unpriced_model(calculator);
@@ -6913,42 +7405,21 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
             }
             *daily_tokens.entry(group.date).or_insert(0) += sess_tokens;
             *daily_cost.entry(group.date).or_insert(0.0) += sess_cost;
-            if session.is_subagent {
-                continue;
-            }
-            unique_sessions.insert(session.file_path.clone());
-            session_day_count += 1;
             active_days_set.insert(group.date);
-            total_turns += session.day_prompts;
             project_churn.add(session.line_churn);
             for (tool, count) in &session.day_tool_usage {
                 *tool_count.entry(tool.clone()).or_insert(0) += count;
             }
             first_seen = Some(first_seen.map_or(group.date, |d| d.min(group.date)));
             last_seen = Some(last_seen.map_or(group.date, |d| d.max(group.date)));
-            let duration = (session.day_last_timestamp - session.day_first_timestamp)
-                .num_minutes()
-                .max(1);
-            // The row folds in its subagents so it matches the Daily row.
-            let subagents = by_parent
-                .get_or_insert_with(|| group.subagent_spend_by_parent())
-                .get(session.file_path.as_path())
-                .copied()
-                .unwrap_or_default();
-            sessions_rev.push((
-                group.date,
-                sess_tokens + subagents.work_tokens,
-                sess_cost + subagents.cost,
-                sess_unpriced || subagents.unpriced,
-                session.model.clone(),
-                session.file_path.clone(),
-                session.git_branch.clone(),
-                duration,
-            ));
+            if session.is_subagent {
+                continue;
+            }
+            unique_sessions.insert(session.file_path.clone());
+            session_day_count += 1;
+            total_turns += session.day_prompts;
         }
     }
-    // Sort sessions by date desc (newest first).
-    sessions_rev.sort_by_key(|s| std::cmp::Reverse(s.0));
 
     let label = state.project_label(&path);
     let label_dim = Style::default().fg(theme::LABEL);
@@ -7054,11 +7525,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
             } else {
                 0
             };
-            let bar = format!(
-                "{}{}",
-                "█".repeat(filled.min(bar_w)),
-                "░".repeat(bar_w.saturating_sub(filled))
-            );
+            let bar = crate::text::hbar(filled, bar_w);
             content.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(bar, Style::default().fg(clr)),
@@ -7122,74 +7589,130 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         "      date       branch   duration   tokens     cost      model",
         Style::default().fg(theme::LABEL),
     )]));
-    for (i, (date, tokens, cost, unpriced, model, file_path, branch, duration_mins)) in
-        sessions_rev.iter().take(10).enumerate()
-    {
-        let model_short = model.as_ref().map_or_else(
+    let rows = project_session_rows(state, &path);
+    let cursor = state
+        .project_detail_cursor()
+        .min(rows.len().saturating_sub(1));
+    let mut cursor_line = content.len();
+    let mut row_starts = Vec::with_capacity(rows.len());
+    let mut spend_by_day = std::collections::HashMap::new();
+    for (i, (group, session)) in rows.iter().enumerate() {
+        row_starts.push(content.len());
+        // The row folds in its subagents so it matches the Daily row.
+        let subagents = spend_by_day
+            .entry(group.date)
+            .or_insert_with(|| group.subagent_spend_by_parent())
+            .get(session.file_path.as_path())
+            .copied()
+            .unwrap_or_default();
+        let tokens = session.work_tokens() + subagents.work_tokens;
+        let cost = session.cost(calculator) + subagents.cost;
+        let unpriced = session.has_unpriced_model(calculator) || subagents.unpriced;
+        let model_short = session.model.as_ref().map_or_else(
             || "?".to_string(),
             |m| crate::aggregator::normalize_model_name(m),
         );
-        let branch_short = branch
+        let branch_short = session
+            .git_branch
             .as_ref()
             .map(|b| {
                 let name = b.split('/').next_back().unwrap_or(b);
                 format!(" #{name}")
             })
             .unwrap_or_default();
-        let dur_str = if *duration_mins >= 60 {
-            format!("{}h{}m", duration_mins / 60, duration_mins % 60)
+        let dur_str = crate::text::format_duration_mins(session.day_duration_mins().max(1));
+        let selected = i == cursor;
+        if selected {
+            cursor_line = content.len();
+        }
+        let (marker, bg) = if selected {
+            ("▶ ", Style::default().bg(theme::SELECTED_BG))
         } else {
-            format!("{duration_mins}m")
+            ("  ", Style::default())
         };
-        content.push(Line::from(vec![
-            Span::styled(format!("  {:>2}. ", i + 1), label_dim),
-            Span::styled(
-                date.format("%Y-%m-%d").to_string(),
-                Style::default().fg(theme::TIME),
-            ),
-            Span::styled(branch_short, Style::default().fg(theme::BRANCH)),
-            Span::styled(format!("  {dur_str:>6}  "), label_dim),
-            Span::styled(
-                format!("{:>9}", crate::format_number(*tokens)),
-                Style::default().fg(theme::PRIMARY),
-            ),
-            Span::styled(
-                format!("  {}", format_cost_marked(*cost, *unpriced, 2)),
-                cost_style_marked(*cost, *unpriced),
-            ),
-            Span::styled(
-                format!("  [{model_short}]"),
-                Style::default().fg(model_color(&model_short)),
-            ),
-        ]));
-        // Session UUID below the summary row so it's available for `claude -r`
-        // without crowding the metadata line.
-        let session_id = file_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?");
-        content.push(Line::from(Span::styled(
-            format!("      {session_id}"),
-            Style::default().fg(theme::SESSION_ID),
-        )));
-    }
-    if sessions_rev.len() > 10 {
-        content.push(Line::from(Span::styled(
-            format!("  +{} earlier sessions", sessions_rev.len() - 10),
-            label_dim,
-        )));
+        content.push(
+            Line::from(vec![
+                Span::styled(format!("{marker}{:>2}. ", i + 1), label_dim),
+                Span::styled(
+                    group.date.format("%Y-%m-%d").to_string(),
+                    Style::default().fg(theme::TIME),
+                ),
+                Span::styled(branch_short, Style::default().fg(theme::BRANCH)),
+                Span::styled(format!("  {dur_str:>6}  "), label_dim),
+                Span::styled(
+                    format!("{:>9}", crate::format_number(tokens)),
+                    Style::default().fg(theme::PRIMARY),
+                ),
+                Span::styled(
+                    format!("  {}", format_cost_marked(cost, unpriced, 2)),
+                    cost_style_marked(cost, unpriced),
+                ),
+                Span::styled(
+                    format!("  [{model_short}]"),
+                    Style::default().fg(model_color(&model_short)),
+                ),
+            ])
+            .style(bg),
+        );
+        // What the session was about, as Daily and Activity name it; the id
+        // stands in only when it has no title of any kind.
+        let title = resolved_title(&state.session_titles, session).map_or_else(
+            || {
+                session
+                    .file_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string()
+            },
+            str::to_string,
+        );
+        content.push(
+            Line::from(Span::styled(
+                format!(
+                    "      {}",
+                    truncate_with_ellipsis(&title, usize::from(popup_width).saturating_sub(10))
+                ),
+                Style::default().fg(if selected {
+                    theme::TITLE
+                } else {
+                    theme::SNIPPET
+                }),
+            ))
+            .style(bg),
+        );
     }
 
     let visible_height = popup_height.saturating_sub(2) as usize;
     let max_scroll = content.len().saturating_sub(visible_height);
-    let scroll = state.project_detail_scroll().min(max_scroll);
+    // The view follows the cursor's two-line row; the first row shows the
+    // project's figures above it as well, when both fit.
+    let mut scroll = state.project_detail_scroll();
+    if cursor == 0 && cursor_line + 2 <= visible_height {
+        scroll = 0;
+    } else if cursor_line < scroll {
+        scroll = cursor_line;
+    } else if cursor_line + 2 > scroll + visible_height {
+        scroll = (cursor_line + 2).saturating_sub(visible_height);
+    }
+    let scroll = scroll.min(max_scroll);
     state.set_project_detail_scroll(scroll);
+    state.set_project_detail_cursor(cursor);
+    let row_lines: Vec<(usize, usize)> = row_starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = row_starts.get(i + 1).copied().unwrap_or(start + 2);
+            (start, end - start)
+        })
+        .collect();
+    record_cursor_rows(state, popup_area, &row_lines, scroll);
 
     // Footer aligned with the other detail popups (CLAUDE.md "Footer /
     // title_bottom Format"): `key: action` with colon+space, `▲▼` for the
     // can-scroll indicator (not `↑↓` — those are reserved for keybind
-    // hints), and a position chip `[N/M project-label]` mirroring
-    // `insights_detail`'s `[1/4] Metrics`.
+    // hints), and a position chip `[N/M project-label]` mirroring the
+    // Insights detail's `[N/M panel]`.
     let can_scroll_up = scroll > 0;
     let can_scroll_down = scroll + visible_height < content.len();
     let scroll_indicator = if can_scroll_up && can_scroll_down {
@@ -7212,7 +7735,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     let title = format!(" Project · {label} ");
     let block = popup_block(&title).title_bottom(Line::from(vec![
         Span::styled(
-            " ↑↓: scroll  Enter/q: back ",
+            " ↑↓: session  Enter: info  q/Esc: back ",
             Style::default().fg(theme::LABEL),
         ),
         Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
@@ -7230,12 +7753,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let popup_width = 76.min(area.width.saturating_sub(4));
     let popup_height = area.height.saturating_sub(4).min(44);
 
-    let popup_area = Rect {
-        x: area.width.saturating_sub(popup_width) / 2,
-        y: area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    let popup_area = centered(area, popup_width, popup_height);
 
     state.layout.active_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
@@ -7252,6 +7770,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("                filter:date:Y-M-D"),
         Line::from("                project:NAME · branch:NAME · model:NAME"),
         Line::from("  f             Open period filter"),
+        Line::from("                MCP stale is judged at a past period's last day"),
         Line::from("  p             Open project filter"),
         Line::from("  m             Open pinned-sessions view (header shows `*N` count)"),
         Line::from("                J / K in the pin list reorders the focused entry"),
@@ -7289,8 +7808,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Span::styled("(Tab 2)", Style::default().fg(theme::LABEL)),
         ]),
         Line::from("  ↑/↓ j/k       Select session (busy → today → older → paused)"),
-        Line::from("  Enter         Open conversation in pane"),
-        Line::from("  i             Session details (includes pid / status)"),
+        Line::from("  Enter         Session details (pid / status)"),
+        Line::from("                in details: Enter opens the conversation"),
         Line::from("  Space         Pin / unpin (same as Daily)"),
         Line::from("  y             Copy `cd ... && claude -r UUID` to clipboard"),
         Line::from("  ←/→ h/l       Time-travel: step back/forward through frozen snapshots"),
@@ -7308,11 +7827,12 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ]),
         Line::from("  ←/→ h/l       Navigate days"),
         Line::from("  ↑/↓ j/k       Select session (or scroll breakdown)"),
-        Line::from("  b             Toggle breakdown focus"),
+        Line::from("  ↑ past top    Focus breakdown, then activity · Enter opens it"),
         Line::from("  t             Edit session title"),
         Line::from("  T             Jump to today"),
-        Line::from("  i / [i] click Session details"),
-        Line::from("  Enter         Open conversation (⇧Enter / C: in a new pane)"),
+        Line::from("  Enter         Session details (also double-click)"),
+        Line::from("                in details: Enter opens the conversation"),
+        Line::from("  ⇧Enter / C    Open conversation in a new pane"),
         Line::from("  Space         Pin / unpin session"),
         Line::from("  s / S         Session / Day summary (AI)"),
         Line::from("                in popup: r regenerate · t write resume title"),
@@ -7383,7 +7903,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  $/MTok billed = cost ÷ all billed tokens (input+output+cache)"),
         Line::from("  Cache TTL: 5m (1.25× base) vs 1h (2× base);"),
         Line::from("             higher 5m share = cheaper writes"),
-        Line::from("  Cache  = ~/.ccsight/cache.json"),
+        Line::from("  Cache  = ~/.ccsight/cache-v*.json"),
         Line::from("  Pins   = ~/.ccsight/pins.json"),
     ]);
 
@@ -7393,7 +7913,11 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .title(Span::styled(
             " Help [↑↓: scroll] ",
             Style::default().fg(theme::PRIMARY).bold(),
-        ));
+        ))
+        .title_bottom(Line::from(Span::styled(
+            " ↑↓: scroll  ?/q/Esc: close ",
+            Style::default().fg(theme::LABEL),
+        )));
     let inner = block.inner(popup_area);
     let total_lines = content.len() as u16;
     let max_scroll = total_lines.saturating_sub(inner.height);
@@ -7931,34 +8455,6 @@ mod tests {
     }
 
     #[test]
-    fn the_today_vs_average_popup_chart_grows_with_the_terminal() {
-        // The popup's chart rows sit between the y-axis `│` and the `└` axis.
-        let chart_rows = |w: u16, h: u16| {
-            let mut state = create_test_state();
-            state.tab = crate::Tab::Insights;
-            state.insights_panel = 1;
-            state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
-            let text = render_popup_text(&mut state, w, h);
-            let axis = text
-                .lines()
-                .position(|l| l.contains("└──"))
-                .expect("x axis");
-            let top = text
-                .lines()
-                .position(|l| l.contains("Today vs Average"))
-                .expect("title");
-            axis - top - 1
-        };
-        let small = chart_rows(80, 24);
-        let large = chart_rows(140, 45);
-        assert!(small >= 8, "keeps the floor: {small}");
-        assert!(
-            large > small + 10,
-            "fills the taller popup: {small} → {large}"
-        );
-    }
-
-    #[test]
     fn a_rename_of_a_ccsight_generated_session_shows_the_new_name() {
         let mut s = crate::test_helpers::helpers::make_session("p", None, None);
         let (prompt, label) = crate::summary::GENERATED_PROMPTS[0];
@@ -8242,6 +8738,31 @@ mod tests {
         );
     }
 
+    // The logo walks only while fully formed, one column per step inside its
+    // span, alternating legs, and is back at the centre when it stops.
+    #[test]
+    fn the_loading_logo_walks_out_and_back_home() {
+        let home = LOGO_WALK_SPAN / 2;
+        assert_eq!(logo_walk(0), (home, None));
+        assert_eq!(logo_walk(LOGO_WALK.end), (home, None));
+        let walk: Vec<(usize, Option<&str>)> = LOGO_WALK.map(logo_walk).collect();
+        assert!(
+            walk.iter()
+                .all(|(x, legs)| *x <= LOGO_WALK_SPAN && legs.is_some())
+        );
+        assert_eq!(walk.first().map(|w| w.0), Some(home));
+        assert_eq!(walk.last().map(|w| w.0), Some(home));
+        assert!(walk.iter().any(|w| w.0 == 0) && walk.iter().any(|w| w.0 == LOGO_WALK_SPAN));
+        assert!(walk.windows(2).all(|p| p[0].0.abs_diff(p[1].0) <= 1));
+        let start = LOGO_WALK.start;
+        assert_ne!(
+            logo_walk(start).1,
+            logo_walk(start + 2).1,
+            "legs alternate per step"
+        );
+        assert!(LOGO_FORMED < start, "walks only once formed");
+    }
+
     fn conv_msg(role: &str, blocks: Vec<ConversationBlock>) -> ConversationMessage {
         ConversationMessage {
             role: role.to_string(),
@@ -8250,7 +8771,33 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_long_conversation_keeps_the_newest_messages_up_to_the_line_cap() {
+        let messages: Vec<ConversationMessage> = (0..6000)
+            .map(|i| {
+                conv_msg(
+                    "user",
+                    vec![ConversationBlock::Text(format!("message number {i}"))],
+                )
+            })
+            .collect();
+        let (lines, positions, flags) = render_conversation_lines(&messages, 80, None);
+        assert_eq!(lines.len(), flags.len());
+        assert_eq!(positions.last().map(|p| p.1), Some(5999));
+        let first_kept = positions[0].1;
+        let placeholder: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(placeholder, format!("... ({first_kept} earlier messages)"));
+        // The placeholder is the one line beyond the cap; one more message would
+        // push the kept window past it.
+        let per_message = positions[1].0 - positions[0].0;
+        assert!(lines.len() - 1 <= 10000);
+        assert!(lines.len() - 1 + per_message > 10000);
+        for pair in positions.windows(2) {
+            assert_eq!(pair[1].1, pair[0].1 + 1);
         }
     }
 
@@ -8274,6 +8821,41 @@ mod tests {
             !footer(&mut state).contains("H/L:day"),
             "dead key advertised"
         );
+    }
+
+    #[test]
+    fn a_loading_pane_shows_centered_progress_then_preparing() {
+        let mut state = create_test_state();
+        state.show_conversation = true;
+        state.active_pane_index = Some(0);
+        let pane = crate::ConversationPane {
+            file_path: Some(std::path::PathBuf::from("/tmp/loading.jsonl")),
+            loading: true,
+            load_total: 1000,
+            ..Default::default()
+        };
+        pane.load_read
+            .store(420, std::sync::atomic::Ordering::Relaxed);
+        state.panes = vec![pane];
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("Loading conversation"), "{text}");
+        assert!(text.contains(" 42%"), "{text}");
+        assert!(text.contains("420 B / 1.0 KB"), "{text}");
+        let row = text
+            .lines()
+            .position(|l| l.contains("Loading conversation"))
+            .unwrap();
+        assert!(
+            row > 10,
+            "vertically centered, not pinned to the top: row {row}"
+        );
+
+        state.panes[0]
+            .load_read
+            .store(1000, std::sync::atomic::Ordering::Relaxed);
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("Preparing conversation"), "{text}");
+        assert!(text.contains("100%"), "{text}");
     }
 
     #[test]
@@ -8447,13 +9029,14 @@ mod tests {
         let popups: Vec<crate::ActivePopup> = vec![
             crate::ActivePopup::None,
             crate::ActivePopup::Help { scroll: 0 },
-            crate::ActivePopup::Detail,
+            crate::ActivePopup::Detail { back: None },
             crate::ActivePopup::Summary { scroll: 0 },
             crate::ActivePopup::InsightsDetail { scroll: 0 },
             crate::ActivePopup::DashboardDetail,
             crate::ActivePopup::ProjectDetail {
                 path: "~/proj".to_string(),
                 scroll: 0,
+                cursor: 0,
             },
             crate::ActivePopup::FilterPopup {
                 selected: 0,
@@ -8514,6 +9097,8 @@ mod tests {
             conv_msg(
                 "assistant",
                 vec![ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Read".into(),
                     input_summary: "src/lib.rs".into(),
                 }],
@@ -8521,6 +9106,7 @@ mod tests {
             conv_msg(
                 "user",
                 vec![ConversationBlock::ToolResult {
+                    tool_use_id: String::new(),
                     content: "command not found: expected binary".into(),
                     is_error: true,
                 }],
@@ -8648,6 +9234,8 @@ mod tests {
             conv_msg(
                 "assistant",
                 vec![ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Edit".into(),
                     input_summary: "aggregator/stats.rs".into(),
                 }],
@@ -8733,6 +9321,8 @@ mod tests {
             conv_msg(
                 "assistant",
                 vec![ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Edit".into(),
                     input_summary: "src/state.rs".into(),
                 }],
@@ -8740,6 +9330,7 @@ mod tests {
             conv_msg(
                 "user",
                 vec![ConversationBlock::ToolResult {
+                    tool_use_id: String::new(),
                     content: "The file has been updated successfully.".into(),
                     is_error: false,
                 }],
@@ -8765,6 +9356,8 @@ mod tests {
             conv_msg(
                 "assistant",
                 vec![ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: name.into(),
                     input_summary: arg.into(),
                 }],
@@ -8774,6 +9367,7 @@ mod tests {
             conv_msg(
                 "user",
                 vec![ConversationBlock::ToolResult {
+                    tool_use_id: String::new(),
                     content: "out".into(),
                     is_error: err,
                 }],
@@ -8807,13 +9401,143 @@ mod tests {
         let (lines2, _, _) = render_compact_lines(&messages, 100, &expanded);
         let detail = lines2
             .iter()
-            .filter(|l| {
+            .map(|l| {
                 l.spans
                     .iter()
-                    .any(|s| s.content.contains("⚙") && s.content.contains(".rs"))
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
             })
+            .filter(|l| l.contains("⚙") && l.contains(".rs") && !l.contains("tools"))
             .count();
         assert_eq!(detail, 3, "expanded group shows each call");
+    }
+
+    // An expanded run shows each call in full: every input field, then its
+    // result named after the call with how long it took, then every line.
+    #[test]
+    fn an_expanded_tool_run_shows_each_call_in_full() {
+        let at =
+            |secs: i64| Some(chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap());
+        let mut call = conv_msg(
+            "assistant",
+            vec![ConversationBlock::ToolUse {
+                id: "c1".into(),
+                name: "Bash".into(),
+                input_summary: "make test".into(),
+                input: vec![
+                    ("command".into(), "make test".into()),
+                    ("description".into(), "Run the tests".into()),
+                ],
+            }],
+        );
+        call.timestamp_utc = at(0);
+        let mut answer = conv_msg(
+            "user",
+            vec![ConversationBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: format!(
+                    "\n\n{}\n\n\n\nlast\n\n",
+                    (1..=40)
+                        .map(|n| format!("out {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+                is_error: false,
+            }],
+        );
+        answer.timestamp_utc = at(12);
+        let messages = vec![call, answer];
+        let expanded: std::collections::HashSet<usize> = [0].into_iter().collect();
+        let (lines, _, _) = render_compact_lines(&messages, 100, &expanded);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let has = |needle: &str| text.iter().any(|l| l.contains(needle));
+        // The call's header carries its result and its description; the
+        // description is not repeated below, the command is.
+        assert!(has("⚙ Bash ✓ 12.0s  Run the tests"), "{text:#?}");
+        assert!(has("command: make test"), "{text:#?}");
+        assert!(!has("description:") && !has("↳"), "{text:#?}");
+        assert!(
+            has("│ out 1") && has("│ out 40") && has("│ last"),
+            "{text:#?}"
+        );
+        // Blank lines: none at the ends, a run folds to one.
+        let out: Vec<&String> = text.iter().filter(|l| l.contains('│')).collect();
+        assert!(out.first().is_some_and(|l| l.contains("out 1")), "{out:#?}");
+        assert!(out.last().is_some_and(|l| l.contains("last")), "{out:#?}");
+        let blank_rows = out.iter().filter(|l| l.trim_end().ends_with('│')).count();
+        assert_eq!(blank_rows, 1, "{out:#?}");
+        assert!(
+            !text.last().is_some_and(|l| l.trim().is_empty()),
+            "no trailing blank row"
+        );
+    }
+
+    // A result whose call sits in a preceding (mixed) message still names the
+    // call it answers; it has no call header in its own run to join.
+    #[test]
+    fn a_result_apart_from_its_call_names_the_call() {
+        let call = conv_msg(
+            "assistant",
+            vec![
+                ConversationBlock::Text("Running it.".into()),
+                ConversationBlock::ToolUse {
+                    id: "c9".into(),
+                    name: "Grep".into(),
+                    input_summary: "needle".into(),
+                    input: vec![("pattern".into(), "needle".into())],
+                },
+            ],
+        );
+        let answer = conv_msg(
+            "user",
+            vec![ConversationBlock::ToolResult {
+                tool_use_id: "c9".into(),
+                content: "hit".into(),
+                is_error: true,
+            }],
+        );
+        let messages = vec![call, answer];
+        let expanded: std::collections::HashSet<usize> = [1].into_iter().collect();
+        let (lines, _, _) = render_compact_lines(&messages, 100, &expanded);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("↳ Grep ✗")), "{text:#?}");
+        assert!(text.iter().any(|l| l.contains("│ hit")), "{text:#?}");
+    }
+
+    // Code in a tool's output reads by its indentation: every wrapped piece
+    // keeps the line's leading whitespace, a tab as four columns.
+    #[test]
+    fn tool_output_keeps_its_indentation() {
+        assert_eq!(
+            wrap_keeping_indent("    let x = 1;", 40),
+            vec!["    let x = 1;"]
+        );
+        assert_eq!(wrap_keeping_indent("\tfoo", 40), vec!["    foo"]);
+        let wrapped = wrap_keeping_indent("  aaaa bbbb cccc dddd", 12);
+        assert!(
+            wrapped.len() > 1 && wrapped.iter().all(|p| p.starts_with("  ")),
+            "{wrapped:?}"
+        );
+        let mut lines = Vec::new();
+        let mut flags = Vec::new();
+        push_tool_output(
+            "fn main() {\n    body();\n}",
+            false,
+            80,
+            &mut lines,
+            &mut flags,
+        );
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(rows[1], "  │     body();", "{rows:#?}");
     }
 
     // message judgment function tests
@@ -8823,10 +9547,13 @@ mod tests {
             role: "assistant".to_string(),
             blocks: vec![
                 ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Read".to_string(),
                     input_summary: "/path".to_string(),
                 },
                 ConversationBlock::ToolResult {
+                    tool_use_id: String::new(),
                     content: "content".to_string(),
                     is_error: false,
                 },
@@ -8835,7 +9562,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         };
         assert!(is_tool_only_message(&msg));
     }
@@ -8847,6 +9574,8 @@ mod tests {
             blocks: vec![
                 ConversationBlock::Text("Hello".to_string()),
                 ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Read".to_string(),
                     input_summary: "/path".to_string(),
                 },
@@ -8855,7 +9584,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         };
         assert!(!is_tool_only_message(&msg));
     }
@@ -8869,7 +9598,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         };
         assert!(is_thinking_only_message(&msg));
     }
@@ -8883,7 +9612,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         };
         assert_eq!(extract_message_text(&msg), "Hello world");
     }
@@ -8893,6 +9622,7 @@ mod tests {
         let msg = ConversationMessage {
             role: "user".to_string(),
             blocks: vec![ConversationBlock::ToolResult {
+                tool_use_id: String::new(),
                 content: "result content".to_string(),
                 is_error: false,
             }],
@@ -8900,7 +9630,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         };
         assert_eq!(extract_message_text(&msg), "result content");
     }
@@ -8910,6 +9640,7 @@ mod tests {
         let msg = ConversationMessage {
             role: "user".to_string(),
             blocks: vec![ConversationBlock::ToolResult {
+                tool_use_id: String::new(),
                 content: "error message".to_string(),
                 is_error: true,
             }],
@@ -8917,7 +9648,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         };
         assert_eq!(extract_message_text(&msg), "[Error] error message");
     }
@@ -9202,9 +9933,10 @@ mod tests {
             ActivePopup::ProjectDetail {
                 path: "p".into(),
                 scroll: 0,
+                cursor: 0,
             },
             ActivePopup::Summary { scroll: 0 },
-            ActivePopup::Detail,
+            ActivePopup::Detail { back: None },
             ActivePopup::DashboardDetail,
             ActivePopup::InsightsDetail { scroll: 0 },
             ActivePopup::TitleEdit {
@@ -9285,6 +10017,8 @@ mod tests {
             day_output_tokens: 1000,
             day_user_msgs: 0,
             day_prompts: 0,
+            day_tool_errors: 0,
+            day_tool_successes: 0,
             day_assistant_msgs: 0,
             day_tokens_by_model,
             day_hourly_activity: std::collections::HashMap::new(),
@@ -9370,7 +10104,6 @@ mod tests {
         state.model_costs = model_costs.clone();
         state.aggregated_model_tokens = aggregated_model_tokens.clone();
         state.daily_costs = daily_costs.clone();
-        state.file_count = 10;
         state.data_limit = 50;
         state.project_list = vec![
             ("~/projects/app-a".to_string(), 50000, today),
@@ -9416,7 +10149,7 @@ mod tests {
             ),
             (
                 crate::Tab::Daily,
-                " ?:help q:quit ←→:day ↑↓:session i:info Enter:view s:summary S:day-summary t:title b:breakdown /:search Space:pin m:pins",
+                " ?:help q:quit ←→:day ↑↓:session Enter:info s:summary S:day-summary t:title /:search Space:pin m:pins",
             ),
             (
                 crate::Tab::Insights,
@@ -9528,6 +10261,50 @@ mod tests {
             !text.contains("…."),
             "ellipsis must never be followed by extra dots"
         );
+    }
+
+    // A resize that hides the focused panel hands focus back to one on
+    // screen, and leaves no click area for the hidden chart.
+    #[test]
+    fn a_narrow_daily_drops_focus_and_clicks_from_the_hidden_chart() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Daily;
+        state.daily_panel = crate::state::DailyPanel::Activity;
+        render_to_text(&mut state, 140, 45);
+        assert!(state.layout.activity_panel_area.is_some());
+        assert_eq!(state.daily_panel, crate::state::DailyPanel::Activity);
+        render_to_text(&mut state, 70, 45);
+        assert!(
+            state.layout.activity_panel_area.is_none(),
+            "no stale chart rect"
+        );
+        assert_ne!(state.daily_panel, crate::state::DailyPanel::Activity);
+    }
+
+    #[test]
+    fn the_daily_cursor_row_is_marked_only_while_the_list_has_focus() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let sessions = vec![
+            make_session_with_tokens("~/a", 1000, 500, "claude-sonnet-4-20250514"),
+            make_session_with_tokens("~/b", 1000, 500, "claude-sonnet-4-20250514"),
+        ];
+        let mut state = make_test_app_state(vec![make_daily_group(date, sessions)]);
+        state.tab = crate::Tab::Daily;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("▶ "), "{text}");
+        assert!(text.contains("Sessions (1/2)"), "{text}");
+        for panel in [
+            crate::state::DailyPanel::Breakdown,
+            crate::state::DailyPanel::Activity,
+        ] {
+            state.daily_panel = panel;
+            let text = render_to_text(&mut state, 140, 45);
+            assert!(!text.contains("▶ "), "{panel:?} focused: {text}");
+            assert!(text.contains("Sessions (2)"), "{panel:?} focused: {text}");
+        }
     }
 
     #[test]
@@ -9707,18 +10484,119 @@ mod tests {
         render_to_text(&mut state, 120, 35);
     }
 
+    // Metrics takes the rows Weekly / Monthly leave and fills them in order:
+    // trend charts, the work line, then the totals; a shorter terminal sheds
+    // the totals first and keeps the charts, the shortest keeps the cards.
+    #[test]
+    fn the_metrics_block_fills_its_height_in_priority_order() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Insights;
+        let tall = render_to_text(&mut state, 140, 45);
+        for needle in [
+            "Last 30 days",
+            "Tokens per session",
+            "Sessions per day",
+            "Lines edited",
+            "Built-in tools",
+            "Cost by model",
+        ] {
+            assert!(tall.contains(needle), "{needle}:\n{tall}");
+        }
+        // The date axis starts at the window's first day and ends at today.
+        let first = (chrono::Local::now().date_naive() - chrono::Duration::days(29))
+            .format("%m-%d")
+            .to_string();
+        let axis = tall
+            .lines()
+            .find(|l| l.contains(&first))
+            .unwrap_or_default();
+        assert!(axis.contains("today"), "{first} … today:\n{tall}");
+        // Every chart row names its value: no bare `┤` step.
+        let bare = tall.lines().find(|l| {
+            l.split('┤')
+                .next()
+                .is_some_and(|lead| l.contains('┤') && lead.trim_matches(['│', ' ']).is_empty())
+        });
+        assert!(bare.is_none(), "unlabelled step: {bare:?}");
+        assert!(!tall.contains("── "), "no rule lines:\n{tall}");
+        let mid = render_to_text(&mut state, 120, 35);
+        assert!(
+            mid.contains("Sessions per day") && mid.contains("Lines edited"),
+            "{mid}"
+        );
+        assert!(!mid.contains("Built-in tools"), "totals go first:\n{mid}");
+        let short = render_to_text(&mut state, 100, 24);
+        assert!(short.contains("cache"), "{short}");
+        assert!(!short.contains("Last 30 days"), "{short}");
+    }
+
+    // Weekly is one compact bar row per weekday, its panel exactly as wide as
+    // a row, today's weekday marked; Monthly takes the rest of the width.
+    #[test]
+    fn the_weekly_panel_is_a_compact_row_per_weekday() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Insights;
+        for (w, h) in [(140, 45), (60, 20)] {
+            let text = render_to_text(&mut state, w, h);
+            let top = text.lines().find(|l| l.contains("┌ Weekly avg")).unwrap();
+            let corner = top.chars().position(|c| c == '┐').unwrap();
+            assert_eq!(
+                corner + 1,
+                usize::from(insights::WEEKLY_W),
+                "{w}x{h}: {top}"
+            );
+            let rows: Vec<usize> = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+                .iter()
+                .map(|d| {
+                    text.lines()
+                        .position(|l| {
+                            l.chars()
+                                .take(corner)
+                                .collect::<String>()
+                                .contains(&format!("{d} "))
+                        })
+                        .unwrap_or_else(|| panic!("{w}x{h}: {d}\n{text}"))
+                })
+                .collect();
+            assert!(
+                rows.windows(2).all(|p| p[1] == p[0] + 1),
+                "{w}x{h}: {rows:?}"
+            );
+        }
+        let today = chrono::Local::now().date_naive().format("%a").to_string();
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains(&format!("▶{} ", &today[..2])), "{text}");
+    }
+
+    // Metrics fits its content, so no terminal height leaves a blank band
+    // inside it; rows its chart steps cannot use go to Weekly / Monthly.
+    #[test]
+    fn metrics_has_no_blank_rows_at_any_height() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Insights;
+        for h in 24..=60 {
+            let text = render_to_text(&mut state, 120, h);
+            let body: Vec<&str> = text
+                .lines()
+                .skip_while(|l| !l.contains("┌ Metrics"))
+                .skip(1)
+                .take_while(|l| !l.starts_with('└'))
+                .collect();
+            let blank = body
+                .iter()
+                .position(|l| l.trim_matches(['│', ' ']).is_empty());
+            assert!(blank.is_none(), "h={h}: blank row in Metrics\n{text}");
+        }
+    }
+
     #[test]
     fn test_draw_insights_detail_popup_renders() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
         state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
 
-        let panel_markers = [
-            (0, "Cache Hit Rate"),
-            (1, "/day"),
-            (2, "Monday"),
-            (3, "avg"),
-        ];
+        let panel_markers = [(0, "Cache Hit Rate"), (1, "Monday"), (2, "avg")];
+        assert_eq!(panel_markers.len(), crate::ui::INSIGHTS_PANELS);
         for (panel, expected) in panel_markers {
             state.insights_panel = panel;
             let text = render_to_text(&mut state, 120, 35);
@@ -9726,6 +10604,8 @@ mod tests {
                 text.contains(expected),
                 "insights detail panel {panel} should contain '{expected}', got:\n{text}"
             );
+            let position = format!("[{}/{}]", panel + 1, crate::ui::INSIGHTS_PANELS);
+            assert!(text.contains(&position), "{position} in:\n{text}");
         }
     }
 
@@ -9959,6 +10839,327 @@ mod tests {
         );
     }
 
+    // A past view judges a server's ⚠ at its last day, as the header count
+    // does: a server used on that day is not stale, however long ago it was.
+    #[test]
+    fn a_past_views_server_row_is_judged_at_the_views_end() {
+        let mut state = create_test_state();
+        let end = chrono::Local::now().date_naive() - chrono::Duration::days(40);
+        // Midnight keeps the floored age at 40 days whatever the hour now.
+        let used = end
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        state.period_filter =
+            crate::PeriodFilter::Custom(end - chrono::Duration::days(5), Some(end));
+        state.stats.tool_usage.clear();
+        state
+            .stats
+            .tool_usage
+            .insert("mcp__server1__do".to_string(), 3);
+        state.mcp_status = vec![crate::infrastructure::McpServerStatus {
+            name: "server1".to_string(),
+            configured: true,
+            last_used: Some(used),
+            total_calls: 3,
+        }];
+        state.configured_resources = Default::default();
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = 3;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.tools_detail_section = 0;
+        let text = render_to_text(&mut state, 140, 45);
+        let row = text
+            .lines()
+            .find(|l| l.contains("server1"))
+            .unwrap_or_default();
+        assert!(row.contains("40d ago"), "{text}");
+        assert!(!row.contains('⚠'), "{row}");
+    }
+
+    // A project's recent sessions read by their titles, the cursor row is
+    // marked, and the view follows the cursor down the list.
+    #[test]
+    fn project_sessions_show_titles_and_follow_the_cursor() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let groups = (0..30)
+            .map(|d| {
+                let mut s = make_session("proj", None, None);
+                s.file_path = std::path::PathBuf::from(format!("/tmp/proj/s{d}.jsonl"));
+                s.custom_title = Some(format!("topic number {d}"));
+                make_daily_group(today - chrono::Duration::days(d), vec![s])
+            })
+            .collect();
+        let mut state = make_test_app_state(groups);
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "proj".to_string(),
+            scroll: 0,
+            cursor: 0,
+        };
+        let text = render_popup_text(&mut state, 140, 45);
+        assert!(text.contains("topic number 0"), "{text}");
+        assert!(text.contains("▶  1."), "{text}");
+        state.set_project_detail_cursor(25);
+        let text = render_popup_text(&mut state, 140, 45);
+        assert!(
+            text.contains("▶ 26.") && text.contains("topic number 25"),
+            "{text}"
+        );
+    }
+
+    // On a short terminal the chart above the session list fills the popup;
+    // picking the first session still brings its row into view.
+    #[test]
+    fn the_first_session_row_shows_when_the_popup_is_short() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let sessions = (0..3)
+            .map(|i| {
+                let mut s = make_session("proj", None, None);
+                s.file_path = std::path::PathBuf::from(format!("/tmp/proj/s{i}.jsonl"));
+                s.custom_title = Some(format!("topic number {i}"));
+                s
+            })
+            .collect();
+        let mut state = make_test_app_state(vec![make_daily_group(today, sessions)]);
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "proj".to_string(),
+            scroll: 0,
+            cursor: 0,
+        };
+        let text = render_popup_text(&mut state, 140, 16);
+        assert!(text.contains("▶  1."), "project detail:\n{text}");
+
+        state.tab = crate::Tab::Daily;
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 0,
+            cursor: 0,
+        };
+        let text = render_to_text(&mut state, 140, 16);
+        assert!(text.contains("▶ "), "day activity:\n{text}");
+    }
+
+    // The Day activity name column grows into the popup's spare width, so a
+    // wide popup shows a whole title; a narrow one still fits every row.
+    #[test]
+    fn day_activity_names_use_the_spare_width() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let title = "a fairly long session title that used to be cut short";
+        let mut s = make_session("proj", None, None);
+        s.custom_title = Some(title.to_string());
+        let mut state = make_test_app_state(vec![make_daily_group(today, vec![s])]);
+        state.tab = crate::Tab::Daily;
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 0,
+            cursor: 0,
+        };
+        let text = render_to_text(&mut state, 160, 45);
+        assert!(text.contains(title), "{text}");
+        // The day chart keeps its narrow scale column, not the name column.
+        let legend = text.lines().find(|l| l.contains("within usual")).unwrap();
+        let bars = legend.find("██").unwrap();
+        let border = legend[..bars].rfind('│').unwrap();
+        assert!(
+            legend[border..bars].chars().count() <= 12,
+            "the chart sits after its scale: {legend}"
+        );
+        for (w, h) in [(120, 35), (60, 20)] {
+            let buf = render_buffer(&mut state, w, h);
+            let right_border = (0..h).any(|y| buf[(w - 1, y)].symbol() == "│");
+            assert!(right_border, "{w}x{h}: the popup's right edge is drawn");
+        }
+    }
+
+    // The cursor model's cost splits by the rate each request got, so a
+    // fast-mode share shows apart from the standard one.
+    #[test]
+    fn a_models_cost_splits_by_the_rate_each_request_got() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let mut s = make_session("p", None, None);
+        let tokens = crate::aggregator::TokenStats {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        s.day_tokens_by_model
+            .insert("claude-opus-5-5".to_string(), tokens.clone());
+        s.day_tokens_by_model
+            .insert("claude-opus-5-5+fast".to_string(), tokens.clone());
+        let mut state = make_test_app_state(vec![make_daily_group(
+            chrono::Local::now().date_naive(),
+            vec![s],
+        )]);
+        state
+            .aggregated_model_tokens
+            .insert("Opus 5.5".to_string(), tokens);
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_panel = 2;
+        let text = render_to_text(&mut state, 140, 45);
+        let billed = text.lines().find(|l| l.contains("billed as")).unwrap();
+        assert!(billed.contains("fast mode $8.00"), "{billed}");
+        assert!(billed.contains("standard $4.00"), "{billed}");
+    }
+
+    // A session with no active hour lists after every timed one, not first.
+    #[test]
+    fn a_session_without_hours_lists_last_in_day_activity() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let mut timed = make_session("timed", None, None);
+        timed.file_path = std::path::PathBuf::from("/t/timed.jsonl");
+        timed.day_hourly_work_tokens.insert(0, 10);
+        let mut idle = make_session("idle", None, None);
+        idle.file_path = std::path::PathBuf::from("/t/idle.jsonl");
+        let group = make_daily_group(chrono::Local::now().date_naive(), vec![idle, timed]);
+        let state = make_test_app_state(vec![group.clone()]);
+        let rows = day_activity_rows(&state, &group);
+        let names: Vec<&String> = rows.iter().map(|r| &r.1).collect();
+        assert!(names[0].contains("timed"), "{names:?}");
+    }
+
+    // On a short terminal the Models detail still shows the cursor row, and
+    // its figures when there is room, never a popup of grid alone.
+    #[test]
+    fn a_short_models_detail_keeps_the_cursor_row_in_view() {
+        let mut state = create_test_state();
+        for i in 0..20 {
+            state.aggregated_model_tokens.insert(
+                format!("Model {i:02}"),
+                crate::aggregator::TokenStats {
+                    input_tokens: 1_000 + i,
+                    ..Default::default()
+                },
+            );
+        }
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_panel = 2;
+        state.dashboard_scroll[2] = 15;
+        for h in [18, 24, 30] {
+            let text = render_to_text(&mut state, 140, h);
+            assert!(text.contains("cache hit"), "{h}: no table header:\n{text}");
+            assert!(text.contains(" ▶ "), "{h}: cursor row not shown:\n{text}");
+            assert!(text.contains("16/"), "{h}:\n{text}");
+        }
+        let text = render_to_text(&mut state, 140, 24);
+        assert!(
+            text.contains("billed as"),
+            "the figures fit at 24 rows:\n{text}"
+        );
+    }
+
+    // The cursor model's daily line keeps its date range whole beside the bars.
+    #[test]
+    fn the_models_daily_line_keeps_its_date_range_whole() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_panel = 2;
+        let text = render_to_text(&mut state, 140, 45);
+        let daily = text.lines().find(|l| l.contains("  daily ")).unwrap();
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(daily.contains(&format!("..{today}")), "{daily}");
+    }
+
+    // A click on a Models table row moves the cursor to that model.
+    #[test]
+    fn a_click_on_a_model_row_selects_it() {
+        let mut state = create_test_state();
+        for i in 0..3 {
+            state.aggregated_model_tokens.insert(
+                format!("Model {i}"),
+                crate::aggregator::TokenStats {
+                    input_tokens: 10 + i,
+                    ..Default::default()
+                },
+            );
+        }
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_panel = 2;
+        render_to_text(&mut state, 140, 45);
+        let (_, area) = state
+            .layout
+            .cursor_row_areas
+            .iter()
+            .find(|(i, _)| *i == 2)
+            .copied()
+            .unwrap();
+        crate::handlers::mouse::handle_mouse_click(&mut state, area.x + 1, area.y);
+        assert_eq!(state.dashboard_scroll[2], 2);
+        assert!(
+            state.show_dashboard_detail(),
+            "the click stays in the popup"
+        );
+    }
+
+    // A session row in a cursor popup answers the mouse: a click moves the
+    // cursor to it, a double-click opens it as Enter does.
+    #[test]
+    fn cursor_popup_rows_take_clicks_and_double_clicks() {
+        use crate::handlers::mouse::{handle_double_click, handle_mouse_click};
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let sessions = (0..3)
+            .map(|i| {
+                let mut s = make_session("proj", None, None);
+                s.file_path = std::path::PathBuf::from(format!("/tmp/proj/s{i}.jsonl"));
+                s
+            })
+            .collect();
+        let mut state = make_test_app_state(vec![make_daily_group(today, sessions)]);
+        let row_at = |state: &AppState, idx: usize| {
+            let (_, a) = state
+                .layout
+                .cursor_row_areas
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .unwrap();
+            (a.x + 1, a.y)
+        };
+
+        state.tab = crate::Tab::Daily;
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 0,
+            cursor: 0,
+        };
+        render_to_text(&mut state, 140, 45);
+        let (x, y) = row_at(&state, 2);
+        handle_mouse_click(&mut state, x, y);
+        assert_eq!(state.day_activity_cursor(), 2, "a click moves the cursor");
+        handle_double_click(&mut state, x, y);
+        assert!(
+            matches!(
+                state.active_popup,
+                crate::ActivePopup::Detail {
+                    back: Some(crate::state::DetailBack::DayActivity { cursor: 2, .. })
+                }
+            ),
+            "a double-click opens the row's detail"
+        );
+
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "proj".to_string(),
+            scroll: 0,
+            cursor: 0,
+        };
+        render_popup_text(&mut state, 140, 45);
+        let (x, y) = row_at(&state, 1);
+        handle_mouse_click(&mut state, x, y);
+        assert_eq!(state.project_detail_cursor(), 1);
+        handle_double_click(&mut state, x, y);
+        assert!(state.show_detail(), "a double-click opens the session");
+    }
+
     #[test]
     fn test_ecosystem_popup_sort_label_reflects_mode() {
         let mut state = create_test_state();
@@ -10140,7 +11341,7 @@ mod tests {
         // semantics, so the test guards against re-introducing one.
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
-        state.stats.total_session_days = 100;
+        state.stats.total_sessions_count = 100;
         state.stats.sessions_using_skills = 20;
         state.stats.sessions_using_subagents = 30;
         state.stats.sessions_using_mcp = 10;
@@ -10174,7 +11375,7 @@ mod tests {
         // Regression: zero session_days must not panic (no div-by-zero from the old % calc).
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
-        state.stats.total_session_days = 0;
+        state.stats.total_sessions_count = 0;
         state.stats.sessions_using_skills = 0;
 
         let text = render_to_text(&mut state, 140, 35);
@@ -10439,7 +11640,7 @@ mod tests {
         // count rather than a cross-category percentage.
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
-        state.stats.total_session_days = 100;
+        state.stats.total_sessions_count = 100;
         state.stats.sessions_using_mcp = 50;
         state.stats.sessions_using_skills = 0;
         state.stats.sessions_using_subagents = 0;
@@ -10552,13 +11753,14 @@ mod tests {
         );
     }
 
+    // The recent sort reorders the Models table, while each share stays one
+    // of the whole view.
     #[test]
-    fn a_recent_sort_scales_model_bars_by_the_largest_model() {
+    fn a_recent_sort_orders_the_model_table_by_last_use() {
         use crate::test_helpers::helpers::{
             make_daily_group, make_session_with_tokens, make_test_app_state,
         };
         let today = chrono::Local::now().date_naive();
-        // The most recent model is the smallest, so it sorts first under Recency.
         let groups = vec![
             make_daily_group(
                 today,
@@ -10584,12 +11786,13 @@ mod tests {
         state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 2;
         let text = render_to_text(&mut state, 140, 45);
-        let full = "█".repeat(15);
-        let full_bars = text.lines().filter(|l| l.contains(&full)).count();
-        assert_eq!(
-            full_bars, 1,
-            "only the largest model fills its bar:\n{text}"
-        );
+        let table: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.contains("cache hit"))
+            .collect();
+        let row = |m: &str| table.iter().position(|l| l.contains(m)).unwrap();
+        assert!(row("Sonnet 4.6") < row("Opus 4.6"), "{text}");
+        assert!(table[row("Opus 4.6")].contains("99%"), "{text}");
     }
 
     #[test]
@@ -10633,44 +11836,593 @@ mod tests {
         );
     }
 
+    // A model with no pricing entry can't pass as free: its cost cell reads
+    // `$?`, and with the cursor on it the figures below say why.
     #[test]
-    fn test_models_detail_unknown_model_shows_warning_badge() {
-        // Regression: unknown model families (no pricing entry) must show a "no pricing"
-        // warning so the user is not silently undercharged in the cost summary.
+    fn a_model_without_pricing_is_flagged_in_the_table_and_its_figures() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2; // Models panel
-
-        // Inject the unknown model into both:
-        // 1. aggregated_model_tokens — drives the Models detail popup item list
-        // 2. one session's day_tokens_by_model — drives the first/last-used dates
-        let unknown_model = "claude-future-experimental-x".to_string();
+        state.dashboard_panel = 2;
+        let unknown_model = "claude-future-x".to_string();
         let tokens = crate::aggregator::stats::TokenStats {
             input_tokens: 1000,
             output_tokens: 500,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_5m_tokens: 0,
-            cache_creation_1h_tokens: 0,
-            non_standard_speed: false,
+            ..Default::default()
         };
         state
             .aggregated_model_tokens
             .insert(unknown_model.clone(), tokens.clone());
-        // The Models detail popup decides "unknown" via `models_without_pricing`.
         state.models_without_pricing.insert(unknown_model.clone());
-        if let Some(group) = state.daily_groups.get_mut(0)
-            && let Some(session) = group.sessions.get_mut(0)
-        {
-            session.day_tokens_by_model.insert(unknown_model, tokens);
+        // A session on the model, so $/ses has a count to divide by.
+        let mut session = crate::test_helpers::helpers::make_session("p", None, None);
+        session.file_path = std::path::PathBuf::from("/t/future.jsonl");
+        session
+            .day_tokens_by_model
+            .insert(unknown_model.clone(), tokens);
+        state.daily_groups[0].sessions.push(session);
+        let mut models: Vec<(String, u64, ())> = state
+            .aggregated_model_tokens
+            .iter()
+            .map(|(n, t)| (n.clone(), t.work_tokens(), ()))
+            .collect();
+        state.sort_models(&mut models);
+        state.dashboard_scroll[2] = models.iter().position(|m| m.0 == unknown_model).unwrap();
+        let text = render_to_text(&mut state, 140, 35);
+        // Both money columns flag the gap, $/ses included.
+        assert!(
+            text.lines()
+                .any(|l| l.contains("claude-futur") && l.matches("$?").count() == 2),
+            "{text}"
+        );
+        assert!(text.contains("⚠ no pricing"), "{text}");
+    }
+
+    #[test]
+    fn projects_sharing_a_basename_stay_distinguishable_in_the_detail() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_panel = 1;
+        state.stats.project_stats.clear();
+        let names = ["/work/dev/foo", "/other/area/foo"];
+        let labels = ["foo (dev)", "foo (area)"];
+        for (name, label) in names.into_iter().zip(labels) {
+            state.stats.project_stats.insert(
+                name.to_string(),
+                crate::aggregator::ProjectStats {
+                    sessions: 1,
+                    tokens: 10,
+                    work_tokens: 10,
+                },
+            );
+            state
+                .project_labels
+                .insert(name.to_string(), label.to_string());
+        }
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(
+            text.contains("foo (dev)") && text.contains("foo (area)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_monthly_panel_shows_tokens_beside_cost() {
+        for (w, h) in [(120, 35), (140, 45)] {
+            let mut state = create_test_state();
+            state.tab = crate::Tab::Insights;
+            let text = render_to_text(&mut state, w, h);
+            // This month's 6.00K tokens averaged over the 12-month window.
+            assert!(text.contains(" 500/mo"), "{w}x{h}:\n{text}");
+            assert!(
+                text.contains("██ cost  ██ tokens"),
+                "{w}x{h}: legend missing"
+            );
+        }
+    }
+
+    // With history older than a year, the popup scrolls further back than
+    // the panel shows, yet both quote the same trailing-year average.
+    #[test]
+    fn the_monthly_panel_and_popup_quote_one_average() {
+        let avg_of = |text: &str| -> String {
+            let i = text.find("avg: $").expect("avg label");
+            let head = text[i..].split('|').next().unwrap();
+            head.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let mut state = create_test_state();
+        // A cost on the 1st of each of the last 13 months: more history than
+        // the trailing year, with the oldest month the priciest.
+        let first = chrono::Datelike::with_day(&chrono::Local::now().date_naive(), 1).unwrap();
+        for k in 1..=13 {
+            let month = first.checked_sub_months(chrono::Months::new(k)).unwrap();
+            let mut s = crate::test_helpers::helpers::make_session("old", None, Some("b"));
+            s.day_input_tokens = 1_000 * u64::from(k);
+            state
+                .daily_groups
+                .push(crate::test_helpers::helpers::make_daily_group(
+                    month,
+                    vec![s],
+                ));
+            state.daily_costs.push((month, 100.0 * f64::from(k)));
+        }
+        state.tab = crate::Tab::Insights;
+        state.insights_panel = 3;
+        let panel = render_to_text(&mut state, 140, 45);
+        state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
+        let popup = render_to_text(&mut state, 140, 45);
+        let popup_avg = popup.lines().find(|l| l.contains("total: $")).map(avg_of);
+        assert_eq!(popup_avg, Some(avg_of(&panel)), "{panel}\n{popup}");
+    }
+
+    #[test]
+    fn the_week_trend_and_hour_grid_live_in_the_weekly_popup_only() {
+        for (w, h) in [(120, 35), (140, 45)] {
+            let mut state = create_test_state();
+            // A prior same weekday, active from midnight, so today has a usual to
+            // compare with at any hour.
+            let week_ago = chrono::Local::now().date_naive() - chrono::Duration::days(7);
+            let mut prior = crate::test_helpers::helpers::make_session("proj", None, Some("w"));
+            prior.day_hourly_work_tokens.insert(0, 1_000);
+            state
+                .daily_groups
+                .push(crate::test_helpers::helpers::make_daily_group(
+                    week_ago,
+                    vec![prior],
+                ));
+            state.tab = crate::Tab::Insights;
+            let panel = render_to_text(&mut state, w, h);
+            // The Weekly panel is the fixed-width left of the bottom row;
+            // Monthly's own `so far` sits to its right.
+            let weekly_cols = usize::from(insights::WEEKLY_W);
+            let in_weekly = panel.lines().any(|l| {
+                l.chars()
+                    .take(weekly_cols)
+                    .collect::<String>()
+                    .contains("so far")
+            });
+            assert!(!in_weekly, "{w}x{h}: the week trend is popup-only");
+            assert!(
+                !panel.contains("of usual"),
+                "{w}x{h}: today against its weekday lives on Daily"
+            );
+            state.insights_panel = 1;
+            state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
+            let popup = render_to_text(&mut state, w, h);
+            assert!(popup.contains("Last 12 weeks"), "{w}x{h}:\n{popup}");
+        }
+        let mut state = create_test_state();
+        state.insights_panel = 1;
+        state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
+        let popup = render_to_text(&mut state, 140, 45);
+        assert!(popup.contains("By hour"), "{popup}");
+        render_to_text(&mut state, 60, 20);
+    }
+
+    // A day's tokens count its subagents on every surface, as its cost does.
+    #[test]
+    fn the_costs_panel_day_row_counts_subagent_tokens() {
+        let mut state = create_test_state();
+        let today = chrono::Local::now().date_naive();
+        let mut sub = crate::test_helpers::helpers::make_session("proj", None, Some("sub"));
+        sub.is_subagent = true;
+        sub.day_input_tokens = 40_000;
+        sub.day_output_tokens = 0;
+        let group = state
+            .daily_groups
+            .iter_mut()
+            .find(|g| g.date == today)
+            .unwrap();
+        let before = group.work_tokens();
+        group.sessions.push(sub);
+        let expected = crate::format_number(before + 40_000);
+        state.tab = crate::Tab::Dashboard;
+        let text = render_to_text(&mut state, 140, 45);
+        let costs_row = text
+            .lines()
+            .find(|l| l.contains("1.") && l.contains("(") && l.contains("$"))
+            .unwrap_or_default();
+        assert!(
+            costs_row.contains(&expected),
+            "{expected} missing: {costs_row}"
+        );
+    }
+
+    // The panel and popup take a language's share of the same rows, so the
+    // catch-all "Other" count never enters one denominator but not the other.
+    #[test]
+    fn a_languages_share_is_the_same_in_the_panel_and_the_popup() {
+        let mut state = create_test_state();
+        state.stats.language_usage = [("Rust".to_string(), 60), ("Other".to_string(), 40)]
+            .into_iter()
+            .collect();
+        state.stats.extension_usage = [("rs".to_string(), 60), ("xyz".to_string(), 30)]
+            .into_iter()
+            .collect();
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = 4;
+        let panel = render_to_text(&mut state, 140, 45);
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        let popup = render_to_text(&mut state, 140, 45);
+        for text in [&panel, &popup] {
+            let row = text
+                .lines()
+                .find(|l| l.contains("Rust"))
+                .unwrap_or_default();
+            assert!(row.contains("66%"), "{row}");
+        }
+    }
+
+    // The project popup counts what the project's subagents did, as the
+    // Ecosystem view does; its session count stays the user's.
+    #[test]
+    fn the_project_popup_counts_its_subagents_tool_calls() {
+        let mut state = create_test_state();
+        let today = chrono::Local::now().date_naive();
+        let mut user = crate::test_helpers::helpers::make_session("~/solo", None, None);
+        user.day_tool_usage.insert("Grep".to_string(), 1);
+        let mut sub = crate::test_helpers::helpers::make_session("~/solo", None, Some("sub"));
+        sub.is_subagent = true;
+        sub.parent_path = Some(user.file_path.clone());
+        sub.day_tool_usage.insert("Grep".to_string(), 6);
+        let group = state
+            .daily_groups
+            .iter_mut()
+            .find(|g| g.date == today)
+            .unwrap();
+        group.sessions.extend([user, sub]);
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "~/solo".to_string(),
+            scroll: 0,
+            cursor: 0,
+        };
+        let text = render_to_text(&mut state, 140, 45);
+        let row = text
+            .lines()
+            .find(|l| l.contains("Grep"))
+            .unwrap_or_default();
+        assert!(row.contains('7'), "{row}\n{text}");
+    }
+
+    // Daily sets the day against its weekday: today up to this hour, a past
+    // day in full, each average built from the same weekday before it.
+    #[test]
+    fn the_daily_activity_sets_the_day_against_its_usual_weekday() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let day = |back: i64, tokens: u64| {
+            let mut s = make_session("proj", None, None);
+            s.day_hourly_work_tokens.insert(0, tokens);
+            make_daily_group(today - chrono::Duration::days(back), vec![s])
+        };
+        let mut state = make_test_app_state(vec![day(0, 300), day(7, 100), day(14, 200)]);
+        state.tab = crate::Tab::Daily;
+        let wd = today.format("%a").to_string();
+        let at = |state: &AppState, back: i64| {
+            state
+                .daily_groups
+                .iter()
+                .position(|g| g.date == today - chrono::Duration::days(back))
+                .unwrap()
+        };
+
+        state.selected_day = at(&state, 0);
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(
+            text.contains(&format!("200% of usual {wd} by now")),
+            "{text}"
+        );
+        state.selected_day = at(&state, 7);
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains(&format!("50% of usual {wd}")), "{text}");
+        assert!(
+            !text.contains("by now"),
+            "a past day compares in full: {text}"
+        );
+        // Narrowing drops the share before active hours, never a figure.
+        for w in (90..=140).step_by(5) {
+            let text = render_to_text(&mut state, w, 35);
+            let line = text.lines().find(|l| l.contains('$')).unwrap_or_default();
+            if line.contains("of usual") {
+                assert!(line.contains("active:"), "{w}: {line}");
+            }
         }
 
-        let text = render_to_text(&mut state, 140, 35);
+        state.selected_day = at(&state, 0);
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 0,
+            cursor: 0,
+        };
+        let popup = render_popup_text(&mut state, 140, 45);
+        assert!(popup.contains("300 vs 150 (200%)"), "{popup}");
+    }
+
+    // A narrow Activity box drops optional fields before it cuts a figure:
+    // the day's cost always ends the line whole.
+    #[test]
+    fn the_daily_activity_line_never_cuts_the_cost() {
+        let mut state = create_test_state();
+        let today = chrono::Local::now().date_naive();
+        let mut sub = crate::test_helpers::helpers::make_session("proj", None, Some("sub"));
+        sub.is_subagent = true;
+        sub.day_input_tokens = 432_000;
+        sub.day_hourly_work_tokens.insert(14, 432_000);
+        let group = state
+            .daily_groups
+            .iter_mut()
+            .find(|g| g.date == today)
+            .unwrap();
+        for s in &mut group.sessions {
+            s.day_input_tokens = 1_100_000;
+        }
+        group.sessions.push(sub);
+        state.selected_day = state
+            .daily_groups
+            .iter()
+            .position(|g| g.date == today)
+            .unwrap();
+        state.tab = crate::Tab::Daily;
+        for (w, h) in (90..=140).step_by(5).map(|w| (w, 35)) {
+            let text = render_to_text(&mut state, w, h);
+            let line = text
+                .lines()
+                .find(|l| l.contains("active:") || l.contains(" sub)"))
+                .unwrap_or_default();
+            let cell = line.split('│').nth(1).unwrap_or_default().trim_end();
+            assert!(
+                cell.chars().last().is_some_and(|c| c.is_ascii_digit()),
+                "{w}x{h}: cost cut in `{cell}`"
+            );
+        }
+    }
+
+    // Breakdown names an MCP tool as every other view does, not by its key.
+    #[test]
+    fn the_breakdown_shows_mcp_tools_by_their_short_name() {
+        let mut state = create_test_state();
+        let today = chrono::Local::now().date_naive();
+        let key = "mcp__server1__action";
+        let group = state
+            .daily_groups
+            .iter_mut()
+            .find(|g| g.date == today)
+            .unwrap();
+        group.sessions[0].day_tool_usage.insert(key.to_string(), 3);
+        state.selected_day = state
+            .daily_groups
+            .iter()
+            .position(|g| g.date == today)
+            .unwrap();
+        state.tab = crate::Tab::Daily;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(!text.contains("mcp__server1"), "{text}");
         assert!(
-            text.contains("no pricing"),
-            "Models detail should show 'no pricing' badge for unknown model. Got:\n{text}"
+            text.contains(&crate::aggregator::format_tool_short(key)),
+            "{text}"
         );
+    }
+
+    // The grid stays put above a long table; the table scrolls so the cursor
+    // row stays in view, and the footer counts the cursor's place.
+    #[test]
+    fn the_model_table_scrolls_under_a_fixed_grid_to_keep_the_cursor_seen() {
+        let mut state = create_test_state();
+        for i in 0..30 {
+            let name = format!("Model {i:02}");
+            state.aggregated_model_tokens.insert(
+                name.clone(),
+                crate::aggregator::TokenStats {
+                    input_tokens: 1_000 + i,
+                    ..Default::default()
+                },
+            );
+            state.model_costs.push((name, 1.0));
+        }
+        state.dashboard_models_sort = crate::RankSort::Tokens;
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = 2;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        let label = crate::ui::insights::short_month(
+            &chrono::Local::now()
+                .date_naive()
+                .format("%Y-%m")
+                .to_string(),
+        );
+        let total = state.aggregated_model_tokens.len();
+        state.dashboard_scroll[2] = total - 1;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains(&label), "the grid stays:\n{text}");
+        assert!(text.contains(&format!("{total}/{total}")), "{text}");
+        let cursor_row = text.lines().find(|l| l.contains(" ▶ ")).unwrap();
+        assert!(
+            cursor_row.contains("Sonnet 4") || cursor_row.contains("Model 00"),
+            "{text}"
+        );
+    }
+
+    // The Projects list names its drill-in, and the project popup it opens is
+    // the size every detail popup shares.
+    #[test]
+    fn the_projects_drill_in_is_hinted_and_full_size() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = 1;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        let list = render_to_text(&mut state, 140, 45);
+        assert!(list.contains("Enter: open project"), "{list}");
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "~/proj".to_string(),
+            scroll: 0,
+            cursor: 0,
+        };
+        render_to_text(&mut state, 140, 45);
+        let area = ratatui::layout::Rect::new(0, 0, 140, 45);
+        assert_eq!(
+            state.layout.active_popup_area,
+            Some(detail_popup_area(area))
+        );
+    }
+
+    // Each popup's footer names the keys it takes, and the Breakdown detail is
+    // the shared detail size.
+    #[test]
+    fn popup_footers_name_their_keys_and_breakdown_is_full_size() {
+        let mut state = create_test_state();
+        state.active_popup = crate::ActivePopup::Help { scroll: 0 };
+        assert!(render_to_text(&mut state, 140, 45).contains("?/q/Esc: close"));
+
+        state.tab = crate::Tab::Insights;
+        state.active_popup = crate::ActivePopup::InsightsDetail { scroll: 0 };
+        assert!(render_to_text(&mut state, 140, 45).contains("↑↓: scroll  Enter/i/q: close"));
+
+        state.active_popup = crate::ActivePopup::ProjectDetail {
+            path: "~/proj".to_string(),
+            scroll: 0,
+            cursor: 0,
+        };
+        assert!(render_to_text(&mut state, 140, 45).contains("Enter: info  q/Esc: back"));
+
+        state.active_popup = crate::ActivePopup::None;
+        state.tab = crate::Tab::Daily;
+        state.daily_breakdown_open = true;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("Enter/Esc: close"), "{text}");
+        let area = ratatui::layout::Rect::new(0, 0, 140, 45);
+        let popup = detail_popup_area(area);
+        let row = text.lines().position(|l| l.contains("┌ Breakdown ("));
+        assert_eq!(
+            row,
+            Some(usize::from(popup.y)),
+            "not the shared size:\n{text}"
+        );
+    }
+
+    // The day's activity popup: the day against its usual weekday, then a row
+    // per session with its subagents' hours folded in, at the shared size.
+    #[test]
+    fn the_day_activity_popup_folds_subagent_hours_into_their_session() {
+        let mut state = create_test_state();
+        let today = chrono::Local::now().date_naive();
+        let idx = state
+            .daily_groups
+            .iter()
+            .position(|g| g.date == today)
+            .unwrap();
+        let group = &mut state.daily_groups[idx];
+        group.sessions[0].day_hourly_work_tokens = [(9, 1_000)].into_iter().collect();
+        let parent = group.sessions[0].file_path.clone();
+        let mut sub = crate::test_helpers::helpers::make_session("proj", None, Some("sub"));
+        sub.is_subagent = true;
+        sub.parent_path = Some(parent);
+        sub.day_hourly_work_tokens = [(9, 500)].into_iter().collect();
+        group.sessions.push(sub);
+        state.selected_day = idx;
+        state.tab = crate::Tab::Daily;
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 0,
+            cursor: 0,
+        };
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(
+            text.contains("against a usual") && text.contains("Sessions (1)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("within usual") && text.contains("short of usual"),
+            "{text}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        let header = lines
+            .iter()
+            .position(|l| l.contains("Sessions (1)"))
+            .unwrap();
+        // The header, the axis, then the session's own row.
+        assert!(
+            lines[header + 2].contains("1.50K"),
+            "subagent hours not folded:\n{text}"
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 140, 45);
+        assert_eq!(
+            state.layout.active_popup_area,
+            Some(detail_popup_area(area))
+        );
+        render_to_text(&mut state, 60, 20);
+    }
+
+    // Each hour fills to the higher of the day and its usual: muted where
+    // both reach, full where the day is past it, shaded where it fell short.
+    #[test]
+    fn a_taller_bar_changes_tone_at_the_usual() {
+        let mut state = create_test_state();
+        let today = chrono::Local::now().date_naive();
+        let idx = state
+            .daily_groups
+            .iter()
+            .position(|g| g.date == today)
+            .unwrap();
+        state.daily_groups[idx].sessions[0].day_hourly_work_tokens =
+            [(9, 1_000), (14, 100)].into_iter().collect();
+        let mut prior = crate::test_helpers::helpers::make_session("proj", None, Some("w"));
+        prior.day_hourly_work_tokens = [(9, 400), (14, 800)].into_iter().collect();
+        state
+            .daily_groups
+            .push(crate::test_helpers::helpers::make_daily_group(
+                today - chrono::Duration::days(7),
+                vec![prior],
+            ));
+        state.selected_day = idx;
+        state.tab = crate::Tab::Daily;
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 0,
+            cursor: 0,
+        };
+        let buf = render_buffer(&mut state, 140, 45);
+        let tone_of = |fg| {
+            buf.content()
+                .iter()
+                .any(|c| c.symbol() == "█" && c.fg == fg)
+        };
+        assert!(
+            tone_of(theme::primary_with_intensity(0.35)),
+            "no muted part within the usual"
+        );
+        assert!(tone_of(theme::TOKENS), "no full part above the usual");
+        let shaded = buf.content().iter().any(|c| c.symbol() == "░");
+        assert!(shaded, "the shortfall below the usual is not shaded");
+        assert!(
+            !buf.content()
+                .iter()
+                .any(|c| c.symbol() == "─" && c.bg == theme::TOKENS)
+        );
+    }
+
+    // The cursor row is marked, and the view follows it down past the chart.
+    #[test]
+    fn the_activity_cursor_row_is_marked_and_kept_in_view() {
+        let mut state = create_test_state();
+        let today = chrono::Local::now().date_naive();
+        let idx = state
+            .daily_groups
+            .iter()
+            .position(|g| g.date == today)
+            .unwrap();
+        for i in 0..30u8 {
+            let mut s = crate::test_helpers::helpers::make_session(&format!("p{i:02}"), None, None);
+            s.day_hourly_work_tokens.insert(i % 24, 10);
+            state.daily_groups[idx].sessions.push(s);
+        }
+        state.selected_day = idx;
+        state.tab = crate::Tab::Daily;
+        state.active_popup = crate::ActivePopup::DayActivity {
+            scroll: 0,
+            cursor: 0,
+        };
+        assert!(render_to_text(&mut state, 140, 45).contains("▶ "));
+        state.set_day_activity_cursor(30);
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(state.day_activity_scroll() > 0, "the view did not follow");
+        assert!(text.contains("▶ "), "cursor row scrolled out:\n{text}");
     }
 
     #[test]
@@ -10778,21 +12530,24 @@ mod tests {
         let text = render_to_text(&mut state, 120, 35);
 
         // cache_hit_rate = 40000 / (50000 + 40000) * 100 = 44.4%
-        assert!(text.contains("44.4% cache"), "should show Cache Hit Rate");
+        assert!(
+            text.contains("44.4% cache hit"),
+            "should show Cache Hit Rate"
+        );
         // tool_success_rate = 90 / (90+10) * 100 = 90.0%
         assert!(
-            text.contains("90.0% success"),
+            text.contains("90.0% tool calls succeeded"),
             "should show tool success rate 90.0%"
         );
         // avg_cost_per_day = 100.0 / 10 = $10.00
         assert!(
-            text.contains("$10.00/day cost"),
-            "should show $10.00/day cost"
+            text.contains("$10.00 per day"),
+            "should show $10.00 per day"
         );
         // tokens_per_day = 60000 / 10 = 6000
         assert!(
-            text.contains("6.00K/day tokens"),
-            "should show 6.00K/day tokens"
+            text.contains("6.00K tokens per day"),
+            "should show 6.00K tokens per day"
         );
     }
 
@@ -10845,6 +12600,8 @@ mod tests {
             day_output_tokens: 100000,
             day_user_msgs: 0,
             day_prompts: 0,
+            day_tool_errors: 0,
+            day_tool_successes: 0,
             day_assistant_msgs: 0,
             day_tokens_by_model: std::collections::HashMap::new(),
             day_hourly_activity: std::collections::HashMap::new(),
@@ -10869,6 +12626,8 @@ mod tests {
         if let Some(group) = state.daily_groups.iter_mut().find(|g| g.date == today) {
             group.sessions.push(subagent_session);
         }
+        // The count folds from the groups, as a load folds it.
+        state.stats = crate::aggregator::Stats::from_groups(&state.daily_groups);
 
         let text = render_to_text(&mut state, 120, 35);
         // tokens_per_day should still be 6.00K (subagent excluded from count)
@@ -10941,6 +12700,7 @@ mod tests {
 
     #[test]
     fn metric_per_day_zero_fills_or_skips_days_with_no_activity() {
+        use super::insights::{DailyTrendValue, MissingDay, metric_per_day, summarise_series};
         let state = create_test_state();
         let today = chrono::Local::now().date_naive();
         // The fixture is active on `today` and on `today - 9`; the eight days
@@ -10998,7 +12758,7 @@ mod tests {
         // does or it renders nothing at all.
         state.selected_day = state.daily_groups.len() - 1;
         state.selected_session = 0;
-        state.active_popup = crate::ActivePopup::Detail;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
         let text = render_to_text(&mut state, 140, 45);
         assert!(text.contains("+12 / -7 lines"), "session detail: {text}");
 
@@ -11006,6 +12766,7 @@ mod tests {
         state.active_popup = crate::ActivePopup::ProjectDetail {
             path: "test-project".to_string(),
             scroll: 0,
+            cursor: 0,
         };
         let text = render_to_text(&mut state, 140, 45);
         assert!(text.contains("lines"), "project detail: {text}");
@@ -11055,6 +12816,25 @@ mod tests {
         render_to_text(&mut state, 120, 35);
     }
 
+    // A priced model whose cost is unknown only through an unrated speed says
+    // so, rather than claiming it has no pricing at all.
+    #[test]
+    fn a_model_unpriced_by_its_speed_names_the_speed_as_the_reason() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Dashboard;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_panel = 2;
+        state.models_without_pricing.insert("Sonnet 4".to_string());
+        if let Some(t) = state.aggregated_model_tokens.get_mut("Sonnet 4") {
+            t.non_standard_speed = true;
+        }
+        let text = render_to_text(&mut state, 140, 45);
+        // The priced part stays a lower bound, as the Costs panel shows it.
+        assert!(text.contains("$100*"), "{text}");
+        assert!(text.contains("⚠ unrated speed"), "{text}");
+        assert!(!text.contains("no pricing"), "{text}");
+    }
+
     #[test]
     fn test_model_efficiency_in_detail_popup() {
         let mut state = create_test_state();
@@ -11063,12 +12843,12 @@ mod tests {
         state.dashboard_panel = 2;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
-            text.contains("/MTok"),
-            "Dashboard detail popup should contain /MTok, got:\n{text}"
+            text.contains("cache hit"),
+            "the table compares efficiency:\n{text}"
         );
         assert!(
-            text.contains("rate/MTok"),
-            "Dashboard detail popup should contain documented rate, got:\n{text}"
+            text.contains("base $3 / $15"),
+            "the cursor row names its rates:\n{text}"
         );
     }
 
@@ -11298,6 +13078,8 @@ mod tests {
             day_output_tokens: 200,
             day_user_msgs: 1,
             day_prompts: 1,
+            day_tool_errors: 0,
+            day_tool_successes: 0,
             day_assistant_msgs: 1,
             day_tokens_by_model: tokens.clone(),
             day_hourly_activity: Default::default(),
@@ -11340,7 +13122,7 @@ mod tests {
         state.tab = crate::Tab::Daily;
         state.selected_day = 1;
         state.selected_session = 0;
-        state.active_popup = crate::ActivePopup::Detail;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
 
         let text = render_popup_text(&mut state, 140, 40);
         let expected = past_date.format("[%Y-%m-%d (%a)]").to_string();
@@ -11377,7 +13159,7 @@ mod tests {
         state.tab = crate::Tab::Daily;
         state.selected_day = 0;
         state.selected_session = 0;
-        state.active_popup = crate::ActivePopup::Detail;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
 
         let text = render_popup_text(&mut state, 140, 40);
         assert!(
@@ -11403,7 +13185,7 @@ mod tests {
         state.tab = crate::Tab::Daily;
         state.selected_day = 0;
         state.selected_session = 0;
-        state.active_popup = crate::ActivePopup::Detail;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
 
         // Loaded → section renders the messages with role glyphs. Scope to
         // the popup rect so background panels can't satisfy the assertions.
@@ -11658,8 +13440,7 @@ mod tests {
             "?:help",
             "q:quit",
             "↑↓:session",
-            "i:info",
-            "Enter:view",
+            "Enter:info",
             "Space:pin",
             "y:copy-resume",
             "←→:snapshot",
@@ -11991,6 +13772,7 @@ mod tests {
         state.active_popup = crate::ActivePopup::ProjectDetail {
             path: "proj".to_string(),
             scroll: 0,
+            cursor: 0,
         };
         let project = render_popup_text(&mut state, 140, 45);
         assert!(
@@ -12001,7 +13783,7 @@ mod tests {
             "project total carries the subagent: {project}"
         );
 
-        state.active_popup = crate::ActivePopup::Detail;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
         let popup = render_popup_text(&mut state, 140, 45);
         let split = format!(
             "(session {} + subagents {})",
@@ -12229,9 +14011,10 @@ mod tests {
                 2 => P::ProjectDetail {
                     path: "~/proj".to_string(),
                     scroll: 0,
+                    cursor: 0,
                 },
                 3 => P::Summary { scroll: 0 },
-                4 => P::Detail,
+                4 => P::Detail { back: None },
                 5 => P::DashboardDetail,
                 6 => P::InsightsDetail { scroll: 0 },
                 7 => P::FilterPopup {
@@ -12312,7 +14095,7 @@ mod tests {
                 timestamp_utc: None,
                 model: None,
                 tokens: None,
-                usage: None,
+                billed: Vec::new(),
             }
         }
     }

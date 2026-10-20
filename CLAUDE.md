@@ -70,12 +70,12 @@ isn't obvious from the filename.
 | `aggregator/mod.rs` | `extract_session_model` walks entries reverse — mid-session `/model` switches must reflect in the badge. |
 | `aggregator/pricing.rs` | `models_without_pricing` surfaces unpriced models (`*` mark) instead of silently rendering $0. |
 | `aggregator/tool_category.rs` | UI section order: **Tools → Skills → Commands → Subagents**. `format_tool_short` strips category prefix (section already conveys it). |
-| `infrastructure/mcp_config.rs` | `is_underutilized(now, 30)` is the canonical "stale" predicate. Servers absent from current config are **inactive**, not stale. |
+| `infrastructure/mcp_config.rs` | `is_underutilized(stale_reference(view_end), 30)` is the canonical "stale" predicate — judged at the view's last day, so a past period is not all stale. Servers absent from current config are **inactive**, not stale. |
 | `infrastructure/live_sessions.rs` | `is_today()` is the single source of truth shared between sort tier and row glyph (busy / today / older). |
 | `infrastructure/live_snapshots.rs` | Per-poll alive-set history at `~/.ccsight/live_snapshots/<YYYY-MM-DD>-<HHMM>.json`. Diff-detected + 30-min debounce: a poll that sees no change is a no-op; same-window changes overwrite the latest file; cross-window changes create a new one. Drives the Live tab's `⟳ restorable` flag and `←/→ h/l` time-travel. Singular `LiveSnapshot` struct here = one historical record; the diagnostic singleton (latest alive-set + `last_refresh_at`) lives in `live_diagnostic.rs`. |
 | `infrastructure/live_diagnostic.rs` | Singleton `~/.ccsight/live_snapshot.json`. Diagnostic only: stores the last poll's alive metadata so external readers (MCP, debug scripts) can answer "when did the TUI last refresh". The Live tab's restorable logic does NOT read this file. |
-| `infrastructure/cache.rs` | `CachedFileStats` is single-shape (no partial flag). Both `StatsAggregator::aggregate_with_shared_cache` (TUI) and `DailyGrouper::group_by_date_with_shared_cache` (`--daily`) write fully-populated entries derived from the same entry-walk — anything else gets re-parsed on the other reader's next pass. Bump `CACHE_VERSION` when adding a field, and store a derived total in ONE place: a second copy is a second definition the two writers can disagree on. |
-| Two cold entry walks | `StatsAggregator` and `DailyGrouper` each walk entries themselves and each write the shared cache. A per-entry field folded into only one of them is invisible in the TUI (stats parses first) yet zeroed by `--daily` / MCP, which then persist the zero. `grouping.rs::cache_round_trip_dailygrouper_to_stats_matches_fresh_parse` is where a new folded field earns its assertion. |
+| `infrastructure/cache.rs` | `CachedFileStats` is single-shape (no partial flag), written by the one entry walk (`DailyGrouper`). Bump `CACHE_VERSION` when adding a field, and store a derived total in ONE place: a second copy is a second definition that can drift. |
+| One entry walk | `DailyGrouper` is the only walk; TUI, `--daily` and MCP all read its per-day slices, and `Stats::from_groups` folds the whole-view figures from them (filtered or not). A per-entry figure a view needs goes into the per-day slice, never a whole-file counter. A slice is only ever built from its cache entry (a fresh parse writes the entry first), so a new field earns its assertion in `grouping.rs::a_cache_entry_rebuilds_the_slices_its_fresh_parse_built`, and the fresh-vs-cached checks below guard its disk round trip. |
 | `shell.rs` | `posix_shell_quote` is the only sanctioned interpolation for `cd ... && claude -r ...`. Lint #28 enforces. |
 | `state.rs` | Adding a field is compiler-checked at every exhaustive `AppState { ... }` literal (`new_initial` + `test_helpers::make_test_app_state`). |
 
@@ -226,16 +226,16 @@ only when every line is load-bearing.
 
 Pick the lowest layer that exercises what you changed.
 
-The StatsAggregator↔DailyGrouper token-agreement check runs at three
-intensities so the per-commit gate stays fast without losing real-data
-coverage: **commit** — `stats_and_grouper_agree_on_sampled_real_files`
-samples a few real `~/.claude` files (oldest/newest + random middle), fast,
-no-ops on CI; **push** — the pre-push hook runs the `#[ignore]`d
-`test_stats_and_grouper_agree_on_token_totals`: exact equality over every
-real file not written recently, identity-checked after both passes so a file
-that moved mid-run makes the result inconclusive instead of a false pass or a
-tolerance-hidden regression; **CI** — `stats_and_grouper_agree_on_fixture` (deterministic
-2-file fixture, also pins absolute values), since CI has no real data. No
+The fresh-parse ↔ cache-rebuild agreement check (the cache passes through its
+on-disk shape between the two walks) runs at three intensities so
+the per-commit gate stays fast without losing real-data coverage: **commit** —
+`fresh_and_cached_walks_agree_on_sampled_real_files` samples a few quiet real
+`~/.claude` files, fast, no-ops on CI; **push** — the pre-push hook runs the
+`#[ignore]`d `test_fresh_and_cached_walks_agree_on_real_data`: every per-slice
+field equal over every real file not written recently, identity-checked after
+both walks so a file that moved mid-run makes the result inconclusive instead
+of a false pass; **CI** — `fresh_and_cached_walks_agree_on_fixture`
+(deterministic 2-file fixture, also pins absolute values), since CI has no real data. No
 real `~/.claude` content is ever committed. CI smoke (`scripts/smoke-ci.sh`)
 drives the TUI through every tab + a popup under tmux with poll-until-ready,
 not just a first-frame capture.
@@ -304,7 +304,15 @@ fix worked.
 - **Pane search**: VS Code style — matches live on the logical messages (collapsed compact messages hit; the current match peek-expands its message), Enter/Shift+Enter = next/prev occurrence, Esc ends the search outright, `/` reopens with the last query preselected.
 - **Async**: Background threads for data load, summary, index build via `mpsc::channel`. UI must show "Searching..." (not "No results") while a loading flag is set. Every `Receiver` must be polled with `match` covering `Disconnected` — `let Ok(...) = rx.try_recv()` silently swallows worker-thread panics and freezes the task forever (lint #26).
 - **MCP tools** (`mcp.rs`): `stats` (+ per-server `mcp_servers` snapshot), `sessions`, `search`, `live_sessions`. The first three share `date_from` / `date_to` (`YYYY-MM-DD`, local timezone); `live_sessions` reports the current poll only.
-- **Costs include subagents**: Overview, Costs panel, and `--daily` CLI all sum over `group.sessions` so totals match.
+- **Subagent rule** (TUI, CLI and MCP alike): *counts* leave subagents out —
+  sessions, session-days, prompts, the denominator of any per-session figure,
+  and the rows of a session list. Everything a session *consumes or does*
+  takes them in — tokens of every kind, cost, tool calls and results,
+  languages, hour / weekday distributions, churn, per-model shares, active
+  days — and a session row folds in its own subagents' spend. A ratio applies
+  the rule to each side. `Stats::from_groups` is the reference fold; a surface
+  computing its own figure must agree with it, which the cross-surface tests
+  (same number, two views) check.
 - **stderr is forbidden** — writes corrupt the TUI rendering. Lint #20 enforces.
 - **Atomic file writes**: every `tmp + rename` write under `~/.ccsight/` must `sync_all` before the rename, otherwise the data isn't durable across power loss. Lint #29 enforces.
 - **Shell command escaping**: any string composed for the user to paste into a shell (`cd ... && claude -r ...`) must route both interpolations through `crate::shell::posix_shell_quote`. The cwd / session_id come from on-disk JSON. Lint #28 enforces.

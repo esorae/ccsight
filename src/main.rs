@@ -37,13 +37,12 @@ pub(crate) use handlers::mcp_popup::{adjust_mcp_scroll, collect_mcp_servers, mcp
 pub(crate) use handlers::pane::{
     current_selected_session, extract_selected_text_from_buffer, get_conv_session_count,
     get_conv_session_file, open_conversation_in_pane, preview_conversation_in_pane,
-    spawn_load_conversation,
 };
 // `join_conversation_lines` is referenced from `main_tests.rs` only.
 #[cfg(test)]
 pub(crate) use handlers::pane::join_conversation_lines;
 
-pub(crate) const SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
+pub(crate) const SUMMARY_MODEL: &str = "claude-haiku-5-5";
 
 use std::io;
 use std::path::PathBuf;
@@ -66,7 +65,7 @@ use crossterm::{
 };
 use ratatui::DefaultTerminal;
 
-use crate::aggregator::{CostCalculator, DailyGroup, DailyGrouper, StatsAggregator};
+use crate::aggregator::{CostCalculator, DailyGroup, DailyGrouper};
 use crate::infrastructure::FileDiscovery;
 
 #[derive(Parser, Debug)]
@@ -146,13 +145,13 @@ fn main() -> io::Result<()> {
     infrastructure::ensure_private_state_root();
 
     if args.clear_cache {
-        if let Ok(cache_path) = infrastructure::cache_path() {
-            if cache_path.exists() {
-                std::fs::remove_file(&cache_path).ok();
-                println!("Cache cleared: {}", cache_path.display());
-            } else {
-                println!("No cache file found");
+        match infrastructure::Cache::clear_all() {
+            Ok(removed) if !removed.is_empty() => {
+                for path in removed {
+                    println!("Cache cleared: {}", path.display());
+                }
             }
+            _ => println!("No cache file found"),
         }
         if infrastructure::SearchIndex::clear_index().is_ok() {
             println!("Search index cleared");
@@ -409,28 +408,6 @@ fn poll_index_build_task(state: &mut AppState) {
     }
 }
 
-/// File path of the session the detail popup is showing. Must mirror the two
-/// `draw_session_detail` call sites so the preview loads the right session:
-/// `session_detail_override` (Live) wins; in the conversation view the active
-/// pane's file path; otherwise the cursor in the current day's user sessions.
-fn detail_session_path(state: &AppState) -> Option<std::path::PathBuf> {
-    if let Some(ref s) = state.session_detail_override {
-        return Some(s.file_path.clone());
-    }
-    if state.show_conversation {
-        return state
-            .active_pane_index
-            .and_then(|i| state.panes.get(i))
-            .and_then(|p| p.file_path.clone())
-            .or_else(|| get_conv_session_file(state, state.selected_session));
-    }
-    let group = state.daily_groups.get(state.selected_day)?;
-    group
-        .user_sessions()
-        .nth(state.selected_session)
-        .map(|s| s.file_path.clone())
-}
-
 /// Kick off the background "Recent conversation" load when the detail popup is
 /// open and showing a session whose preview isn't loaded yet. Keyed on the
 /// file path so switching sessions reloads and reopening the same one is a
@@ -439,7 +416,7 @@ fn ensure_session_recent_load(state: &mut AppState) {
     if !state.show_detail() {
         return;
     }
-    let Some(path) = detail_session_path(state) else {
+    let Some(path) = crate::handlers::pane::detail_session_path(state) else {
         return;
     };
     if state.session_detail_recent_for.as_ref() == Some(&path) {
@@ -500,11 +477,30 @@ fn poll_data_reload_task(state: &mut AppState) {
                         state.daily_groups.iter().map(|g| g.date).collect();
                     let prev_sessions = day_session_paths(state, state.selected_day);
                     let (prev_day, prev_session) = (state.selected_day, state.selected_session);
+                    let selected_hit = selected_result_path(state);
+                    let saved_day = state
+                        .search_saved_state
+                        .map(|(_, day, _, _)| (day, day_session_paths(state, day)));
                     state.apply_loaded_data(data);
                     let next_days: Vec<NaiveDate> =
                         state.daily_groups.iter().map(|g| g.date).collect();
                     state.selected_day =
                         crate::state::follow_selection(&prev_days, prev_day, &next_days);
+                    // Where `/` was pressed, followed the same way, so Esc
+                    // lands on that day and session, not on their old indices.
+                    if let Some((day, paths)) = saved_day {
+                        let next_day = crate::state::follow_selection(&prev_days, day, &next_days);
+                        let same_day = prev_days.get(day) == next_days.get(next_day);
+                        let next_paths = day_session_paths(state, next_day);
+                        if let Some(saved) = state.search_saved_state.as_mut() {
+                            saved.2 = if same_day {
+                                crate::state::follow_selection(&paths, saved.2, &next_paths)
+                            } else {
+                                0
+                            };
+                            saved.1 = next_day;
+                        }
+                    }
                     if state.conv_list_mode == crate::ConvListMode::Day
                         && prev_days.get(prev_day) == next_days.get(state.selected_day)
                     {
@@ -535,17 +531,18 @@ fn poll_data_reload_task(state: &mut AppState) {
                             state.selected_session = session_count.saturating_sub(1);
                         }
                     }
+                    // The positions point into the replaced groups. A preview
+                    // returns to this list, so it is rebuilt then as well.
                     state.search_results.clear();
                     state.search_selected = 0;
                     start_index_build(state);
-                    if state.search_mode && !state.search_input.text.is_empty() {
-                        let ctx_owned = build_search_filter_ctx(state);
-                        state.search_results = search::perform_search(
-                            &state.daily_groups,
-                            &state.search_input.text,
-                            &ctx_owned.as_ref(),
-                        );
-                        start_content_search(state);
+                    if (state.search_mode || state.search_preview_mode)
+                        && !state.search_input.text.is_empty()
+                    {
+                        crate::rerun_search(state, start_content_search);
+                        if !reselect_result(state, selected_hit.as_deref()) {
+                            state.search_reselect = selected_hit;
+                        }
                     }
                 }
             }
@@ -592,20 +589,7 @@ fn poll_search_task(state: &mut AppState) {
                             )
                         })
                     };
-                    // Sessions already listed, built once: a fetch returns up
-                    // to thousands of hits, and a per-hit scan of the list
-                    // runs on the render thread.
-                    let mut shown: std::collections::HashSet<std::path::PathBuf> = state
-                        .search_results
-                        .iter()
-                        .filter_map(|r| {
-                            state.daily_groups.get(r.day_idx).and_then(|g| {
-                                g.user_sessions()
-                                    .nth(r.session_idx)
-                                    .map(|s| s.file_path.clone())
-                            })
-                        })
-                        .collect();
+                    let mut accepted = Vec::new();
                     for mut result in content_results {
                         if let Some(path) = result.session_path.as_ref() {
                             let is_message_day = |day_idx: usize| {
@@ -644,12 +628,31 @@ fn poll_search_task(state: &mut AppState) {
                         if !crate::search::session_passes_filters(session, &filters, &ctx) {
                             continue;
                         }
-                        // Dedupe by file_path so a multi-day session doesn't
-                        // appear once per day. perform_search deduped its own
-                        // output; this catches tantivy hits that arrive after.
-                        if shown.insert(session.file_path.clone()) {
-                            state.search_results.push(result);
-                        }
+                        accepted.push(result);
+                    }
+                    // The hits take their tier's place, and the row under the
+                    // cursor stays under it as rows move.
+                    let groups = &state.daily_groups;
+                    let path_of = |r: &crate::search::SearchResult| {
+                        groups
+                            .get(r.day_idx)
+                            .and_then(|g| g.user_sessions().nth(r.session_idx))
+                            .map(|s| s.file_path.clone())
+                    };
+                    let selected = state.search_reselect.take().or_else(|| {
+                        state
+                            .search_results
+                            .get(state.search_selected)
+                            .and_then(path_of)
+                    });
+                    crate::search::merge_content_hits(&mut state.search_results, accepted, path_of);
+                    if let Some(i) = selected.and_then(|p| {
+                        state
+                            .search_results
+                            .iter()
+                            .position(|r| path_of(r).as_ref() == Some(&p))
+                    }) {
+                        state.search_selected = i;
                     }
                 }
                 state.search_task = None;
@@ -668,8 +671,7 @@ fn poll_search_task(state: &mut AppState) {
 /// the failure. `Disconnected` clears the slot so a panicked regen thread
 /// doesn't block future regens.
 fn poll_updating_task(state: &mut AppState) {
-    if let Some((ref rx, ref file_path, _day_idx, _session_idx, _actual_idx)) = state.updating_task
-    {
+    if let Some((ref rx, ref file_path)) = state.updating_task {
         let outcome = rx.try_recv();
         match outcome {
             Ok(result) => {
@@ -735,6 +737,12 @@ fn poll_pane_loads(state: &mut AppState) {
                     let is_reload = !pane.messages.is_empty();
                     let old_count = pane.message_lines.len();
                     let was_at_last = old_count > 0 && pane.selected_message >= old_count - 1;
+                    // At the bottom of the last row — an expanded tool run can be
+                    // far taller than the pane — the reader is following the tail.
+                    let was_at_bottom = match (&pane.rendered, pane.last_visible_height) {
+                        (Some(r), Some(vh)) => pane.scroll + vh >= r.0.len(),
+                        _ => false,
+                    };
 
                     pane.messages = messages;
                     pane.loading = false;
@@ -743,16 +751,21 @@ fn poll_pane_loads(state: &mut AppState) {
 
                     if is_reload {
                         if was_at_last {
-                            if let Some(msg) = pane
-                                .messages
-                                .iter()
-                                .rev()
-                                .find(|m| !ui::is_thinking_only_message(m))
+                            // Following the tail selects the last row outright;
+                            // a timestamp lookup could land on a preceding message
+                            // stamped the same second.
+                            if !was_at_bottom
+                                && let Some(msg) = pane
+                                    .messages
+                                    .iter()
+                                    .rev()
+                                    .find(|m| !ui::is_thinking_only_message(m))
                             {
                                 pane.focused_timestamp = msg.timestamp.clone();
                             }
                             pane.scroll = usize::MAX;
                             pane.selected_message = usize::MAX;
+                            pane.follow_tail = was_at_bottom;
                         }
                     } else {
                         pane.search_matches.clear();
@@ -797,6 +810,10 @@ fn poll_initial_load(state: &mut AppState, rx: &mpsc::Receiver<LoadResult>) {
     }
 }
 
+/// One frame: the longest input is drained before a draw, and the longest a
+/// pending draw waits on input.
+const FRAME_BUDGET: Duration = Duration::from_millis(16);
+
 fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
     thread::spawn(ui::warmup_syntax_highlighting);
     // Warm the user-language cache off the UI thread so the first summary doesn't
@@ -818,7 +835,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
     });
 
     let mut last_render = Instant::now();
-    loop {
+    'main: loop {
         if state.tab == Tab::Dashboard && !state.show_dashboard_detail() {
             let today = Local::now().date_naive();
             if let Some(oldest) = state.daily_groups.iter().map(|g| g.date).min() {
@@ -832,7 +849,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
         // events and a full redraw each would freeze the UI draining the
         // queue. Skip a frame while input is still pending (O(1) handlers),
         // but force one per frame budget so a sustained scroll still animates.
-        let render_due = last_render.elapsed() >= Duration::from_millis(16);
+        let render_due = last_render.elapsed() >= FRAME_BUDGET;
         if state.needs_draw && (render_due || !event::poll(Duration::ZERO).unwrap_or(false)) {
             execute!(io::stdout(), BeginSynchronizedUpdate)?;
             let completed = terminal.draw(|f| ui::draw(f, &mut state))?;
@@ -969,8 +986,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             {
                                 pane.focused_timestamp = msg.timestamp.clone();
                             }
-                            pane.load_task = Some(spawn_load_conversation(file_path));
-                            pane.loading = true;
+                            pane.start_load(file_path);
                             pane.last_modified = Some(modified);
                         }
                     }
@@ -996,7 +1012,18 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
 
         poll_search_task(&mut state);
 
-        if event::poll(Duration::from_millis(50))? {
+        // Drain every queued event before the next draw: one event per drawn
+        // frame lets a held key's repeats outrun a slow frame, so the screen
+        // trails the key and keeps moving after release. The frame budget
+        // still forces a draw while input never stops.
+        // The budget runs from the first event, not from the idle wait.
+        let mut batch_start: Option<Instant> = None;
+        let mut wait = Duration::from_millis(50);
+        while event::poll(wait)? {
+            if batch_start.get_or_insert_with(Instant::now).elapsed() >= FRAME_BUDGET {
+                break;
+            }
+            wait = Duration::ZERO;
             let ev = match std::panic::catch_unwind(event::read) {
                 Ok(result) => result?,
                 Err(_) => continue,
@@ -1184,7 +1211,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         if state.ctrl_c_pressed {
-                            break;
+                            break 'main;
                         }
                         state.ctrl_c_pressed = true;
                         state.toast("Press again to quit".to_string());
@@ -1233,13 +1260,14 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         handlers::keyboard::handle_dashboard_detail_key(&mut state, key);
                     } else if state.show_insights_detail() {
                         handlers::keyboard::handle_insights_detail_key(&mut state, key);
+                    } else if state.show_day_activity() {
+                        handlers::keyboard::handle_day_activity_key(&mut state, key);
                     } else if handlers::keyboard::handle_default_key(
                         &mut state,
                         key,
                         preview_conversation_in_pane,
-                        open_conversation_in_pane,
                     ) {
-                        break;
+                        break 'main;
                     }
                 }
                 _ => {}
@@ -1280,7 +1308,7 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
     }
     if state.show_title_edit() {
         if let crate::ActivePopup::TitleEdit { return_to, .. } = &state.active_popup {
-            state.active_popup = return_to.restore();
+            state.active_popup = return_to.clone().restore();
         }
         return;
     }
@@ -1293,70 +1321,138 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
         return;
     }
     if state.search_mode {
-        // Keep `search_input.text` so a follow-up `/` restores the
-        // previous query — same trade-off as the keyboard Esc handler.
-        state.search_mode = false;
-        state.search_results.clear();
-        state.search_selected = 0;
-        state.search_task = None;
-        state.searching = false;
-        if let Some((tab, day, session, show_conv)) = state.search_saved_state.take() {
-            state.tab = tab;
-            state.selected_day = day;
-            state.selected_session = session;
-            state.show_conversation = show_conv;
-        }
-        state.search_preview_mode = false;
+        close_search(state);
         return;
     }
     if state.show_detail() {
-        state.active_popup = crate::ActivePopup::None;
-        state.session_detail_override = None;
-        state.session_detail_live_extra = None;
+        state.close_detail();
         return;
     }
     if state.show_dashboard_detail() {
         state.active_popup = crate::ActivePopup::None;
         return;
     }
-    if state.show_insights_detail() {
+    if state.show_insights_detail() || state.show_day_activity() {
         state.active_popup = crate::ActivePopup::None;
         return;
     }
     if state.show_conversation {
         // Same one-level-outward steps as the Esc key: an in-pane search bar
-        // first, then focus, then the view. Dismissing never removes a pane —
-        // that is `X` — so a click-away cannot silently drop a loaded pane.
-        if let Some(idx) = state.active_pane_index {
-            if state.panes.get(idx).is_some_and(|p| p.search_mode) {
-                state.panes[idx].search_mode = false;
-                return;
-            }
-            state.active_pane_index = None;
-            return;
-        }
-        if let Some(pane) = state.panes.first_mut()
+        // first, then a search preview back to its results, then focus, then
+        // the view. Dismissing never removes a single pane — that is `X`.
+        let bar_pane = state.active_pane_index.unwrap_or(0);
+        if let Some(pane) = state.panes.get_mut(bar_pane)
             && pane.search_mode
         {
             pane.search_mode = false;
             return;
         }
-        state.show_conversation = false;
-        state.panes.clear();
-        state.active_pane_index = None;
-        state.conv_list_mode = ConvListMode::Day;
+        if state.search_preview_mode {
+            return_to_search(state);
+            return;
+        }
+        if state.active_pane_index.take().is_some() {
+            return;
+        }
+        close_conversation_view(state);
         return;
     }
-    if state.daily_breakdown_focus {
-        state.daily_breakdown_focus = false;
+    if state.daily_breakdown_open {
+        state.daily_breakdown_open = false;
         state.daily_breakdown_scroll = 0;
     }
 }
 
+/// Leave the search popup, back to where `/` was pressed. The query text
+/// stays so the next `/` restores it; the result list is rebuilt on open.
+pub(crate) fn close_search(state: &mut AppState) {
+    state.search_mode = false;
+    state.search_select_all = false;
+    state.search_results.clear();
+    state.search_selected = 0;
+    state.search_task = None;
+    state.searching = false;
+    supersede_content_scan();
+    state.search_history.reset_cursor();
+    if let Some((tab, day, session, show_conv)) = state.search_saved_state.take() {
+        state.tab = tab;
+        state.selected_day = day;
+        state.selected_session = session;
+        state.show_conversation = show_conv;
+    }
+    state.search_preview_mode = false;
+}
+
+/// From a search hit's preview back to the result list. Panes are emptied,
+/// not removed, so the next preview reuses their slots.
+pub(crate) fn return_to_search(state: &mut AppState) {
+    state.show_conversation = false;
+    if state.conv_list_mode == ConvListMode::Live {
+        state.selected_session = 0;
+    }
+    for pane in &mut state.panes {
+        pane.clear();
+    }
+    state.active_pane_index = None;
+    if let Some((tab, day, session, _)) = &state.search_saved_state {
+        state.tab = *tab;
+        state.selected_day = *day;
+        state.selected_session = *session;
+    }
+    state.search_mode = true;
+    state.search_preview_mode = false;
+    // A list emptied while previewing comes back with its query, not blank.
+    if state.search_results.is_empty() && !state.search_input.text.is_empty() {
+        rerun_search(state, start_content_search);
+    }
+}
+
+/// The session file of the search result under the cursor.
+fn selected_result_path(state: &AppState) -> Option<std::path::PathBuf> {
+    let r = state.search_results.get(state.search_selected)?;
+    state
+        .daily_groups
+        .get(r.day_idx)?
+        .user_sessions()
+        .nth(r.session_idx)
+        .map(|s| s.file_path.clone())
+}
+
+/// Puts the cursor back on `path`'s row; `false` when the list lacks it.
+fn reselect_result(state: &mut AppState, path: Option<&std::path::Path>) -> bool {
+    let Some(path) = path else { return false };
+    let groups = &state.daily_groups;
+    let Some(i) = state.search_results.iter().position(|r| {
+        groups
+            .get(r.day_idx)
+            .and_then(|g| g.user_sessions().nth(r.session_idx))
+            .is_some_and(|s| s.file_path == path)
+    }) else {
+        return false;
+    };
+    state.search_selected = i;
+    true
+}
+
+/// Close the whole conversation view. A search preview ends with it, so a
+/// later `/` does not return to a stale saved position.
+pub(crate) fn close_conversation_view(state: &mut AppState) {
+    state.show_conversation = false;
+    // The Live list's row index means nothing in the Day list reopened next.
+    if state.conv_list_mode == ConvListMode::Live {
+        state.selected_session = 0;
+    }
+    state.panes.clear();
+    state.active_pane_index = None;
+    state.conv_list_mode = ConvListMode::Day;
+    state.search_preview_mode = false;
+    state.search_saved_state = None;
+}
+
 pub(crate) fn has_blocking_popup(state: &AppState) -> bool {
     use crate::ActivePopup::{
-        DashboardDetail, Detail, FilterPopup, Help, InsightsDetail, None, ProjectDetail,
-        ProjectPopup, Summary, TitleEdit,
+        DashboardDetail, DayActivity, Detail, FilterPopup, Help, InsightsDetail, None,
+        ProjectDetail, ProjectPopup, Summary, TitleEdit,
     };
     // Exhaustive so a new ActivePopup variant forces a blocking/non-blocking
     // decision here. FilterPopup / ProjectPopup are non-blocking (clicks fall
@@ -1366,9 +1462,10 @@ pub(crate) fn has_blocking_popup(state: &AppState) -> bool {
         Help { .. }
         | ProjectDetail { .. }
         | Summary { .. }
-        | Detail
+        | Detail { .. }
         | DashboardDetail
         | InsightsDetail { .. }
+        | DayActivity { .. }
         | TitleEdit { .. } => true,
         None | FilterPopup { .. } | ProjectPopup { .. } => false,
     }
@@ -1402,6 +1499,17 @@ pub(crate) fn live_selectable_range(state: &AppState) -> (usize, usize) {
     }
 }
 
+/// One row up / down, kept inside `live_selectable_range` so a single-pane
+/// mode never lands the cursor on a row it hides.
+pub(crate) fn step_live_selection(state: &mut AppState, up: bool) {
+    let (lo, hi) = live_selectable_range(state);
+    if up {
+        state.live_selected = state.live_selected.saturating_sub(1).max(lo);
+    } else if state.live_selected + 1 < hi {
+        state.live_selected += 1;
+    }
+}
+
 /// Resolve the currently-selected Live session. Today view = active first,
 /// then paused; past-day view = single list from the loaded daily snapshot.
 pub(crate) fn live_selected_session(
@@ -1427,7 +1535,7 @@ pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
             chrono::Local::now().date_naive(),
         ),
         1 => state.stats.project_stats.len(),
-        2 => state.model_costs.len(),
+        2 => state.aggregated_model_tokens.len(),
         3 => crate::ui::dashboard::tool_usage_line_count(state),
         4 => {
             let known = state
@@ -1471,50 +1579,25 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
 /// cache it is handed, so a test passes one that cannot write back.
 fn load_data_with(limit: usize, cache: crate::infrastructure::Cache) -> anyhow::Result<LoadedData> {
     let files = FileDiscovery::find_jsonl_files_with_limit(limit)?;
-    let file_count = files.len();
-    // Thread the stats-updated cache into the grouper: cold-start misses are
-    // parsed once (by stats) and become grouper cache hits.
-    let (stats, cache_stats, cache) = StatsAggregator::aggregate_with_shared_cache(&files, cache);
-    let mut cache_for_grouper = Some(cache);
-    let daily_groups =
-        DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache_for_grouper);
+    // One walk: every view, the whole-range figures included, folds the same
+    // per-day slices, so no second pass can define a number differently.
+    let mut cache = Some(cache);
+    let (daily_groups, cache_stats) = DailyGrouper::group_by_date_counted(&files, &mut cache);
+    let stats = crate::aggregator::Stats::from_groups(&daily_groups);
 
     let calculator = CostCalculator::global();
-    let model_costs = calculator.calculate_costs_by_model(&stats.model_tokens);
     let aggregated_model_tokens = CostCalculator::aggregate_tokens_by_model(&stats.model_tokens);
     let models_without_pricing = calculator.models_without_pricing(&stats.model_tokens);
-    let cost: f64 = model_costs.iter().map(|(_, c)| c).sum();
-
-    // Subagent-inclusive so per-day rows sum back to Overview `total_cost`.
-    // Zero-token days (errors, cancellations) dropped to keep Costs panel
-    // clean; they still appear in Daily tab via daily_groups.
-    let daily_costs: Vec<(NaiveDate, f64)> = daily_groups
-        .iter()
-        .filter_map(|group| {
-            let day_cost: f64 = group
-                .sessions
-                .iter()
-                .flat_map(|s| {
-                    s.day_tokens_by_model.iter().map(|(model, tokens)| {
-                        calculator
-                            .calculate_cost(tokens, Some(model.as_str()))
-                            .unwrap_or(0.0)
-                    })
-                })
-                .sum();
-            (group.billable_tokens() > 0).then_some((group.date, day_cost))
-        })
-        .collect();
+    let costs = crate::aggregator::cost_summary(&daily_groups);
 
     Ok(LoadedData {
         stats,
-        cost,
-        model_costs,
+        cost: costs.total,
+        model_costs: costs.by_model,
         aggregated_model_tokens,
         models_without_pricing,
         daily_groups,
-        daily_costs,
-        file_count,
+        daily_costs: costs.daily,
         cache_stats,
     })
 }
@@ -1534,8 +1617,7 @@ pub(crate) fn paste_into_active_input(
             state.search_input.set(String::new());
         }
         crate::InputKind::PaneSearch => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
+            if let Some(pane) = state.active_pane_mut()
                 && pane.search_select_all
             {
                 pane.search_select_all = false;
@@ -1560,20 +1642,11 @@ pub(crate) fn apply_text_input_side_effects(state: &mut AppState, kind: crate::I
     match kind {
         crate::InputKind::Title => {}
         crate::InputKind::Search => {
-            let ctx_owned = build_search_filter_ctx(state);
-            state.search_results = search::perform_search(
-                &state.daily_groups,
-                &state.search_input.text,
-                &ctx_owned.as_ref(),
-            );
-            state.search_selected = 0;
-            start_content_search(state);
+            crate::rerun_search(state, start_content_search);
         }
         crate::InputKind::Filter => state.set_filter_input_error(false),
         crate::InputKind::PaneSearch => {
-            if let Some(idx) = state.active_pane_index
-                && let Some(pane) = state.panes.get_mut(idx)
-            {
+            if let Some(pane) = state.active_pane_mut() {
                 ui::on_pane_search_edit(pane);
             }
         }
@@ -1634,6 +1707,20 @@ static CONTENT_SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic
 
 pub(crate) fn supersede_content_scan() -> u64 {
     CONTENT_SCAN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
+
+/// Re-run the open query: metadata hits now, content hits via
+/// `start_content` (a parameter so key-handler tests can stub it).
+pub(crate) fn rerun_search(state: &mut AppState, start_content: fn(&mut AppState)) {
+    let ctx_owned = build_search_filter_ctx(state);
+    state.search_results = search::perform_search(
+        &state.daily_groups,
+        &state.search_input.text,
+        &ctx_owned.as_ref(),
+    );
+    state.search_selected = 0;
+    state.search_reselect = None;
+    start_content(state);
 }
 
 /// Days a content match's message must fall in: the view's period filter

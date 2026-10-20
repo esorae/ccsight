@@ -10,8 +10,6 @@ use crate::aggregator::{CostCalculator, DailyGroup, DailyGrouper};
 use crate::conversation::{ConversationBlock, ConversationMessage, load_conversation};
 use crate::infrastructure::FileDiscovery;
 
-use std::path::PathBuf;
-
 #[derive(Debug, Clone)]
 pub struct CcsightServer {
     limit: usize,
@@ -27,7 +25,6 @@ pub struct CcsightServer {
 #[derive(Debug)]
 struct LoadedData {
     daily_groups: Vec<DailyGroup>,
-    summary_cache: HashMap<PathBuf, Option<String>>,
 }
 
 fn load_fresh_data(limit: usize) -> LoadedData {
@@ -38,21 +35,7 @@ fn load_fresh_data(limit: usize) -> LoadedData {
 }
 
 fn build_loaded_data(daily_groups: Vec<DailyGroup>) -> LoadedData {
-    let mut summary_cache = HashMap::new();
-
-    for group in &daily_groups {
-        for session in &group.sessions {
-            let path = &session.file_path;
-            if session.summary.is_none() && !summary_cache.contains_key(path) {
-                summary_cache.insert(path.clone(), derive_summary(path));
-            }
-        }
-    }
-
-    LoadedData {
-        daily_groups,
-        summary_cache,
-    }
+    LoadedData { daily_groups }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -349,24 +332,18 @@ impl CcsightServer {
         let mut total_cost = 0.0;
         let mut total_input = 0u64;
         let mut total_output = 0u64;
-        // Dedup by file_path: `filtered` holds one entry per (session, active
-        // day), so counting per entry would report session-days. Distinct paths
-        // give the true session count (matches search / Daily list).
-        let mut session_paths: std::collections::HashSet<&std::path::PathBuf> =
-            std::collections::HashSet::new();
-        // Separate from `session_paths`: project counts include subagents
-        // (matching the TUI's ProjectStats), the deduped total excludes them.
-        let mut project_files: std::collections::HashSet<&std::path::PathBuf> =
-            std::collections::HashSet::new();
+        // Counts, tokens, hours, tools and languages come from the TUI's own
+        // fold, so both surfaces apply one subagent rule: counts exclude them,
+        // everything else includes them.
+        let owned: Vec<crate::aggregator::DailyGroup> =
+            filtered.iter().map(|g| (*g).clone()).collect();
+        let stats = crate::aggregator::Stats::from_groups(&owned);
         let mut model_agg: HashMap<String, (f64, u64)> = HashMap::new();
-        let mut project_agg: HashMap<String, (usize, u64, f64)> = HashMap::new();
-        let mut hourly_agg: HashMap<u8, u64> = HashMap::new();
+        let mut project_cost: HashMap<String, f64> = HashMap::new();
         let group_by = params.group_by.as_deref();
         let mut daily_agg: HashMap<NaiveDate, (f64, usize, u64)> = HashMap::new();
         let mut total_cache_creation = 0u64;
         let mut total_cache_read = 0u64;
-        let mut tool_counts: HashMap<String, usize> = HashMap::new();
-        let mut lang_counts: HashMap<String, usize> = HashMap::new();
 
         // Track models encountered in the filtered window that lack a pricing entry,
         // so the stats response can surface the silent-$0 risk to the caller.
@@ -377,13 +354,12 @@ impl CcsightServer {
             for session in &group.sessions {
                 let mut session_cost = 0.0;
                 for (model, tokens) in &session.day_tokens_by_model {
-                    let cost = calculator
-                        .calculate_cost(tokens, Some(model))
-                        .unwrap_or(0.0);
-                    if !calculator.has_pricing(Some(model)) {
+                    let cost = calculator.calculate_cost(tokens, Some(model));
+                    if cost.is_none() {
                         models_without_pricing
                             .insert(crate::aggregator::normalize_model_name(model));
                     }
+                    let cost = cost.unwrap_or(0.0);
                     session_cost += cost;
                     total_cost += cost;
                     total_cache_creation += tokens.cache_creation_tokens;
@@ -398,43 +374,15 @@ impl CcsightServer {
                 total_input += session.day_input_tokens;
                 total_output += session.day_output_tokens;
 
-                // Subagent-inclusive (matches total_cost_usd / --daily / TUI
-                // project_stats). Subagent skip below gates only session_count
-                // and hourly / tool / language tallies.
                 if group_by == Some("day") {
                     let day = daily_agg.entry(group.date).or_default();
                     day.0 += session_cost;
-                    day.1 += 1;
+                    day.1 += usize::from(!session.is_subagent);
                     day.2 += session.work_tokens();
                 }
-
-                let proj = project_agg.entry(session.project_name.clone()).or_default();
-                // A multi-day session appears once per active day; count the
-                // FILE once so `sum(projects[].sessions)` reconciles with the
-                // deduped `total_sessions`. Tokens/cost are per-day slices and
-                // still sum across every appearance.
-                if project_files.insert(&session.file_path) {
-                    proj.0 += 1;
-                }
-                proj.1 += session.work_tokens();
-                proj.2 += session_cost;
-
-                if session.is_subagent {
-                    continue;
-                }
-
-                session_paths.insert(&session.file_path);
-
-                for (hour, tokens) in &session.day_hourly_work_tokens {
-                    *hourly_agg.entry(*hour).or_default() += tokens;
-                }
-
-                for (tool, count) in &session.day_tool_usage {
-                    *tool_counts.entry(tool.clone()).or_default() += count;
-                }
-                for (lang, count) in &session.day_language_usage {
-                    *lang_counts.entry(lang.clone()).or_default() += count;
-                }
+                *project_cost
+                    .entry(session.project_name.clone())
+                    .or_default() += session_cost;
             }
         }
 
@@ -456,14 +404,15 @@ impl CcsightServer {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let mut projects: Vec<serde_json::Value> = project_agg
-            .into_iter()
-            .map(|(project, (sessions, work_tokens, cost))| {
+        let mut projects: Vec<serde_json::Value> = stats
+            .project_stats
+            .iter()
+            .map(|(project, p)| {
                 serde_json::json!({
                     "project": project,
-                    "sessions": sessions,
-                    "work_tokens": work_tokens,
-                    "cost_usd": round_cents(cost),
+                    "sessions": p.sessions,
+                    "work_tokens": p.work_tokens,
+                    "cost_usd": round_cents(project_cost.get(project).copied().unwrap_or(0.0)),
                 })
             })
             .collect();
@@ -476,7 +425,7 @@ impl CcsightServer {
         });
 
         let mut hourly_pattern: HashMap<String, u64> = HashMap::new();
-        for (hour, tokens) in &hourly_agg {
+        for (hour, tokens) in &stats.hourly_work_activity {
             hourly_pattern.insert(hour.to_string(), *tokens);
         }
 
@@ -501,9 +450,10 @@ impl CcsightServer {
             0.0
         };
 
-        let total_tool_calls: usize = tool_counts.values().sum();
-        let mut top_tools: Vec<serde_json::Value> = tool_counts
-            .into_iter()
+        let total_tool_calls: usize = stats.tool_usage.values().sum();
+        let mut top_tools: Vec<serde_json::Value> = stats
+            .tool_usage
+            .iter()
             .map(|(tool, count)| serde_json::json!({"tool": tool, "count": count}))
             .collect();
         top_tools.sort_by(|a, b| {
@@ -514,8 +464,9 @@ impl CcsightServer {
         });
         top_tools.truncate(10);
 
-        let mut languages: Vec<serde_json::Value> = lang_counts
-            .into_iter()
+        let mut languages: Vec<serde_json::Value> = stats
+            .language_usage
+            .iter()
             .map(|(lang, count)| serde_json::json!({"language": lang, "count": count}))
             .collect();
         languages.sort_by(|a, b| {
@@ -545,21 +496,19 @@ impl CcsightServer {
         // the Tools popup shows. Useful for users asking "which servers are
         // I paying mental tax on but never invoking" via the MCP API.
         let mcp_status_json = {
-            let now = chrono::Utc::now();
-            let owned: Vec<crate::aggregator::DailyGroup> =
-                filtered.iter().map(|g| (*g).clone()).collect();
+            let stale_at = crate::infrastructure::stale_reference(end);
             let mut entries: Vec<serde_json::Value> =
                 crate::infrastructure::compute_mcp_status(&owned)
                     .into_iter()
                     .map(|s| {
-                        // `is_underutilized(now, 30)` is the canonical "stale"
+                        // `is_underutilized(stale_at, 30)` is the canonical "stale"
                         // predicate; reusing it here keeps the MCP API field
                         // in lockstep with the TUI legend / popup ⚠ marker.
                         let status = if !s.configured {
                             "inactive"
                         } else if s.last_used.is_none() {
                             "stale-never"
-                        } else if s.is_underutilized(now, 30) {
+                        } else if s.is_underutilized(stale_at, 30) {
                             "stale-idle"
                         } else {
                             "active"
@@ -594,7 +543,7 @@ impl CcsightServer {
             "total_cost_usd": round_cents(total_cost),
             "pricing_gap": pricing_gap_json,
             "mcp_servers": mcp_status_json,
-            "total_sessions": session_paths.len(),
+            "total_sessions": stats.total_sessions_count,
             "tokens": {
                 "input": total_input,
                 "output": total_output,
@@ -734,14 +683,7 @@ impl CcsightServer {
                         .map(|s| s.file_path.clone())
                 })
             };
-            // Only in-range metadata hits may claim a session: one outside
-            // the range is dropped below and would take the session's content
-            // hit with it.
-            let mut seen: std::collections::HashSet<std::path::PathBuf> = meta_results
-                .iter()
-                .filter(|r| day_in_range(r.day_idx))
-                .filter_map(path_of)
-                .collect();
+            let mut hits = Vec::new();
             for mut result in index.search_between(&free_text, fetch_limit, 200, date_from, date_to)
             {
                 if let Some(stored) = result.session_path.as_deref() {
@@ -764,15 +706,13 @@ impl CcsightServer {
                     result.day_idx = d;
                     result.session_idx = i;
                 }
-                match path_of(&result) {
-                    Some(p) => {
-                        if seen.insert(p) {
-                            meta_results.push(result);
-                        }
-                    }
-                    None => meta_results.push(result),
-                }
+                hits.push(result);
             }
+            // Only in-range metadata hits may claim a session: one outside
+            // the range is dropped below and would take the session's content
+            // hit with it. The merge then ranks as the TUI's list does.
+            meta_results.retain(|r| day_in_range(r.day_idx));
+            crate::search::merge_content_hits(&mut meta_results, hits, path_of);
         }
 
         let calculator = CostCalculator::global();
@@ -833,6 +773,7 @@ impl CcsightServer {
 
             let match_type = match result.match_type {
                 crate::search::SearchMatchType::ProjectName => "project",
+                crate::search::SearchMatchType::Title => "title",
                 crate::search::SearchMatchType::Summary => "summary",
                 crate::search::SearchMatchType::GitBranch => "branch",
                 crate::search::SearchMatchType::SessionId => "session_id",
@@ -1133,7 +1074,6 @@ impl CcsightServer {
                     group.date,
                     session,
                     calculator,
-                    &data.summary_cache,
                     totals.get(session.file_path.as_path()),
                     by_parent
                         .get(session.file_path.as_path())
@@ -1157,7 +1097,7 @@ impl CcsightServer {
                     let first_prompt = session
                         .summary
                         .as_deref()
-                        .or_else(|| data.summary_cache.get(&session.file_path)?.as_deref());
+                        .or(session.first_user_message.as_deref());
                     let meta_match = session.project_name.to_lowercase().contains(&q)
                         || json["summary"]
                             .as_str()
@@ -1243,7 +1183,6 @@ impl CcsightServer {
             date,
             session,
             calculator,
-            &data.summary_cache,
             totals.get(session.file_path.as_path()),
             crate::aggregator::day_subagent_spend(session, &data.daily_groups),
         );
@@ -1445,6 +1384,15 @@ use crate::text::round_cents;
 fn clean_summary(text: &str) -> String {
     let text = text.trim();
     if text.starts_with("Implement the following plan:") || text.starts_with("/plan") {
+        // A cached prompt has its newlines collapsed: the plan's `# ` heading
+        // then sits inline instead of on a line of its own.
+        // Only a ` # ` with space before it is a heading; `C# ` is not.
+        if !text.contains('\n')
+            && let Some((_, rest)) = text.split_once(" # ")
+        {
+            let title = rest.split(" #").next().unwrap_or(rest);
+            return truncate(title.trim(), 120);
+        }
         for line in text.lines().skip(1) {
             let line = line.trim();
             if let Some(title) = line.strip_prefix("# ") {
@@ -1587,6 +1535,7 @@ fn extract_files_touched(messages: &[ConversationMessage]) -> (Vec<String>, usiz
             if let ConversationBlock::ToolUse {
                 name,
                 input_summary,
+                ..
             } = block
                 && matches!(name.as_str(), "Read" | "Edit" | "Write" | "MultiEdit")
                 && !input_summary.is_empty()
@@ -1611,28 +1560,18 @@ fn extract_files_touched(messages: &[ConversationMessage]) -> (Vec<String>, usiz
 
 const AUTO_PREFIXES: &[&str] = &["You are a rule generator", "Generate a git commit message"];
 
-fn derive_summary(file_path: &std::path::Path) -> Option<String> {
-    use crate::domain::EntryType;
-    use crate::parser::JsonlParser;
-
-    let entries = JsonlParser::parse_file(file_path).ok()?;
-
-    for entry in entries.iter().take(50) {
-        if entry.entry_type != EntryType::User {
-            continue;
-        }
-        let message = entry.message.as_ref()?;
-        let text = message.content.extract_text();
-        let text = text.trim();
-        if text.is_empty() || text.starts_with('<') || text.starts_with('[') {
-            continue;
-        }
-        if AUTO_PREFIXES.iter().any(|p| text.starts_with(p)) {
-            continue;
-        }
-        return Some(clean_summary(text));
+/// Title for a session that has none: its first typed prompt, cleaned. Read
+/// off the cached slice, so a load re-reads no transcript for it.
+fn fallback_title(session: &crate::aggregator::SessionInfo) -> Option<String> {
+    let first = session.first_user_message.as_deref()?.trim();
+    if first.is_empty()
+        || first.starts_with('<')
+        || first.starts_with('[')
+        || AUTO_PREFIXES.iter().any(|p| first.starts_with(p))
+    {
+        return None;
     }
-    None
+    Some(clean_summary(first))
 }
 
 /// The share of a row that ran in subagents the session launched. The row's
@@ -1686,23 +1625,15 @@ fn build_session_json(
     date: NaiveDate,
     session: &crate::aggregator::SessionInfo,
     calculator: &CostCalculator,
-    summary_cache: &HashMap<PathBuf, Option<String>>,
     total: Option<&(
         crate::aggregator::SessionCumulative,
         &crate::aggregator::SessionInfo,
     )>,
     subagents: crate::aggregator::SubagentSpend,
 ) -> serde_json::Value {
-    let mut cost = subagents.cost;
-    let mut cache_creation = 0u64;
-    let mut cache_read = 0u64;
-    for (model, tokens) in &session.day_tokens_by_model {
-        cost += calculator
-            .calculate_cost(tokens, Some(model))
-            .unwrap_or(0.0);
-        cache_creation += tokens.cache_creation_tokens;
-        cache_read += tokens.cache_read_tokens;
-    }
+    let cost = session.cost(calculator) + subagents.cost;
+    let day = session.day_token_total();
+    let (cache_creation, cache_read) = (day.cache_creation_tokens, day.cache_read_tokens);
 
     let first_local = session.day_first_timestamp.with_timezone(&Local);
     let last_local = session.day_last_timestamp.with_timezone(&Local);
@@ -1711,7 +1642,7 @@ fn build_session_json(
         first_local.format("%H:%M"),
         last_local.format("%H:%M")
     );
-    let duration_mins = (session.day_last_timestamp - session.day_first_timestamp).num_minutes();
+    let duration_mins = session.day_duration_mins();
 
     let session_id = session
         .file_path
@@ -1734,7 +1665,7 @@ fn build_session_json(
     let summary = titled
         .display_title()
         .map(str::to_string)
-        .or_else(|| summary_cache.get(&session.file_path).and_then(Clone::clone));
+        .or_else(|| fallback_title(titled));
 
     let mut row = serde_json::json!({
         "session_id": session_id,
@@ -1784,6 +1715,7 @@ mod tests {
 
     use super::*;
     use crate::test_helpers::helpers::{make_daily_group, make_session, make_session_with_tokens};
+    use std::path::PathBuf;
 
     struct TempFile(PathBuf);
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2209,17 +2141,10 @@ mod tests {
             unpriced: false,
         };
         let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
-        let json = build_session_json(date, &session, calculator, &HashMap::new(), None, spend);
+        let json = build_session_json(date, &session, calculator, None, spend);
         assert_eq!(json["cost_usd"], serde_json::json!(round_cents(2.0 * own)));
         assert_eq!(json["subagents"]["tokens"], 500);
-        let bare = build_session_json(
-            date,
-            &session,
-            calculator,
-            &HashMap::new(),
-            None,
-            SubagentSpend::default(),
-        );
+        let bare = build_session_json(date, &session, calculator, None, SubagentSpend::default());
         assert!(
             bare.get("subagents").is_none(),
             "no block without subagents"
@@ -2237,14 +2162,7 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
         let calculator = CostCalculator::global();
 
-        let json = build_session_json(
-            date,
-            &session,
-            calculator,
-            &HashMap::new(),
-            None,
-            Default::default(),
-        );
+        let json = build_session_json(date, &session, calculator, None, Default::default());
 
         assert_eq!(json["date"], "2026-03-19"); // lint-ok: date-literal
         assert_eq!(json["project"], "~/projects/myapp");
@@ -2269,7 +2187,6 @@ mod tests {
             date,
             &session,
             CostCalculator::global(),
-            &HashMap::new(),
             None,
             Default::default(),
         );
@@ -2287,7 +2204,6 @@ mod tests {
             date,
             &session,
             CostCalculator::global(),
-            &HashMap::new(),
             None,
             Default::default(),
         );
@@ -2306,7 +2222,6 @@ mod tests {
             date,
             &session,
             CostCalculator::global(),
-            &HashMap::new(),
             None,
             Default::default(),
         );
@@ -2396,6 +2311,34 @@ mod tests {
             json["total_sessions"], 3,
             "should include today + yesterday but not last_week"
         );
+    }
+
+    // One subagent rule for the TUI and MCP: counts leave subagents out,
+    // per-project tokens and tool / hour tallies take them in.
+    #[test]
+    fn stats_counts_exclude_subagents_and_tallies_include_them() {
+        let today = Local::now().date_naive();
+        let mut user =
+            make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        user.day_tool_usage.insert("Read".to_string(), 2);
+        let mut sub =
+            make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        sub.file_path = std::path::PathBuf::from("/tmp/test/app/subagents/agent-1.jsonl");
+        sub.is_subagent = true;
+        sub.day_tool_usage.insert("Read".to_string(), 3);
+        sub.day_hourly_work_tokens.insert(9, 700);
+        let server = CcsightServer::from_groups(vec![make_daily_group(today, vec![user, sub])]);
+        let json = call_stats(&server, None);
+
+        assert_eq!(
+            json["projects"][0]["sessions"], 1,
+            "a subagent is not a session"
+        );
+        assert_eq!(
+            json["top_tools"][0]["count"], 5,
+            "subagent tool calls count"
+        );
+        assert_eq!(json["hourly_pattern"]["9"], 700, "subagent hours count");
     }
 
     #[test]
@@ -2851,7 +2794,7 @@ mod tests {
                 model: None,
                 tokens: None,
                 timestamp_utc: None,
-                usage: None,
+                billed: Vec::new(),
             },
             ConversationMessage {
                 role: "assistant".to_string(),
@@ -2860,7 +2803,7 @@ mod tests {
                 model: Some("claude-sonnet-4".to_string()),
                 tokens: Some((1000, 500)),
                 timestamp_utc: None,
-                usage: None,
+                billed: Vec::new(),
             },
             ConversationMessage {
                 role: "user".to_string(),
@@ -2869,7 +2812,7 @@ mod tests {
                 model: None,
                 tokens: None,
                 timestamp_utc: None,
-                usage: None,
+                billed: Vec::new(),
             },
         ];
         let conv = extract_conversation(&messages);
@@ -2891,7 +2834,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         }];
         let conv = extract_conversation(&messages);
         assert_eq!(conv.len(), 1);
@@ -2903,6 +2846,8 @@ mod tests {
         let messages = vec![ConversationMessage {
             role: "assistant".to_string(),
             blocks: vec![ConversationBlock::ToolUse {
+                id: String::new(),
+                input: Vec::new(),
                 name: "Read".to_string(),
                 input_summary: "/tmp/x".to_string(),
             }],
@@ -2910,7 +2855,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         }];
         let conv = extract_conversation(&messages);
         assert!(
@@ -2929,7 +2874,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         }];
         let conv = extract_conversation(&messages);
         let text = conv[0]["text"].as_str().unwrap();
@@ -2942,6 +2887,8 @@ mod tests {
         let messages = vec![ConversationMessage {
             role: "user".to_string(),
             blocks: vec![ConversationBlock::ToolUse {
+                id: String::new(),
+                input: Vec::new(),
                 name: "Read".to_string(),
                 input_summary: "/tmp/x".to_string(),
             }],
@@ -2949,7 +2896,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         }];
         let conv = extract_conversation(&messages);
         assert!(conv.is_empty());
@@ -2961,18 +2908,26 @@ mod tests {
             role: "assistant".to_string(),
             blocks: vec![
                 ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Read".to_string(),
                     input_summary: "/src/main.rs".to_string(),
                 },
                 ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Edit".to_string(),
                     input_summary: "/src/lib.rs".to_string(),
                 },
                 ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Read".to_string(),
                     input_summary: "/src/main.rs".to_string(),
                 },
                 ConversationBlock::ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Bash".to_string(),
                     input_summary: "cargo test".to_string(),
                 },
@@ -2981,7 +2936,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         }];
         let (files, total) = extract_files_touched(&messages);
         // Touch count orders the list, so a capped list keeps the files the
@@ -2994,11 +2949,15 @@ mod tests {
     fn files_touched_drops_scratch_paths_and_caps_but_counts_every_file() {
         let mut blocks: Vec<ConversationBlock> = (0..MAX_FILES_TOUCHED + 5)
             .map(|i| ConversationBlock::ToolUse {
+                id: String::new(),
+                input: Vec::new(),
                 name: "Edit".to_string(),
                 input_summary: format!("/src/f{i:03}.rs"),
             })
             .collect();
         blocks.push(ConversationBlock::ToolUse {
+            id: String::new(),
+            input: Vec::new(),
             name: "Write".to_string(),
             input_summary: "/tmp/scratch.txt".to_string(),
         });
@@ -3009,7 +2968,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         }];
         let (files, total) = extract_files_touched(&messages);
         assert_eq!(files.len(), MAX_FILES_TOUCHED);
@@ -3030,7 +2989,7 @@ mod tests {
             model: None,
             tokens: None,
             timestamp_utc: None,
-            usage: None,
+            billed: Vec::new(),
         }];
         let (files, total) = extract_files_touched(&messages);
         assert!(files.is_empty());
@@ -3136,63 +3095,43 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_summary_from_file() {
-        let tmp = TempFile::new("ccsight_derive_summary.jsonl");
-        tmp.write_jsonl(&[serde_json::json!({
-            "type": "user",
-            "timestamp": "2026-03-20T10:00:00Z",
-            "message": {"role": "user", "content": "Add MCP server support to the project"}
-        })]);
+    fn a_session_without_a_title_falls_back_to_its_first_prompt() {
+        let with = |first: &str| {
+            let mut s = make_session_with_tokens("~/p", 1, 1, "claude-opus-4-6");
+            s.first_user_message = Some(first.to_string());
+            fallback_title(&s)
+        };
         assert_eq!(
-            derive_summary(tmp.path()).as_deref(),
-            Some("Add MCP server support to the project")
+            with("Add MCP server support").as_deref(),
+            Some("Add MCP server support")
         );
-    }
-
-    #[test]
-    fn test_derive_summary_skips_system_tags() {
-        let tmp = TempFile::new("ccsight_derive_skip_tags.jsonl");
-        tmp.write_jsonl(&[
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-20T10:00:00Z",
-                "message": {"role": "user", "content": "<local-command-caveat>system noise</local-command-caveat>"}
-            }),
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-20T10:01:00Z",
-                "message": {"role": "user", "content": "Fix the login bug"}
-            }),
-        ]);
+        assert_eq!(with("[Image: pasted]"), None, "not a prompt worth titling");
         assert_eq!(
-            derive_summary(tmp.path()).as_deref(),
-            Some("Fix the login bug")
+            with("Generate a git commit message for"),
+            None,
+            "auto prompt"
         );
-    }
-
-    #[test]
-    fn test_derive_summary_no_user_message() {
-        let tmp = TempFile::new("ccsight_derive_no_user.jsonl");
-        tmp.write_jsonl(&[serde_json::json!({
-            "type": "assistant",
-            "timestamp": "2026-03-20T10:00:00Z",
-            "message": {"role": "assistant", "content": "Hello"}
-        })]);
-        assert!(derive_summary(tmp.path()).is_none());
-    }
-
-    #[test]
-    fn test_derive_summary_truncates_long() {
-        let tmp = TempFile::new("ccsight_derive_long.jsonl");
-        let long = "x".repeat(300);
-        tmp.write_jsonl(&[serde_json::json!({
-            "type": "user",
-            "timestamp": "2026-03-20T10:00:00Z",
-            "message": {"role": "user", "content": long}
-        })]);
-        let result = derive_summary(tmp.path()).unwrap();
-        assert!(result.len() <= 124);
-        assert!(result.ends_with("..."));
+        let long = with(&"x".repeat(300)).unwrap();
+        assert!(long.len() <= 124 && long.ends_with("..."));
+        // A cached plan prompt is one line; its heading still becomes the title.
+        assert_eq!(
+            with("Implement the following plan: # Split main.rs ## Context details").as_deref(),
+            Some("Split main.rs")
+        );
+        // `C# ` in the plan's lead-in is not its heading.
+        assert_eq!(
+            with("Implement the following plan: port the C# service # Real Title ## Context")
+                .as_deref(),
+            Some("Real Title")
+        );
+        assert_eq!(
+            with("<command-name>/x</command-name> args"),
+            None,
+            "a tag-wrapped injection is not a prompt"
+        );
+        let mut none = make_session_with_tokens("~/p", 1, 1, "claude-opus-4-6");
+        none.first_user_message = None;
+        assert_eq!(fallback_title(&none), None);
     }
 
     #[test]
@@ -3598,7 +3537,6 @@ mod tests {
             newer,
             newest,
             CostCalculator::global(),
-            &HashMap::new(),
             totals.get(newest.file_path.as_path()),
             Default::default(),
         );
@@ -3615,7 +3553,6 @@ mod tests {
             newer,
             s,
             CostCalculator::global(),
-            &HashMap::new(),
             totals.get(s.file_path.as_path()),
             Default::default(),
         );
@@ -3686,24 +3623,21 @@ mod tests {
     }
 
     #[test]
-    fn test_query_searches_derived_summary() {
+    fn test_query_searches_the_first_prompt_of_an_untitled_session() {
         let today = Local::now().date_naive();
         let mut session = make_session("~/projects/app", None, None);
         session.summary = None;
-
-        let tmp = TempFile::new("ccsight_query_summary.jsonl");
-        tmp.write_jsonl(&[serde_json::json!({
-            "type": "user",
-            "timestamp": "2026-03-20T10:00:00Z",
-            "message": {"role": "user", "content": "Fix the pagination bug in user list"}
-        })]);
-        session.file_path = tmp.path().to_path_buf();
+        session.first_user_message = Some("Fix the pagination bug in user list".to_string());
 
         let groups = vec![make_daily_group(today, vec![session])];
         let server = CcsightServer::from_groups(groups);
         let json = call_sessions(&server, Some("pagination"), None, None, None);
 
-        assert_eq!(json["count"], 1, "query should match derived summary");
+        assert_eq!(json["count"], 1, "query should match the first prompt");
+        assert_eq!(
+            json["sessions"][0]["summary"], "Fix the pagination bug in user list",
+            "the first prompt stands in for the missing title"
+        );
     }
 
     #[test]

@@ -115,6 +115,15 @@ pub fn hbar(filled: usize, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
+/// `s` cut to `width` display columns (with `…`) and padded to exactly
+/// `width`, so a column of wide (CJK) and narrow text still lines up —
+/// `format!("{:<w$}")` pads by chars, not columns.
+pub fn fit_width(s: &str, width: usize) -> String {
+    let cut = truncate_with_ellipsis(s, width);
+    let used = unicode_width::UnicodeWidthStr::width(cut.as_str());
+    format!("{cut}{}", " ".repeat(width.saturating_sub(used)))
+}
+
 /// Truncate `s` to `max_width` display columns (UnicodeWidth-aware), ending
 /// with `…` when cut. The single home for display-name truncation — render
 /// sites must call this, never `chars().take(n)` (which drops the ellipsis
@@ -169,6 +178,31 @@ pub fn format_pct_f64(part: f64, total: f64) -> String {
         "<1%".to_string()
     } else {
         format!("{pct}%")
+    }
+}
+
+/// `90` → `1h30m`, `45` → `45m`.
+pub fn format_duration_mins(mins: i64) -> String {
+    if mins >= 60 {
+        format!("{}h{}m", mins / 60, mins % 60)
+    } else {
+        format!("{mins}m")
+    }
+}
+
+/// Decimal byte size with one significant decimal below ten: `5.2 MB`, `560 MB`.
+pub fn format_bytes(bytes: u64) -> String {
+    let (divisor, unit) = match bytes {
+        b if b >= 1_000_000_000 => (1_000_000_000.0, "GB"),
+        b if b >= 1_000_000 => (1_000_000.0, "MB"),
+        b if b >= 1_000 => (1_000.0, "KB"),
+        _ => return format!("{bytes} B"),
+    };
+    let v = bytes as f64 / divisor;
+    if v < 10.0 {
+        format!("{v:.1} {unit}")
+    } else {
+        format!("{v:.0} {unit}")
     }
 }
 
@@ -312,6 +346,15 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     #[test]
+    fn format_bytes_keeps_one_decimal_only_below_ten() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(5_240_000), "5.2 MB");
+        assert_eq!(format_bytes(560_700_000), "561 MB");
+        assert_eq!(format_bytes(2_100_000_000), "2.1 GB");
+    }
+
+    #[test]
     fn hbar_fills_and_pads_to_width() {
         assert_eq!(UnicodeWidthStr::width(hbar(3, 10).as_str()), 10);
         assert_eq!(hbar(0, 4), "░░░░");
@@ -343,6 +386,22 @@ mod tests {
         // Within budget → unchanged; zero budget → empty.
         assert_eq!(truncate_with_ellipsis("abc", 8), "abc");
         assert_eq!(truncate_with_ellipsis("abc", 0), "");
+    }
+
+    #[test]
+    fn fit_width_pads_by_display_columns() {
+        use unicode_width::UnicodeWidthStr;
+        for s in ["abc", "日本語のタイトル", "a長いタイトルが入る場合"] {
+            assert_eq!(UnicodeWidthStr::width(fit_width(s, 10).as_str()), 10, "{s}");
+        }
+    }
+
+    #[test]
+    fn a_duration_switches_to_hours_at_sixty_minutes() {
+        assert_eq!(format_duration_mins(0), "0m");
+        assert_eq!(format_duration_mins(59), "59m");
+        assert_eq!(format_duration_mins(60), "1h0m");
+        assert_eq!(format_duration_mins(125), "2h5m");
     }
 
     #[test]

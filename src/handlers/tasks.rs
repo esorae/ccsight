@@ -69,19 +69,18 @@ pub(crate) fn start_day_summary(state: &mut AppState, group: DailyGroup, regener
 }
 
 /// Spawn the JSONL custom-title generation task triggered by `t` in Daily /
-/// Session detail popups. Records `(day, session)` indices in
-/// `state.updating_session` so the main loop can splice the result back in.
+/// Session detail popups. Records `(day, session)` in `state.updating_session`
+/// for the row's spinner; the result is matched back by file path.
 pub(crate) fn start_jsonl_regen(
     state: &mut AppState,
     session: SessionInfo,
     day: usize,
     sess: usize,
-    actual_idx: usize,
 ) {
     let file_path = session.file_path.clone();
     let (tx, rx) = mpsc::channel();
     state.updating_session = Some((day, sess));
-    state.updating_task = Some((rx, file_path, day, sess, actual_idx));
+    state.updating_task = Some((rx, file_path));
     thread::spawn(move || {
         let result = summary::regenerate_jsonl_title(&session);
         let _ = tx.send(result);

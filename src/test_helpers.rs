@@ -24,6 +24,8 @@ pub mod helpers {
             day_output_tokens: 0,
             day_user_msgs: 0,
             day_prompts: 0,
+            day_tool_errors: 0,
+            day_tool_successes: 0,
             day_assistant_msgs: 0,
             day_tokens_by_model: HashMap::new(),
             day_hourly_activity: HashMap::new(),
@@ -100,13 +102,16 @@ pub mod helpers {
 
     pub fn make_test_app_state(groups: Vec<DailyGroup>) -> crate::AppState {
         let daily_costs: Vec<(NaiveDate, f64)> = groups.iter().map(|g| (g.date, 1.0)).collect();
+        // The figures fold from the groups, as a load folds them: a view never
+        // shows a count its own groups would not produce.
+        let stats = crate::aggregator::Stats::from_groups(&groups);
 
-        crate::AppState {
+        let mut state = crate::AppState {
             needs_draw: false,
             tab: crate::Tab::Dashboard,
             pins: crate::pins::Pins::empty(),
             conv_list_mode: crate::ConvListMode::Day,
-            stats: crate::aggregator::Stats::default(),
+            stats: stats.clone(),
             total_cost: daily_costs.len() as f64,
             model_costs: Vec::new(),
             aggregated_model_tokens: HashMap::new(),
@@ -143,14 +148,14 @@ pub mod helpers {
             show_conversation: false,
             summary_content: String::new(),
             summary_type: None,
-            daily_breakdown_focus: false,
+            daily_breakdown_open: false,
+            daily_panel: crate::state::DailyPanel::Sessions,
             daily_breakdown_scroll: 0,
             daily_breakdown_max_scroll: 0,
             generating_summary: false,
             summary_task: None,
             loading: false,
             error: None,
-            file_count: 0,
             cache_stats: None,
             dashboard_panel: 0,
             dashboard_scroll: [0; 7],
@@ -170,6 +175,7 @@ pub mod helpers {
             searching: false,
             search_preview_mode: false,
             search_saved_state: None,
+            search_reselect: None,
             search_history: crate::search_history::SearchHistory::default(),
             mcp_status: Vec::new(),
             configured_resources: crate::infrastructure::ConfiguredResources::default(),
@@ -211,14 +217,19 @@ pub mod helpers {
             original_daily_groups: groups,
             verified_project_paths: std::collections::HashMap::new(),
             original_daily_costs: daily_costs.clone(),
-            original_stats: crate::aggregator::Stats::default(),
+            original_stats: stats,
             original_total_cost: daily_costs.len() as f64,
             original_model_costs: Vec::new(),
             original_aggregated_model_tokens: HashMap::new(),
             dashboard_projects_sort: crate::state::RankSort::default(),
             dashboard_models_sort: crate::state::RankSort::default(),
+            models_detail_offset: 0,
             dashboard_ecosystem_sort: crate::state::RankSort::default(),
             dashboard_languages_sort: crate::state::RankSort::default(),
-        }
+        };
+        // Derived exactly as a data load derives it, so a popup under test
+        // sees the project rows the real one would.
+        state.rebuild_project_list();
+        state
     }
 }

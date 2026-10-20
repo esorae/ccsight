@@ -95,9 +95,9 @@ else
     step "1" "Overview" "dashboard-tab"
     step "2" "Active now" "live-tab"
     step "3" "Breakdown (" "daily-tab"
-    step "4" "Today vs Average" "insights-tab"
+    step "4" "Weekly avg" "insights-tab"
     # 3) Open the Insights detail popup (single-key) and close it.
-    step "i" "Usage by category" "insights-detail-open"
+    step "i" "Cache Hit Rate" "insights-detail-open"
     tmux send-keys -t "$SESSION" Escape
     assert_no_panic "insights-detail-close"
     # 4) Back to Dashboard, open a panel detail popup via Enter, then close.
@@ -107,6 +107,17 @@ else
     assert_no_panic "dashboard-detail-open"
     tmux send-keys -t "$SESSION" Escape
     assert_no_panic "dashboard-detail-close"
+    # 5) Mouse: an SGR press + release on the tab bar's `f:Filter` must open
+    #    the filter popup, so click dispatch runs on CI and not only in tests.
+    bar=$(frame | grep -m1 "f:Filter")
+    prefix=${bar%%f:Filter*}
+    col=$(( ${#prefix} + 2 ))
+    row=$(( $(frame | grep -n -m1 "f:Filter" | cut -d: -f1) ))
+    tmux send-keys -t "$SESSION" -l $'\e[<0;'"$col;$row"'M'
+    tmux send-keys -t "$SESSION" -l $'\e[<0;'"$col;$row"'m'
+    if ! wait_for "Filter Period"; then fail=1; fi
+    assert_no_panic "filter-click"
+    tmux send-keys -t "$SESSION" Escape
 fi
 
 echo "── final frame ─────────────────────────────────────────"

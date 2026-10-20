@@ -6,14 +6,13 @@
 //! debugging consistency.
 //!
 //! Layout:
-//!   ~/.ccsight/cache.json   — parsed-session JSON cache (incremental)
+//!   ~/.ccsight/cache-v*.json — parsed-session JSON cache, one file per version
 //!   ~/.ccsight/index/       — tantivy full-text index segments
 //!   ~/.ccsight/pins.json    — pinned-session list
 //!
-//! Pre-1.1 versions used `~/.cache/ccsight/` (cache + index) and
-//! `~/.config/ccsight/` (pins). `migrate_legacy_state_dirs()` is called once
-//! at startup and renames any leftover files into the new layout, so
-//! existing users don't lose their cache or pins.
+//! `migrate_legacy_state_dirs()` runs once at startup and renames leftover
+//! index and pins files from `~/.cache/ccsight/` and `~/.config/ccsight/`
+//! into this layout; the cache is rebuilt rather than moved.
 
 use std::path::PathBuf;
 
@@ -25,6 +24,8 @@ pub fn state_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".ccsight"))
 }
 
+/// The single-file cache's name. The cache itself is versioned files beside
+/// it (`cache-v*.json`), so callers take only its directory.
 pub fn cache_path() -> Result<PathBuf> {
     Ok(state_root()?.join("cache.json"))
 }
@@ -114,10 +115,6 @@ pub fn migrate_legacy_state_dirs() {
     };
 
     let migrations = [
-        (
-            home.join(".cache/ccsight/cache.json"),
-            new_root.join("cache.json"),
-        ),
         (home.join(".cache/ccsight/index"), new_root.join("index")),
         (
             home.join(".config/ccsight/pins.json"),

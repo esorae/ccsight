@@ -52,7 +52,6 @@ fn resample_sparkline(
 }
 
 fn render_sparkline(values: &[u64], global_max: u64, color: Color) -> Vec<Span<'static>> {
-    const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let max_val = global_max.max(1);
     let spark: String = values
         .iter()
@@ -60,8 +59,9 @@ fn render_sparkline(values: &[u64], global_max: u64, color: Color) -> Vec<Span<'
             if v == 0 {
                 ' '
             } else {
-                let idx = ((v as f64 / max_val as f64) * 7.0) as usize;
-                SPARK_CHARS[idx.min(7)]
+                let top = BLOCK_RAMP.len() - 1;
+                let idx = ((v as f64 / max_val as f64) * top as f64) as usize;
+                BLOCK_RAMP[idx.min(top)]
             }
         })
         .collect();
@@ -148,13 +148,7 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
         state.dashboard_panel == 5,
         state.dashboard_scroll[5],
     );
-    draw_hourly_pattern(
-        frame,
-        heatmap_row[1],
-        state,
-        state.dashboard_panel == 6,
-        state.dashboard_scroll[6],
-    );
+    draw_hourly_pattern(frame, heatmap_row[1], state, state.dashboard_panel == 6);
 
     let bottom_rows = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(chunks[2]);
 
@@ -200,9 +194,7 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
         state.dashboard_panel == 2,
         state.dashboard_scroll[2],
     );
-    let tools_selected = state.dashboard_panel == 3;
-    let tools_scroll = state.dashboard_scroll[3];
-    draw_tool_usage(frame, bottom_row[1], state, tools_selected, tools_scroll);
+    draw_tool_usage(frame, bottom_row[1], state, state.dashboard_panel == 3);
     draw_languages(
         frame,
         bottom_row[2],
@@ -264,15 +256,14 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
     ])
     .split(inner);
 
-    let session_count = crate::aggregator::distinct_user_session_count(&state.daily_groups);
+    let session_count = state.stats.total_sessions_count;
 
     // Four zeroes read the same whether the tool is broken or the machine has
     // simply never run Claude Code. Only the empty case needs saying, so this
     // returns before the cards rather than adding a caption to every launch.
     // Judged on the unfiltered data: a filter that matches nothing is not a
     // missing install, and its zero cards already say "none in this range".
-    let nothing_on_disk =
-        crate::aggregator::distinct_user_session_count(&state.original_daily_groups) == 0;
+    let nothing_on_disk = state.original_stats.total_sessions_count == 0;
     if session_count == 0 && nothing_on_disk && !state.loading {
         frame.render_widget(Paragraph::new(empty_dashboard_lines()).centered(), inner);
         return;
@@ -365,12 +356,7 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
         .daily_groups
         .iter()
         .map(|group| {
-            let tokens: u64 = group
-                .sessions
-                .iter()
-                .filter(|s| !s.is_subagent)
-                .map(crate::aggregator::SessionInfo::work_tokens)
-                .sum();
+            let tokens: u64 = group.work_tokens();
             (group.date, tokens)
         })
         .collect();
@@ -573,57 +559,65 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
     frame.render_widget(heatmap, area);
 }
 
-fn draw_hourly_pattern(
-    frame: &mut Frame,
-    area: Rect,
+/// Average work tokens per clock hour of a calendar day. Subagents count
+/// and idle days divide, so the 24 hours sum to the view's tokens per day
+/// like every other per-day figure.
+pub(crate) fn hourly_average(
     state: &AppState,
-    selected: bool,
-    _scroll: usize,
-) {
+    today: chrono::NaiveDate,
+) -> std::collections::HashMap<u8, u64> {
     let mut hourly_total: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
-    for group in &state.daily_groups {
-        for session in &group.sessions {
-            if session.is_subagent {
-                continue;
-            }
-            for (hour, tokens) in &session.day_hourly_work_tokens {
-                *hourly_total.entry(*hour).or_insert(0) += tokens;
-            }
+    for session in state.daily_groups.iter().flat_map(|g| &g.sessions) {
+        for (hour, tokens) in &session.day_hourly_work_tokens {
+            *hourly_total.entry(*hour).or_insert(0) += tokens;
         }
     }
-    let num_days = state.daily_groups.len().max(1) as u64;
+    let num_days = state.calendar_days(today) as u64;
+    hourly_total
+        .into_iter()
+        .map(|(h, t)| (h, t / num_days))
+        .collect()
+}
 
-    let hourly_avg: std::collections::HashMap<u8, u64> = hourly_total
-        .iter()
-        .map(|(h, t)| (*h, *t / num_days))
-        .collect();
+/// Row `row` (0 = bottom) of a 24-column vertical bar chart `height` rows
+/// tall. The top cell of each bar takes an eighth-block so heights between
+/// rows still read.
+pub(crate) fn hourly_bar_row(
+    hourly: &std::collections::HashMap<u8, u64>,
+    max: u64,
+    row: usize,
+    height: usize,
+) -> String {
+    let step = 1.0 / height as f64;
+    let threshold = (row as f64 + 0.5) * step;
+    (0..24u8)
+        .map(|hour| {
+            let ratio = hourly.get(&hour).copied().unwrap_or(0) as f64 / max.max(1) as f64;
+            if ratio >= threshold {
+                BLOCK_RAMP[BLOCK_RAMP.len() - 1]
+            } else if ratio >= threshold - step && ratio > 0.0 {
+                let sub_level = ((ratio - (threshold - step)) * height as f64 * 8.0) as usize;
+                BLOCK_RAMP[sub_level.min(BLOCK_RAMP.len() - 1)]
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+fn draw_hourly_pattern(frame: &mut Frame, area: Rect, state: &AppState, selected: bool) {
+    let hourly_avg = hourly_average(state, chrono::Local::now().date_naive());
 
     let max_tokens = hourly_avg.values().max().copied().unwrap_or(1);
     let total_avg: u64 = hourly_avg.values().sum();
 
-    let bar_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let inner_height = area.height.saturating_sub(3) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
 
     // Bar graph (vertical style in rows)
     for row in (0..inner_height).rev() {
-        let threshold = (row as f64 + 0.5) / inner_height as f64;
-        let mut row_chars = String::new();
-        for hour in 0..24u8 {
-            let tokens = hourly_avg.get(&hour).copied().unwrap_or(0);
-            let ratio = tokens as f64 / max_tokens as f64;
-            if ratio >= threshold {
-                row_chars.push(bar_chars[7]);
-            } else if ratio >= threshold - (1.0 / inner_height as f64) && ratio > 0.0 {
-                let sub_level = ((ratio - (threshold - 1.0 / inner_height as f64))
-                    * inner_height as f64
-                    * 8.0) as usize;
-                row_chars.push(bar_chars[sub_level.min(7)]);
-            } else {
-                row_chars.push(' ');
-            }
-        }
+        let row_chars = hourly_bar_row(&hourly_avg, max_tokens, row, inner_height);
         lines.push(Line::from(Span::styled(
             row_chars,
             Style::default().fg(theme::PRIMARY),
@@ -829,13 +823,7 @@ fn draw_model_tokens(
     frame.render_widget(table, area);
 }
 
-fn draw_tool_usage(
-    frame: &mut Frame,
-    area: Rect,
-    state: &mut AppState,
-    selected: bool,
-    _scroll: usize,
-) {
+fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected: bool) {
     // Ecosystem & Health — progressive disclosure by inner height:
     // Tier 1 always (per-category summary, kept split unlike popup's
     // merged Tools tab), Tier 2 ≥8 (top tools), Tier 3 ≥11 (alerts).
@@ -986,11 +974,11 @@ fn draw_tool_usage(
     // regardless of which tiers are visible. Tier 3 may also list them as a
     // standalone alert; the duplication is intentional — tying the warning to its
     // category line makes "which thing is stale" visually unambiguous.
-    let now = chrono::Utc::now();
+    let stale_at = state.stale_reference();
     let stale_mcp_count: usize = state
         .mcp_status
         .iter()
-        .filter(|s| s.is_underutilized(now, 30))
+        .filter(|s| s.is_underutilized(stale_at, 30))
         .count();
 
     // Health alerts are computed up-front so we know how many lines Tier 3 needs.
@@ -1268,8 +1256,11 @@ pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
     // expanded server's tool sub-rows. Without counting these, j-scroll and
     // the scrollbar's `N/M` indicator stop short of the real end.
     let extra = if active == 0 {
-        let now = chrono::Utc::now();
-        let any_stale = state.mcp_status.iter().any(|s| s.is_underutilized(now, 30));
+        let stale_at = state.stale_reference();
+        let any_stale = state
+            .mcp_status
+            .iter()
+            .any(|s| s.is_underutilized(stale_at, 30));
         // Each expanded server contributes (tool_count) sub-rows. Built-in
         // counts as a server-like group with `mcp_tool_count("Built-in")`
         // tools (i.e. all built-in keys) when expanded.
@@ -1305,10 +1296,11 @@ pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
     }
 }
 
-fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: bool, scroll: usize) {
-    // Known languages with their aggregate counts, excluding the literal
-    // "Other" bucket. Unknown extensions are surfaced individually below
-    // (rule: architecture.categorization — no catch-all grouping).
+/// The Languages rows, ranked: known languages, then each unknown extension
+/// in place of a catch-all "Other" (rule: architecture.categorization). One
+/// builder for the panel and the popup, so both share rows, rank and the
+/// total a share is taken of. `bool` = an unknown extension.
+fn language_rows(state: &AppState) -> Vec<(String, usize, bool)> {
     let mut entries: Vec<(String, usize, bool)> = state
         .stats
         .language_usage
@@ -1321,10 +1313,12 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
             entries.push((ext.clone(), *count, true));
         }
     }
-    // Shared sort (recent / tokens) so the compact panel and detail popup
-    // agree on rank. Both modes carry a name tiebreaker for frame stability.
     state.sort_languages(&mut entries);
+    entries
+}
 
+fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: bool, scroll: usize) {
+    let entries = language_rows(state);
     let total_usage: usize = entries.iter().map(|(_, c, _)| *c).sum();
     let (visible_height, _, scroll) = calc_scroll(area.height, entries.len(), scroll, 2);
 
@@ -1416,19 +1410,11 @@ fn draw_recent_costs(
             let cost_display = cost.max(0.0);
             let unpriced = super::any_unpriced(&state.daily_groups, |g, _| g.date == *date);
             let cost_str = super::format_cost_marked(cost_display, unpriced, cost_precision);
-            let tokens: u64 =
-                state
-                    .daily_groups
-                    .iter()
-                    .find(|g| &g.date == date)
-                    .map_or(0, |group| {
-                        group
-                            .sessions
-                            .iter()
-                            .filter(|s| !s.is_subagent)
-                            .map(crate::aggregator::SessionInfo::work_tokens)
-                            .sum()
-                    });
+            let tokens: u64 = state
+                .daily_groups
+                .iter()
+                .find(|g| &g.date == date)
+                .map_or(0, crate::aggregator::DailyGroup::work_tokens);
             Row::new(vec![
                 Cell::from(format!("{}.", i + 1)).style(Style::default().fg(theme::LABEL)),
                 Cell::from(date_str),
@@ -1479,10 +1465,13 @@ pub(crate) const ACTIVITY_HEADER_ROWS: usize = 5;
 /// "no activity" glyph — visually distinct from the `▁..█` non-zero ramp so
 /// zero days never get mistaken for the lowest non-zero bucket.
 pub(crate) const SPARK_CHARS: [char; 9] = ['·', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// The non-zero ramp alone, lowest to full, for bars and graphs whose zero
+/// cell is a blank.
+pub(crate) const BLOCK_RAMP: &[char] = SPARK_CHARS.split_at(1).1;
 
 /// Render a trailing-N-day sparkline of `value_for_date(d)` ending at `today`.
 /// The bucket is normalised against the window's max so visual scale is
-/// independent of the absolute magnitude. Days with zero value render as `░`.
+/// independent of the absolute magnitude. Days with zero value render as `SPARK_CHARS[0]`.
 pub(crate) fn render_spark_line<F>(
     today: chrono::NaiveDate,
     days: usize,
@@ -1582,15 +1571,7 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
         NaiveDate::from_ymd_opt(prev_month_end.year(), prev_month_end.month(), 1)
             .unwrap_or(prev_month_end);
 
-    let days_in_month = {
-        let next_month_start = if today.month() == 12 {
-            NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
-        } else {
-            NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
-        }
-        .unwrap_or(today);
-        (next_month_start - month_start).num_days() as u32
-    };
+    let days_in_month = crate::aggregator::days_in_month(today);
     let day_of_month = today.day();
 
     let mut mtd_cost = 0.0f64;
@@ -1626,26 +1607,35 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
     let gap = super::any_unpriced(&state.daily_groups, |g, _| {
         g.date.year() == today.year() && g.date.month() == today.month()
     });
-    let summary = vec![
+    let mut summary = vec![
         Span::styled("  this mo: ", Style::default().fg(theme::LABEL)),
         Span::styled(
             super::format_cost_marked(mtd_cost, gap, 0),
             cost_total_style(gap),
         ),
-        Span::styled(" · forecast: ", Style::default().fg(theme::LABEL)),
-        Span::styled(
-            super::format_cost_marked(forecast, gap, 0),
-            cost_total_style(gap),
-        ),
-        Span::styled(
-            format!(
-                " ({days_remaining}d left @ {}/day)  ",
-                super::format_cost(run_rate, 0)
-            ),
-            Style::default().fg(theme::META),
-        ),
-        Span::styled(delta_text, Style::default().fg(theme::META)),
     ];
+    // On the month's last day the forecast is the running figure itself, so
+    // it is left off — the same rule the Insights Monthly panel follows.
+    if days_remaining > 0 {
+        summary.extend([
+            Span::styled(" · forecast: ", Style::default().fg(theme::LABEL)),
+            Span::styled(
+                super::format_cost_marked(forecast, gap, 0),
+                cost_total_style(gap),
+            ),
+            Span::styled(
+                format!(
+                    " ({days_remaining}d left @ {}/day)",
+                    super::format_cost(run_rate, 0)
+                ),
+                Style::default().fg(theme::META),
+            ),
+        ]);
+    }
+    summary.push(Span::styled(
+        format!("  {delta_text}"),
+        Style::default().fg(theme::META),
+    ));
 
     // Top model composition for the current month.
     let calculator = crate::aggregator::CostCalculator::global();
@@ -1797,11 +1787,7 @@ pub(crate) fn activity_header_lines(
     let active_dates: std::collections::HashSet<NaiveDate> = state
         .daily_groups
         .iter()
-        .filter(|g| {
-            g.sessions
-                .iter()
-                .any(|s| !s.is_subagent && s.work_tokens() > 0)
-        })
+        .filter(|g| g.sessions.iter().any(|s| s.work_tokens() > 0))
         .map(|g| g.date)
         .collect();
     let mut streak = 0u64;
@@ -1819,12 +1805,7 @@ pub(crate) fn activity_header_lines(
     let mut this_project_tokens: HashMap<String, u64> = HashMap::new();
     let mut this_tool_count: HashMap<String, usize> = HashMap::new();
     for group in &state.daily_groups {
-        let tokens: u64 = group
-            .sessions
-            .iter()
-            .filter(|s| !s.is_subagent)
-            .map(crate::aggregator::SessionInfo::work_tokens)
-            .sum();
+        let tokens: u64 = group.work_tokens();
         let sess = group.sessions.iter().filter(|s| !s.is_subagent).count();
         let ws = week_start(group.date);
         if ws == this_week_start {
@@ -1833,7 +1814,7 @@ pub(crate) fn activity_header_lines(
             if tokens > 0 {
                 this_days += 1;
             }
-            for s in group.sessions.iter().filter(|s| !s.is_subagent) {
+            for s in &group.sessions {
                 *this_project_tokens
                     .entry(s.project_name.clone())
                     .or_insert(0) += s.work_tokens();
@@ -1914,12 +1895,7 @@ pub(crate) fn activity_header_lines(
     let mut daily_tokens: std::collections::HashMap<NaiveDate, u64> =
         std::collections::HashMap::new();
     for group in &state.daily_groups {
-        let tokens: u64 = group
-            .sessions
-            .iter()
-            .filter(|s| !s.is_subagent)
-            .map(crate::aggregator::SessionInfo::work_tokens)
-            .sum();
+        let tokens: u64 = group.work_tokens();
         daily_tokens.insert(group.date, tokens);
     }
     // Follows the list below it: a daily sparkline under a `Weekly Activity`
@@ -2034,12 +2010,7 @@ pub(crate) fn weekly_activity(state: &AppState) -> Vec<WeeklyBucket> {
     for group in &state.daily_groups {
         let start = week_start(group.date);
         let iso = group.date.iso_week();
-        let tokens: u64 = group
-            .sessions
-            .iter()
-            .filter(|s| !s.is_subagent)
-            .map(crate::aggregator::SessionInfo::work_tokens)
-            .sum();
+        let tokens: u64 = group.work_tokens();
         let cost = cost_by_date.get(&group.date).copied().unwrap_or(0.0);
         let entry = buckets.entry(start).or_insert_with(|| {
             let end = start + chrono::Duration::days(6);
@@ -2109,16 +2080,27 @@ fn push_month_divider_line(
     ]));
 }
 
-/// Width-aware ellipsis truncation shared by the detail-popup panel
-/// builders below. Pure; counts display columns, not bytes.
-fn detail_panel_costs(
-    state: &mut AppState,
+/// What every detail-panel builder is drawn with; each takes the fields it
+/// needs, so the dispatch passes one value instead of six.
+#[derive(Clone, Copy)]
+struct PanelCtx {
     today: NaiveDate,
     content_width: usize,
     visible_height: usize,
     scroll: usize,
-    _popup_area: Rect,
-) -> (String, Vec<Line<'static>>) {
+    popup_area: Rect,
+}
+
+/// Width-aware ellipsis truncation shared by the detail-popup panel
+/// builders below. Pure; counts display columns, not bytes.
+fn detail_panel_costs(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Line<'static>>) {
+    let PanelCtx {
+        today,
+        content_width,
+        visible_height,
+        scroll,
+        ..
+    } = ctx;
     use chrono::Datelike;
     let title = " Daily Costs ".to_string();
     let mut lines: Vec<Line> = costs_header_lines(state, today);
@@ -2148,12 +2130,7 @@ fn detail_panel_costs(
         std::collections::HashMap::new();
     let mut day_tok: std::collections::HashMap<NaiveDate, u64> = std::collections::HashMap::new();
     for group in &state.daily_groups {
-        let tokens: u64 = group
-            .sessions
-            .iter()
-            .filter(|s| !s.is_subagent)
-            .map(crate::aggregator::SessionInfo::work_tokens)
-            .sum();
+        let tokens: u64 = group.work_tokens();
         *monthly_tok
             .entry((group.date.year(), group.date.month()))
             .or_insert(0) += tokens;
@@ -2228,14 +2205,14 @@ fn detail_panel_costs(
     (title, lines)
 }
 
-fn detail_panel_projects(
-    state: &mut AppState,
-    _today: NaiveDate,
-    content_width: usize,
-    visible_height: usize,
-    scroll: usize,
-    popup_area: Rect,
-) -> (String, Vec<Line<'static>>) {
+fn detail_panel_projects(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Line<'static>>) {
+    let PanelCtx {
+        content_width,
+        visible_height,
+        scroll,
+        popup_area,
+        ..
+    } = ctx;
     let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
     state.sort_projects(&mut projects);
     // `scroll` is the cursor (j/k moves it; Enter opens this row).
@@ -2355,9 +2332,7 @@ fn detail_panel_projects(
         let bar = crate::text::hbar(filled, bar_width);
         let intensity = theme::bar_intensity(ratio);
         let bar_color = theme::ramp_color(theme::RAMP_PURPLE, intensity);
-        // Show basename only; the absolute path is in the popup title.
-        let basename = name.rsplit('/').next().unwrap_or(name.as_str());
-        let display_name = super::truncate_with_ellipsis(basename, name_width);
+        let display_name = super::truncate_with_ellipsis(&state.project_label(name), name_width);
         let cost = project_cost.get(name.as_str()).copied().unwrap_or(0.0);
         let unpriced = super::any_unpriced(&state.daily_groups, |_, s| &s.project_name == *name);
         let active_days = project_active_days.get(name.as_str()).copied().unwrap_or(0);
@@ -2447,24 +2422,166 @@ fn detail_panel_projects(
     (title, lines)
 }
 
-fn detail_panel_models(
-    state: &mut AppState,
-    _today: NaiveDate,
+/// Rows the model-by-month grid takes above the table, padded to this height
+/// so the table starts on the same line however many models the grid shows.
+const MODELS_HEADER_ROWS: usize = MODEL_GRID_MODELS + 2;
+
+const MODEL_GRID_MODELS: usize = 10;
+
+/// When each model carried the work: one row per model (every month's leader,
+/// then the heaviest; latest used first), one column per month since the view's
+/// first, each cell shaded by the model's share of that month's work tokens,
+/// subagents included. A long history packs the columns and labels every
+/// other month; only what still does not fit drops off the old end.
+fn model_month_lines(
+    state: &AppState,
+    today: NaiveDate,
     content_width: usize,
-    visible_height: usize,
-    scroll: usize,
-    _popup_area: Rect,
-) -> (String, Vec<Line<'static>>) {
+) -> Vec<Line<'static>> {
+    use chrono::Datelike;
+    const NAME_W: usize = 12;
+    // A margin each side, and a gap between the names and the first month.
+    const MARGIN: usize = 2;
+    const LEAD: usize = MARGIN + NAME_W + 2;
+    let span = |from: NaiveDate| {
+        ((today.year() - from.year()) * 12 + today.month() as i32 - from.month() as i32 + 1).max(1)
+            as usize
+    };
+    let history = state
+        .daily_groups
+        .iter()
+        .map(|g| g.date)
+        .min()
+        .map_or(1, span);
+    // Columns widen to fill the room the history leaves, so a short history
+    // is not crammed left; below a label's width, every other month is labelled.
+    let room = content_width.saturating_sub(LEAD + MARGIN);
+    let col_w = (room / history.max(1)).clamp(3, 8);
+    let label_every = if col_w >= 6 { 1 } else { 2 };
+    let months = history.min(room / col_w).max(3);
+    let first_month = today
+        .with_day(1)
+        .and_then(|d| d.checked_sub_months(chrono::Months::new(months as u32 - 1)))
+        .unwrap_or(today);
+    let slot = |date: NaiveDate| {
+        let back = (today.year() - date.year()) * 12 + today.month() as i32 - date.month() as i32;
+        (0..months as i32)
+            .contains(&back)
+            .then(|| months - 1 - back as usize)
+    };
+    let mut per_model: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut month_total = vec![0u64; months];
+    for group in &state.daily_groups {
+        let Some(i) = slot(group.date) else { continue };
+        for session in &group.sessions {
+            for (model, ts) in &session.day_tokens_by_model {
+                let work = ts.input_tokens + ts.output_tokens;
+                let name = crate::aggregator::normalize_model_name(model);
+                per_model.entry(name).or_insert_with(|| vec![0; months])[i] += work;
+                month_total[i] += work;
+            }
+        }
+    }
+    let mut rows: Vec<(String, Vec<u64>)> = per_model.into_iter().collect();
+    rows.sort_by(|a, b| {
+        b.1.iter()
+            .sum::<u64>()
+            .cmp(&a.1.iter().sum::<u64>())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    // Each month's leader keeps a row, so an old generation still shows in
+    // its own months; the heaviest of the rest fill what is left.
+    let leaders: std::collections::HashSet<String> = (0..months)
+        .filter_map(|i| {
+            rows.iter()
+                .filter(|(_, cells)| cells[i] > 0)
+                .max_by(|a, b| a.1[i].cmp(&b.1[i]).then_with(|| b.0.cmp(&a.0)))
+                .map(|(name, _)| name.clone())
+        })
+        .collect();
+    let (mut rows, rest): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|(name, _)| leaders.contains(name));
+    rows.truncate(MODEL_GRID_MODELS);
+    let room_left = MODEL_GRID_MODELS.saturating_sub(rows.len());
+    rows.extend(rest.into_iter().take(room_left));
+    // Latest use first, then the later starter, so generations read as a
+    // diagonal band from the top right.
+    let last_used = |cells: &[u64]| cells.iter().rposition(|t| *t > 0);
+    let first_used = |cells: &[u64]| cells.iter().position(|t| *t > 0);
+    rows.sort_by(|a, b| {
+        last_used(&b.1)
+            .cmp(&last_used(&a.1))
+            .then_with(|| first_used(&b.1).cmp(&first_used(&a.1)))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    // Labels counted back from the current month, so it is always labelled.
+    let mut axis = " ".repeat(months * col_w + 5);
+    for k in (0..months).filter(|k| (months - 1 - k) % label_every == 0) {
+        let month = first_month
+            .checked_add_months(chrono::Months::new(k as u32))
+            .unwrap_or(first_month);
+        let label = super::insights::short_month(&month.format("%Y-%m").to_string());
+        axis.replace_range(k * col_w..k * col_w + label.len(), &label);
+    }
+    let mut lines = vec![Line::from(vec![
+        Span::raw(" ".repeat(LEAD)),
+        Span::styled(
+            axis.trim_end().to_string(),
+            Style::default().fg(theme::TIME),
+        ),
+    ])];
+    for (model, cells) in &rows {
+        let mut spans = vec![Span::styled(
+            format!(
+                "{}{:<NAME_W$}  ",
+                " ".repeat(MARGIN),
+                super::truncate_with_ellipsis(model, NAME_W)
+            ),
+            Style::default().fg(super::model_color(model)),
+        )];
+        for (tokens, total) in cells.iter().zip(&month_total) {
+            let share = if *total > 0 {
+                *tokens as f64 / *total as f64
+            } else {
+                0.0
+            };
+            let cell = match share {
+                s if s <= 0.0 => "  ",
+                s if s < 0.1 => "░░",
+                s if s < 0.35 => "▒▒",
+                s if s < 0.65 => "▓▓",
+                _ => "██",
+            };
+            // Centred under the five-wide label that starts its column.
+            let text = format!(" {cell}{}", " ".repeat(col_w.saturating_sub(3)));
+            spans.push(Span::styled(
+                text,
+                Style::default().fg(super::model_color(model)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.resize(MODELS_HEADER_ROWS, Line::from(""));
+    lines
+}
+
+fn detail_panel_models(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Line<'static>>) {
+    let PanelCtx {
+        content_width,
+        visible_height,
+        ..
+    } = ctx;
     let sort_label = state.dashboard_models_sort.label();
     let title = format!(" Model Tokens  · {sort_label} (s) ");
     let mut lines: Vec<Line> = Vec::new();
-    let calculator = CostCalculator::global();
 
     let mut model_last_used: HashMap<String, NaiveDate> = HashMap::new();
     let mut model_first_used: HashMap<String, NaiveDate> = HashMap::new();
     let mut model_daily_tokens: HashMap<String, Vec<(NaiveDate, u64)>> = HashMap::new();
     for group in state.daily_groups.iter().rev() {
-        for session in group.user_sessions() {
+        for session in &group.sessions {
             for (model_name, ts) in &session.day_tokens_by_model {
                 let normalized = crate::aggregator::normalize_model_name(model_name);
                 let last = model_last_used
@@ -2489,26 +2606,7 @@ fn detail_panel_models(
             }
         }
     }
-    let spark_width = content_width.saturating_sub(10);
     let today = chrono::Local::now().date_naive();
-    let global_first = state.daily_groups.last().map_or(today, |g| g.date);
-    let global_last = state.daily_groups.first().map_or(today, |g| g.date);
-    let all_resampled: HashMap<String, Vec<u64>> = model_daily_tokens
-        .iter()
-        .map(|(name, daily)| {
-            (
-                name.clone(),
-                resample_sparkline(daily, spark_width, global_first, global_last),
-            )
-        })
-        .collect();
-    let global_spark_max: u64 = all_resampled
-        .values()
-        .flat_map(|v| v.iter())
-        .copied()
-        .max()
-        .unwrap_or(1);
-
     let mut models: Vec<(String, u64, (crate::aggregator::TokenStats, f64))> = state
         .aggregated_model_tokens
         .iter()
@@ -2527,168 +2625,396 @@ fn detail_panel_models(
     state.sort_models(&mut models);
 
     let total_tokens: u64 = models.iter().map(|(_, t, _)| *t).sum();
-    // Largest row, not the first: under the recent sort the first row can be
-    // small, which would overfill every bar below it.
-    let max_tokens = models.iter().map(|(_, t, _)| *t).max().unwrap_or(1).max(1);
-    let bar_width = 15usize;
-    let name_width = content_width.saturating_sub(50);
-    let items_visible = visible_height / 3;
+    let total_cost: f64 = models.iter().map(|(_, _, (_, c))| *c).sum();
+    let sessions = model_session_counts(state);
+    let layout = models_layout(visible_height);
+    if layout.grid {
+        lines.extend(model_month_lines(state, today, content_width));
+    }
 
-    for (i, (model, work_tokens, (ts, cost))) in
-        models.iter().enumerate().skip(scroll).take(items_visible)
-    {
-        let ratio = if max_tokens > 0 {
-            *work_tokens as f64 / max_tokens as f64
-        } else {
-            0.0
-        };
-        let pct = crate::text::format_pct(*work_tokens, total_tokens);
-        let filled = (ratio * bar_width as f64).round() as usize;
-        let unknown = state.models_without_pricing.contains(model);
-        let bar = if unknown {
-            // Unknown-pricing variant: dotted fill + space pad (no hbar — its
-            // `░` pad would imply a known scale). Saturating like hbar.
-            let f = filled.min(bar_width);
-            format!(
-                "{}{}",
-                "░".repeat(f),
-                " ".repeat(bar_width.saturating_sub(f))
-            )
-        } else {
-            crate::text::hbar(filled, bar_width)
-        };
-        let bar_color = if unknown {
-            theme::WARNING
-        } else {
-            let intensity = theme::bar_intensity(ratio);
-            theme::ramp_color(theme::RAMP_BLUE, intensity)
-        };
+    // The table scrolls under the grid; the view moves only when the cursor
+    // leaves it, and the cursor row's figures sit fixed below the table.
+    let rows = layout.rows;
+    let cursor = state.dashboard_scroll[2].min(models.len().saturating_sub(1));
+    let mut offset = state.models_detail_offset.min(cursor);
+    if cursor >= offset + rows {
+        offset = cursor + 1 - rows;
+    }
+    state.models_detail_offset = offset;
 
-        let display_name = super::truncate_with_ellipsis(model, name_width);
-        let token_info = if unknown {
-            format!(
-                "in:{} out:{} cache:{}  $? (pricing undefined)",
-                crate::format_number(ts.input_tokens),
-                crate::format_number(ts.output_tokens),
-                crate::format_number(ts.cache_creation_tokens + ts.cache_read_tokens),
-            )
-        } else {
-            // Two effective rates: `work` = $/MTok over input+output
-            // (gap vs base = cache pull-down); `billed` = $/MTok over
-            // every billed token (cache included).
-            let work_tokens = ts.input_tokens + ts.output_tokens;
-            let total_tokens = work_tokens + ts.cache_creation_tokens + ts.cache_read_tokens;
-            let rates = match (work_tokens, total_tokens) {
-                (0, 0) => String::new(),
-                (0, _) => format!(
-                    "  ${:.2}/MTok billed",
-                    cost / (total_tokens as f64 / 1_000_000.0),
-                ),
-                (_, _) => format!(
-                    "  ${:.2}/MTok work · ${:.2}/MTok billed",
-                    cost / (work_tokens as f64 / 1_000_000.0),
-                    cost / (total_tokens as f64 / 1_000_000.0),
-                ),
-            };
-            format!(
-                "in:{} out:{} cache:{}  ${:.2}{}",
-                crate::format_number(ts.input_tokens),
-                crate::format_number(ts.output_tokens),
-                crate::format_number(ts.cache_creation_tokens + ts.cache_read_tokens),
-                cost.max(0.0),
-                rates,
-            )
+    let cols = model_columns(content_width);
+    lines.push(model_table_header(&cols));
+    let first_row_line = lines.len();
+    for (i, (model, work, (ts, cost))) in models.iter().enumerate().skip(offset).take(rows) {
+        let row = ModelRow {
+            name: model,
+            work: *work,
+            tokens: ts,
+            cost: *cost,
+            unknown: state.models_without_pricing.contains(model),
+            sessions: sessions.get(model).copied().unwrap_or(0),
+            last_used: model_last_used.get(model).copied(),
         };
+        lines.push(model_table_line(
+            &row,
+            &cols,
+            total_tokens,
+            total_cost,
+            i == cursor,
+        ));
+    }
+    let shown = lines.len() - first_row_line;
+    let row_lines: Vec<(usize, usize)> = (0..shown).map(|i| (first_row_line + i, 1)).collect();
+    super::record_cursor_rows(state, ctx.popup_area, &row_lines, 0);
+    for area in &mut state.layout.cursor_row_areas {
+        area.0 += offset;
+    }
+    lines.resize(first_row_line + rows, Line::from(""));
 
-        let mut name_spans = vec![
-            Span::styled(
-                format!("  {:>3}. ", i + 1),
-                Style::default().fg(theme::LABEL),
-            ),
-            Span::styled(
-                format!("{display_name:<name_width$}"),
-                Style::default().fg(if unknown {
-                    theme::WARNING
-                } else {
-                    super::model_color(&display_name)
-                }),
-            ),
-        ];
-        if unknown {
-            name_spans.push(Span::styled(
-                " ⚠ no pricing",
-                Style::default()
-                    .fg(theme::WARNING)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        lines.push(Line::from(name_spans));
-        let date_range = match (
-            model_first_used.get(model.as_str()),
-            model_last_used.get(model.as_str()),
-        ) {
-            (Some(f), Some(l)) if f == l => format!(" {}", f.format("%Y-%m-%d")),
-            (Some(f), Some(l)) => {
-                format!(" {}..{}", f.format("%Y-%m-%d"), l.format("%Y-%m-%d"))
-            }
+    if let Some((model, _, (ts, _))) = models.get(cursor).filter(|_| layout.detail > 0) {
+        // Room for the `daily` label and the date range after the bars.
+        let spark_width = content_width.saturating_sub(8 + 24 + 4);
+        let first = state.daily_groups.last().map_or(today, |g| g.date);
+        let last = state.daily_groups.first().map_or(today, |g| g.date);
+        let spark = model_daily_tokens
+            .get(model)
+            .map(|daily| resample_sparkline(daily, spark_width, first, last))
+            .unwrap_or_default();
+        let range = match (model_first_used.get(model), model_last_used.get(model)) {
+            (Some(f), Some(l)) => format!("  {}..{}", f.format("%Y-%m-%d"), l.format("%Y-%m-%d")),
             _ => String::new(),
         };
-        lines.push(Line::from(vec![
-            Span::raw("       "),
-            Span::styled(bar, Style::default().fg(bar_color)),
-            Span::styled(
-                format!(" {}", crate::format_number(*work_tokens)),
-                Style::default().fg(theme::PRIMARY),
-            ),
-            Span::styled(format!(" {pct:>3}"), Style::default().fg(bar_color)),
-            Span::styled(date_range, Style::default().fg(theme::TIME)),
-        ]));
-        let info_color = if unknown {
-            theme::WARNING
-        } else {
-            theme::VALUE
-        };
-        lines.push(Line::from(vec![
-            Span::raw("       "),
-            Span::styled(token_info, Style::default().fg(info_color)),
-        ]));
-        if let Some(p) = calculator.get_pricing_by_display_name(model) {
-            lines.push(Line::from(vec![
-                Span::raw("       "),
-                Span::styled(
-                    format!(
-                        "rate/MTok: in:${} out:${} cw_5m:${} cw_1h:${} cache_r:${}",
-                        p.input_cost_per_mtok,
-                        p.output_cost_per_mtok,
-                        p.cache_write_5m_cost_per_mtok,
-                        p.cache_write_1h_cost_per_mtok,
-                        p.cache_read_cost_per_mtok,
-                    ),
-                    Style::default().fg(theme::META),
-                ),
-            ]));
+        let unknown = state.models_without_pricing.contains(model);
+        let mut detail =
+            model_detail_lines(state, model, ts, unknown, &spark, range, content_width);
+        if layout.detail < MODEL_DETAIL_LINES {
+            detail.remove(0);
         }
-        if let Some(values) = all_resampled.get(model)
-            && values.iter().any(|&v| v > 0)
-        {
-            lines.push(Line::from(render_sparkline(
-                values,
-                global_spark_max,
-                bar_color,
-            )));
-        }
+        detail.truncate(layout.detail);
+        lines.extend(detail);
     }
     (title, lines)
 }
 
-fn detail_panel_ecosystem(
-    state: &mut AppState,
-    _today: NaiveDate,
-    content_width: usize,
-    visible_height: usize,
-    scroll: usize,
-    popup_area: Rect,
-) -> (String, Vec<Line<'static>>) {
+/// Lines the cursor model's figures take below the table at full height.
+const MODEL_DETAIL_LINES: usize = 5;
+/// Table rows the Models detail keeps before giving up the grid above it.
+const MODEL_MIN_ROWS: usize = 5;
+
+/// What the Models detail shows at a height: the table first, the cursor
+/// row's figures next, the month grid only when both have room.
+struct ModelsLayout {
+    grid: bool,
+    /// Detail lines kept: all, then without the spacer, then without the
+    /// trend; fewer drops the detail whole.
+    detail: usize,
+    rows: usize,
+}
+
+fn models_layout(visible_height: usize) -> ModelsLayout {
+    let header = 1;
+    let grid = visible_height >= MODELS_HEADER_ROWS + header + MODEL_MIN_ROWS + MODEL_DETAIL_LINES;
+    let room = visible_height
+        .saturating_sub(if grid { MODELS_HEADER_ROWS } else { 0 } + header + MODEL_MIN_ROWS);
+    let detail = room.min(MODEL_DETAIL_LINES);
+    let detail = if detail >= 3 { detail } else { 0 };
+    let rows = visible_height
+        .saturating_sub(if grid { MODELS_HEADER_ROWS } else { 0 } + header + detail)
+        .max(1);
+    ModelsLayout { grid, detail, rows }
+}
+
+/// One model's figures for a row of the Models detail table.
+struct ModelRow<'a> {
+    name: &'a str,
+    work: u64,
+    tokens: &'a crate::aggregator::TokenStats,
+    cost: f64,
+    unknown: bool,
+    sessions: usize,
+    last_used: Option<NaiveDate>,
+}
+
+/// A column of the Models table: its header and width, right-aligned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ModelCol {
+    Tokens,
+    TokenShare,
+    Cost,
+    CostShare,
+    CacheHit,
+    Sessions,
+    CostPerSession,
+    LastUsed,
+}
+
+impl ModelCol {
+    const ALL: [Self; 8] = [
+        Self::Tokens,
+        Self::TokenShare,
+        Self::Cost,
+        Self::CostShare,
+        Self::CacheHit,
+        Self::Sessions,
+        Self::CostPerSession,
+        Self::LastUsed,
+    ];
+
+    fn header(self) -> &'static str {
+        match self {
+            Self::Tokens => "tokens",
+            Self::TokenShare => "tok%",
+            Self::Cost => "cost",
+            Self::CostShare => "cost%",
+            Self::CacheHit => "cache hit",
+            Self::Sessions => "sessions",
+            Self::CostPerSession => "$/ses",
+            Self::LastUsed => "last used",
+        }
+    }
+
+    fn width(self) -> usize {
+        match self {
+            Self::Tokens | Self::CostShare => 7,
+            Self::TokenShare => 5,
+            Self::Cost | Self::Sessions | Self::CostPerSession => 9,
+            Self::CacheHit => 10,
+            Self::LastUsed => 12,
+        }
+    }
+}
+
+/// Model-name column width in the Models table, after the cursor marker.
+const MODEL_NAME_W: usize = 14;
+
+/// The columns that fit `width`: the rightmost drop first.
+fn model_columns(width: usize) -> Vec<ModelCol> {
+    let mut cols = ModelCol::ALL.to_vec();
+    while cols.len() > 2 && 3 + MODEL_NAME_W + cols.iter().map(|c| c.width()).sum::<usize>() > width
+    {
+        cols.pop();
+    }
+    cols
+}
+
+fn model_table_header(cols: &[ModelCol]) -> Line<'static> {
+    let mut text = format!("   {:<MODEL_NAME_W$}", "Model");
+    for c in cols {
+        text.push_str(&format!("{:>w$}", c.header(), w = c.width()));
+    }
+    Line::from(Span::styled(text, Style::default().fg(theme::LABEL)))
+}
+
+fn model_table_line(
+    row: &ModelRow,
+    cols: &[ModelCol],
+    total_tokens: u64,
+    total_cost: f64,
+    selected: bool,
+) -> Line<'static> {
+    let ts = row.tokens;
+    let read_base = ts.input_tokens + ts.cache_read_tokens + ts.cache_creation_tokens;
+    // A share with nothing under it reads as a dash, not as zero.
+    let empty = |c: ModelCol| match c {
+        ModelCol::CacheHit => read_base == 0,
+        ModelCol::Sessions | ModelCol::CostPerSession => row.sessions == 0,
+        _ => false,
+    };
+    let cell = |c: ModelCol| -> String {
+        match c {
+            _ if empty(c) => "—".to_string(),
+            ModelCol::Tokens => crate::format_number(row.work),
+            ModelCol::TokenShare => crate::text::format_pct(row.work, total_tokens),
+            ModelCol::Cost => super::format_cost_marked(row.cost, row.unknown, 0),
+            ModelCol::CostShare => crate::text::format_pct_f64(row.cost, total_cost),
+            ModelCol::CacheHit => {
+                format!(
+                    "{:.1}%",
+                    ts.cache_read_tokens as f64 / read_base as f64 * 100.0
+                )
+            }
+            ModelCol::Sessions => row.sessions.to_string(),
+            ModelCol::CostPerSession => {
+                super::format_cost_marked(row.cost / row.sessions as f64, row.unknown, 2)
+            }
+            ModelCol::LastUsed => row
+                .last_used
+                .map_or_else(String::new, |d| d.format("%Y-%m-%d").to_string()),
+        }
+    };
+    let bg = if selected {
+        Style::default().bg(theme::SELECTED_BG)
+    } else {
+        Style::default()
+    };
+    let name = super::truncate_with_ellipsis(row.name, MODEL_NAME_W - 1);
+    let mut spans = vec![
+        Span::styled(if selected { " ▶ " } else { "   " }, bg.fg(theme::PRIMARY)),
+        Span::styled(
+            format!("{name:<MODEL_NAME_W$}"),
+            bg.fg(if row.unknown {
+                theme::WARNING
+            } else {
+                super::model_color(row.name)
+            }),
+        ),
+    ];
+    for c in cols {
+        let color = match c {
+            ModelCol::Tokens => theme::TOKENS,
+            ModelCol::Cost | ModelCol::CostPerSession if row.unknown => theme::WARNING,
+            ModelCol::Cost | ModelCol::CostPerSession => theme::VALUE,
+            ModelCol::LastUsed => theme::TIME,
+            _ => theme::META,
+        };
+        spans.push(Span::styled(
+            format!("{:>w$}", cell(*c), w = c.width()),
+            bg.fg(color),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The cursor model's figures: token kinds and base rates, its cost by the
+/// rate each request got, and its daily work.
+fn model_detail_lines(
+    state: &AppState,
+    model: &str,
+    ts: &crate::aggregator::TokenStats,
+    unknown: bool,
+    spark: &[u64],
+    range: String,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let calculator = CostCalculator::global();
+    let head = format!("─ {model} ");
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(head.clone(), Style::default().fg(theme::PRIMARY)),
+            Span::styled(
+                "─".repeat(width.saturating_sub(head.chars().count() + 2)),
+                Style::default().fg(theme::BORDER),
+            ),
+        ]),
+    ];
+    let kind = |label: &str, n: u64| {
+        [
+            Span::styled(format!("  {label} "), Style::default().fg(theme::LABEL)),
+            Span::styled(crate::format_number(n), Style::default().fg(theme::VALUE)),
+        ]
+    };
+    let mut spans: Vec<Span> = Vec::new();
+    spans.extend(kind("in", ts.input_tokens));
+    spans.extend(kind("out", ts.output_tokens));
+    spans.extend(kind("cache read", ts.cache_read_tokens));
+    spans.extend(kind("cache write", ts.cache_creation_tokens));
+    let base = calculator.get_pricing_by_display_name(model);
+    if unknown {
+        // A model with a rate is unpriced only by a speed without one.
+        let why = if ts.non_standard_speed && base.is_some() {
+            "unrated speed"
+        } else {
+            "no pricing"
+        };
+        spans.push(Span::styled(
+            format!("    ⚠ {why}"),
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(p) = base {
+        spans.push(Span::styled(
+            format!(
+                "    base ${} / ${}  read ${}",
+                p.input_cost_per_mtok, p.output_cost_per_mtok, p.cache_read_cost_per_mtok
+            ),
+            Style::default().fg(theme::META),
+        ));
+    }
+    lines.push(Line::from(spans));
+
+    // Each rate the model billed at, its share summed slice by slice.
+    let mut by_rate: Vec<(&'static str, f64, bool)> = Vec::new();
+    for session in state.daily_groups.iter().flat_map(|g| &g.sessions) {
+        for (key, t) in &session.day_tokens_by_model {
+            if crate::aggregator::normalize_model_name(key) != model {
+                continue;
+            }
+            let label = crate::aggregator::pricing_label(key);
+            let cost = calculator.calculate_cost(t, Some(key));
+            match by_rate.iter_mut().find(|r| r.0 == label) {
+                Some(r) => {
+                    r.1 += cost.unwrap_or(0.0);
+                    r.2 |= cost.is_none();
+                }
+                None => by_rate.push((label, cost.unwrap_or(0.0), cost.is_none())),
+            }
+        }
+    }
+    by_rate.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let mut billed = vec![Span::styled(
+        "  billed as ",
+        Style::default().fg(theme::LABEL),
+    )];
+    for (i, (label, cost, unknown)) in by_rate.iter().enumerate() {
+        if i > 0 {
+            billed.push(Span::styled("  ·  ", Style::default().fg(theme::SEPARATOR)));
+        }
+        billed.push(Span::styled(
+            format!("{label} "),
+            Style::default().fg(theme::VALUE),
+        ));
+        billed.push(Span::styled(
+            super::format_cost_marked(*cost, *unknown, 2),
+            super::cost_total_style(*unknown),
+        ));
+    }
+    lines.push(Line::from(billed));
+
+    let max = spark.iter().copied().max().unwrap_or(1);
+    let mut daily = vec![Span::styled("  daily ", Style::default().fg(theme::LABEL))];
+    // The bars alone: the helper's lead-in indent is for a row of its own.
+    daily.extend(
+        render_sparkline(spark, max, theme::PRIMARY)
+            .into_iter()
+            .skip(1),
+    );
+    daily.push(Span::styled(range, Style::default().fg(theme::TIME)));
+    lines.push(Line::from(daily));
+    lines
+}
+
+/// User sessions that used each model, a subagent's use counted for the
+/// session that launched it, each session once however many days it ran.
+fn model_session_counts(state: &AppState) -> HashMap<String, usize> {
+    let mut seen: HashMap<String, std::collections::HashSet<&std::path::Path>> = HashMap::new();
+    for session in state.daily_groups.iter().flat_map(|g| &g.sessions) {
+        let owner = if session.is_subagent {
+            session.parent_path.as_deref()
+        } else {
+            Some(session.file_path.as_path())
+        };
+        let Some(owner) = owner else { continue };
+        for (key, t) in &session.day_tokens_by_model {
+            if t.all_tokens() > 0 {
+                seen.entry(crate::aggregator::normalize_model_name(key))
+                    .or_default()
+                    .insert(owner);
+            }
+        }
+    }
+    seen.into_iter().map(|(m, s)| (m, s.len())).collect()
+}
+
+fn detail_panel_ecosystem(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Line<'static>>) {
+    let PanelCtx {
+        content_width,
+        visible_height,
+        scroll,
+        popup_area,
+        ..
+    } = ctx;
     use crate::aggregator::{ToolCategory, classify_tool, format_tool_short};
 
     let title = format!(
@@ -3041,7 +3367,7 @@ fn detail_panel_ecosystem(
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        let now_for_legend = chrono::Utc::now();
+        let stale_at = state.stale_reference();
         // Stale count uses the same source-of-truth as the Dashboard
         // Stale = `mcp_status` + `is_underutilized(30)` so we include
         // configured-never servers absent from logs (built-in excluded
@@ -3049,7 +3375,7 @@ fn detail_panel_ecosystem(
         let stale_count = state
             .mcp_status
             .iter()
-            .filter(|s| s.is_underutilized(now_for_legend, 30))
+            .filter(|s| s.is_underutilized(stale_at, 30))
             .count();
         let total_calls = builtin_total + mcp_total;
         lines.push(Line::from(vec![Span::styled(
@@ -3194,11 +3520,13 @@ fn detail_panel_ecosystem(
                 None => "never".to_string(),
             };
             let is_inactive = !agg.is_builtin && !agg.configured;
-            // Per-row stale flag must match the legend / preview count:
-            // configured + (never used OR >=30d idle). Threshold matches
-            // `McpServerStatus::is_underutilized` exactly so per-row `⚠`
-            // and the header "N stale" stay in sync.
-            let is_stale = !agg.is_builtin && agg.configured && days_since.is_none_or(|d| d >= 30);
+            // The header's "N stale" predicate, judged at the view's end, so a
+            // past period's rows agree with its count; "Nd ago" stays from today.
+            let is_stale = !agg.is_builtin
+                && state
+                    .mcp_status
+                    .iter()
+                    .any(|m| m.name == *group && m.is_underutilized(stale_at, 30));
             let expanded = state.mcp_expanded_servers.contains(group);
             let is_selected = i == selected_idx;
             let arrow = if expanded { "▼" } else { "▶" };
@@ -3289,11 +3617,7 @@ fn detail_panel_ecosystem(
                     let t_ratio = *tcalls as f64 / tool_max as f64;
                     let t_pct = crate::text::format_pct(*tcalls as u64, agg.calls as u64);
                     let filled_t = (t_ratio * tool_bar_width as f64).round() as usize;
-                    let t_bar = format!(
-                        "{}{}",
-                        "█".repeat(filled_t),
-                        "░".repeat(tool_bar_width.saturating_sub(filled_t))
-                    );
+                    let t_bar = crate::text::hbar(filled_t, tool_bar_width);
                     let t_ses = state
                         .stats
                         .tool_sessions
@@ -3380,11 +3704,7 @@ fn detail_panel_ecosystem(
             let ratio = **count as f64 / max_usage as f64;
             let pct = crate::text::format_pct(**count as u64, sec.total as u64);
             let filled = ((ratio * bar_width as f64).round() as usize).min(bar_width);
-            let bar = format!(
-                "{}{}",
-                "█".repeat(filled),
-                "░".repeat(bar_width.saturating_sub(filled))
-            );
+            let bar = crate::text::hbar(filled, bar_width);
             let (r, g, b) = rgb_from_table(&sec.bar_rgb_table, ratio);
             let bar_color = Color::Rgb(r, g, b); // lint-ok: raw-rgb — rgb_from_table output
             let display_raw = (sec.format_name)(name);
@@ -3422,7 +3742,7 @@ fn detail_panel_ecosystem(
             row_idx += 1;
         }
         // Configured-but-unused rows.
-        let bar_empty = "░".repeat(bar_width);
+        let bar_empty = crate::text::hbar(0, bar_width);
         for key in &unused_keys {
             let display_raw = (sec.format_name)(key);
             let display_name = super::truncate_with_ellipsis(&display_raw, name_width);
@@ -3470,14 +3790,13 @@ fn detail_panel_ecosystem(
     (title, lines)
 }
 
-fn detail_panel_languages(
-    state: &mut AppState,
-    _today: NaiveDate,
-    content_width: usize,
-    visible_height: usize,
-    scroll: usize,
-    _popup_area: Rect,
-) -> (String, Vec<Line<'static>>) {
+fn detail_panel_languages(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Line<'static>>) {
+    let PanelCtx {
+        content_width,
+        visible_height,
+        scroll,
+        ..
+    } = ctx;
     let sort_label = state.dashboard_languages_sort.label();
     let title = format!(" Languages  · {sort_label} (s) ");
     let mut lines: Vec<Line> = vec![
@@ -3504,22 +3823,9 @@ fn detail_panel_languages(
     }
     other_exts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
 
-    // Known languages + unknown extensions as one list, ranked by the shared
-    // Languages sort (recent / tokens). The per-language extension breakdown
-    // below still comes from `ext_by_lang`.
-    let mut entries: Vec<(String, usize, bool)> = state
-        .stats
-        .language_usage
-        .iter()
-        .filter(|(lang, _)| lang.as_str() != "Other")
-        .map(|(lang, count)| (lang.clone(), *count, false))
-        .collect();
-    for (ext, count) in &other_exts {
-        entries.push(((*ext).clone(), **count, true));
-    }
-    state.sort_languages(&mut entries);
-
-    let total_usage: usize = state.stats.language_usage.values().sum();
+    // The per-language extension breakdown below still comes from `ext_by_lang`.
+    let entries = language_rows(state);
+    let total_usage: usize = entries.iter().map(|(_, c, _)| *c).sum();
     // Bar scaling uses the global max count, independent of row order so the
     // bars look identical whether sorted by recency or tokens.
     let max_count = entries.iter().map(|(_, c, _)| *c).max().unwrap_or(1).max(1);
@@ -3638,12 +3944,14 @@ fn detail_panel_languages(
 
 fn detail_panel_activity_weekly(
     state: &mut AppState,
-    today: NaiveDate,
-    _content_width: usize,
-    visible_height: usize,
-    scroll: usize,
-    _popup_area: Rect,
+    ctx: PanelCtx,
 ) -> (String, Vec<Line<'static>>) {
+    let PanelCtx {
+        today,
+        visible_height,
+        scroll,
+        ..
+    } = ctx;
     let title = " Weekly Activity ".to_string();
     let mut lines: Vec<Line> = activity_header_lines(state, today);
     let body_height = visible_height.saturating_sub(ACTIVITY_HEADER_ROWS);
@@ -3686,12 +3994,15 @@ fn detail_panel_activity_weekly(
 
 fn detail_panel_activity_daily(
     state: &mut AppState,
-    today: NaiveDate,
-    content_width: usize,
-    visible_height: usize,
-    scroll: usize,
-    _popup_area: Rect,
+    ctx: PanelCtx,
 ) -> (String, Vec<Line<'static>>) {
+    let PanelCtx {
+        today,
+        content_width,
+        visible_height,
+        scroll,
+        ..
+    } = ctx;
     use chrono::Datelike;
     let title = " Daily Activity ".to_string();
     let mut lines: Vec<Line> = activity_header_lines(state, today);
@@ -3714,7 +4025,7 @@ fn detail_panel_activity_daily(
             let mut output = 0u64;
             let mut cw = 0u64;
             let mut cr = 0u64;
-            for s in group.sessions.iter().filter(|s| !s.is_subagent) {
+            for s in &group.sessions {
                 work += s.work_tokens();
                 input += s.day_input_tokens;
                 output += s.day_output_tokens;
@@ -3818,35 +4129,18 @@ fn detail_panel_activity_daily(
     (title, lines)
 }
 
-fn detail_panel_hourly(
-    state: &mut AppState,
-    _today: NaiveDate,
-    _content_width: usize,
-    visible_height: usize,
-    scroll: usize,
-    _popup_area: Rect,
-) -> (String, Vec<Line<'static>>) {
+fn detail_panel_hourly(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Line<'static>>) {
+    let PanelCtx {
+        today,
+        visible_height,
+        scroll,
+        ..
+    } = ctx;
     let title = " Hourly Average ".to_string();
     // No leading blank line — 24 hours need every row we can get to
     // fit on lower-height terminals.
     let mut lines: Vec<Line> = Vec::new();
-    let mut hourly_total: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
-    for group in &state.daily_groups {
-        for session in &group.sessions {
-            if session.is_subagent {
-                continue;
-            }
-            for (hour, tokens) in &session.day_hourly_work_tokens {
-                *hourly_total.entry(*hour).or_insert(0) += tokens;
-            }
-        }
-    }
-    let num_days = state.daily_groups.len().max(1) as u64;
-
-    let hourly_avg: std::collections::HashMap<u8, u64> = hourly_total
-        .iter()
-        .map(|(h, t)| (*h, *t / num_days))
-        .collect();
+    let hourly_avg = hourly_average(state, today);
 
     let max_tokens = hourly_avg.values().max().copied().unwrap_or(1);
     let total_avg: u64 = hourly_avg.values().sum();
@@ -3901,7 +4195,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         // don't leave the oldest day below the fold.
         0 => active_days_body_line_count(state, today),
         1 => state.stats.project_stats.len(),
-        2 => state.model_costs.len(),
+        2 => state.aggregated_model_tokens.len(),
         3 => tool_usage_line_count(state),
         4 => {
             let known = state
@@ -3937,7 +4231,8 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         // header; panel 5 likewise reserves rows for streak/dow header.
         0 => visible_height.saturating_sub(COSTS_HEADER_ROWS),
         1 => visible_height / 3,
-        2 => visible_height / 5,
+        // A row cursor: it may rest on the last model.
+        2 => 1,
         4 => visible_height / 2, // Languages: main row + extensions line
         5 => visible_height.saturating_sub(ACTIVITY_HEADER_ROWS),
         _ => visible_height,
@@ -3956,71 +4251,22 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
     // `state.dashboard_panel` across the arms (each builder takes `&mut state`),
     // and so the post-match `title_bottom` can read state fields freely.
     let panel = state.dashboard_panel;
+    let ctx = PanelCtx {
+        today,
+        content_width,
+        visible_height,
+        scroll,
+        popup_area,
+    };
     let (title, content) = match panel {
-        0 => detail_panel_costs(
-            state,
-            today,
-            content_width,
-            visible_height,
-            scroll,
-            popup_area,
-        ),
-        1 => detail_panel_projects(
-            state,
-            today,
-            content_width,
-            visible_height,
-            scroll,
-            popup_area,
-        ),
-        2 => detail_panel_models(
-            state,
-            today,
-            content_width,
-            visible_height,
-            scroll,
-            popup_area,
-        ),
-        3 => detail_panel_ecosystem(
-            state,
-            today,
-            content_width,
-            visible_height,
-            scroll,
-            popup_area,
-        ),
-        4 => detail_panel_languages(
-            state,
-            today,
-            content_width,
-            visible_height,
-            scroll,
-            popup_area,
-        ),
-        5 if state.activity_view_weekly => detail_panel_activity_weekly(
-            state,
-            today,
-            content_width,
-            visible_height,
-            scroll,
-            popup_area,
-        ),
-        5 => detail_panel_activity_daily(
-            state,
-            today,
-            content_width,
-            visible_height,
-            scroll,
-            popup_area,
-        ),
-        6 => detail_panel_hourly(
-            state,
-            today,
-            content_width,
-            visible_height,
-            scroll,
-            popup_area,
-        ),
+        0 => detail_panel_costs(state, ctx),
+        1 => detail_panel_projects(state, ctx),
+        2 => detail_panel_models(state, ctx),
+        3 => detail_panel_ecosystem(state, ctx),
+        4 => detail_panel_languages(state, ctx),
+        5 if state.activity_view_weekly => detail_panel_activity_weekly(state, ctx),
+        5 => detail_panel_activity_daily(state, ctx),
+        6 => detail_panel_hourly(state, ctx),
         _ => {
             let title = " Unknown ".to_string();
             let lines = vec![Line::from("  No detail view available")];
@@ -4028,20 +4274,18 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         }
     };
 
-    let scroll_indicator = if can_scroll_up && can_scroll_down {
-        " ▲▼ "
-    } else if can_scroll_up {
-        " ▲ "
-    } else if can_scroll_down {
-        " ▼ "
+    let scroll_indicator = if panel == 2 {
+        let offset = state.models_detail_offset;
+        let below = offset + models_layout(visible_height).rows < total_items;
+        super::scroll_arrows(offset > 0, below, " ", " ")
     } else {
-        ""
+        super::scroll_arrows(can_scroll_up, can_scroll_down, " ", " ")
     };
 
-    let position_info = if total_items > 0 {
-        // Use `items_per_screen` (not `visible_height`) — multi-line items
-        // like Projects (3 lines) and Models (5 lines) otherwise inflate
-        // the visible count to the raw row count.
+    let position_info = if panel == 2 && total_items > 0 {
+        format!(" {}/{} ", scroll + 1, total_items)
+    } else if total_items > 0 {
+        // Count items, not lines: Projects rows are 3 lines tall.
         format!(
             " {}-{}/{} ",
             scroll + 1,
@@ -4073,6 +4317,12 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     } else {
                         " ↑↓: scroll  z: all days  q: close "
                     }
+                } else if state.dashboard_panel == 1 {
+                    " ↑↓: select  Enter: open project  s: sort  q: close "
+                } else if state.dashboard_panel == 2 {
+                    " ↑↓: model  s: sort  q: close "
+                } else if state.dashboard_panel == 4 {
+                    " ↑↓: scroll  s: sort  q: close "
                 } else {
                     " ↑↓: scroll  q: close "
                 },
@@ -4087,6 +4337,207 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
 
 #[cfg(test)]
 mod tests {
+    // A month's leader keeps its row even when heavier models fill the rest,
+    // so an old generation still shows in the months it carried.
+    #[test]
+    fn every_months_leader_keeps_a_row_in_the_model_grid() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(); // lint-ok: date-literal
+        let old = chrono::NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(); // lint-ok: date-literal
+        let heavy: Vec<_> = [
+            "opus-4-5",
+            "opus-4-6",
+            "opus-4-7",
+            "opus-4-8",
+            "opus-5",
+            "opus-5-5",
+            "sonnet-4-5",
+            "sonnet-4-6",
+            "sonnet-5",
+            "sonnet-5-5",
+            "haiku-4-5",
+        ]
+        .iter()
+        .map(|m| make_session_with_tokens("p", 1_000, 0, &format!("claude-{m}")))
+        .collect();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            make_daily_group(today, heavy),
+            make_daily_group(
+                old,
+                vec![make_session_with_tokens("p", 5, 0, "claude-opus-4-1")],
+            ),
+        ]);
+        state.daily_groups = state.original_daily_groups.clone();
+        let text: String = super::model_month_lines(&state, today, 100)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("Opus 4.1"), "{text}");
+    }
+
+    // A history longer than the wide columns hold packs them, still reaching
+    // back to the first month and labelling the current one.
+    #[test]
+    fn a_long_history_packs_the_model_grid_to_its_first_month() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(); // lint-ok: date-literal
+        let first = chrono::NaiveDate::from_ymd_opt(2025, 2, 1).unwrap(); // lint-ok: date-literal
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            make_daily_group(
+                today,
+                vec![make_session_with_tokens("p", 1, 1, "claude-opus-5")],
+            ),
+            make_daily_group(
+                first,
+                vec![make_session_with_tokens("p", 1, 1, "claude-opus-4-1")],
+            ),
+        ]);
+        state.daily_groups = state.original_daily_groups.clone();
+        let lines = super::model_month_lines(&state, today, 100);
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert!(text(&lines[0]).contains("26-05"), "{}", text(&lines[0]));
+        let old_row = lines
+            .iter()
+            .map(text)
+            .find(|t| t.contains("Opus 4.1"))
+            .unwrap();
+        // 16 months back to February 2025, widened to fill the room: the
+        // name block, then five columns a month, inside the right margin.
+        assert_eq!(old_row.chars().count(), 16 + 16 * 5, "{old_row}");
+        assert!(old_row.chars().count() <= 100 - 2);
+        assert!(old_row.trim_end().ends_with('█') || old_row.contains("██"));
+    }
+
+    // The grid is a fixed height, newest model on top, and shades a cell by
+    // the model's share of that month's work.
+    #[test]
+    fn the_model_grid_puts_the_newest_model_on_top() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(); // lint-ok: date-literal
+        let earlier = chrono::NaiveDate::from_ymd_opt(2026, 3, 10).unwrap(); // lint-ok: date-literal
+        let old = make_session_with_tokens("p", 900, 100, "claude-opus-4-6");
+        let new = make_session_with_tokens("p", 900, 100, "claude-opus-5");
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            make_daily_group(today, vec![new]),
+            make_daily_group(earlier, vec![old]),
+        ]);
+        state.daily_groups = state.original_daily_groups.clone();
+        let lines = super::model_month_lines(&state, today, 100);
+        assert_eq!(lines.len(), super::MODELS_HEADER_ROWS);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(
+            text[1].contains("Opus 5") && text[1].contains("██"),
+            "{text:#?}"
+        );
+        assert!(
+            text[2].contains("Opus 4.6") && text[2].contains("██"),
+            "{text:#?}"
+        );
+    }
+
+    // The forecast is left off on the month's last day, where it would only
+    // repeat the running figure.
+    #[test]
+    fn the_costs_header_drops_the_forecast_on_the_last_day() {
+        let state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        let text = |y, m, d| -> String {
+            let today = chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap(); // lint-ok: date-literal
+            super::costs_header_lines(&state, today)
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect()
+        };
+        assert!(text(2025, 1, 15).contains("forecast"));
+        assert!(!text(2025, 1, 31).contains("forecast"));
+    }
+
+    // The hour profile is a per-calendar-day figure: idle days divide and
+    // subagent hours count.
+    #[test]
+    fn the_hourly_average_is_per_calendar_day_and_counts_subagents() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(); // lint-ok: date-literal
+        let first = today - chrono::Duration::days(9);
+        let mut user = make_session("proj", None, None);
+        user.day_hourly_work_tokens.insert(9, 1000);
+        let mut sub = make_session("proj", None, Some("sub"));
+        sub.is_subagent = true;
+        sub.day_hourly_work_tokens.insert(9, 500);
+        let state = make_test_app_state(vec![
+            make_daily_group(today, vec![user]),
+            make_daily_group(first, vec![sub]),
+        ]);
+        assert_eq!(state.calendar_days(today), 10);
+        assert_eq!(super::hourly_average(&state, today).get(&9), Some(&150));
+    }
+
+    // A session counts once per model however many days it ran, and a
+    // subagent's use counts for the session that launched it.
+    #[test]
+    fn model_sessions_fold_subagents_into_their_parent_and_days_into_one() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        let today = chrono::Local::now().date_naive();
+        let parent = make_session_with_tokens("p", 10, 0, "claude-opus-4-6");
+        let mut sub = make_session_with_tokens("p", 10, 0, "claude-haiku-4-5");
+        sub.is_subagent = true;
+        sub.file_path = std::path::PathBuf::from("/tmp/p/sub.jsonl");
+        sub.parent_path = Some(parent.file_path.clone());
+        let groups = vec![
+            make_daily_group(today, vec![parent.clone(), sub]),
+            make_daily_group(today - chrono::Duration::days(1), vec![parent]),
+        ];
+        let counts = super::model_session_counts(&make_test_app_state(groups));
+        assert_eq!(counts.get("Opus 4.6"), Some(&1), "two days, one session");
+        assert_eq!(counts.get("Haiku 4.5"), Some(&1), "the subagent's parent");
+    }
+
+    // A shorter popup gives up the grid first, then the detail's spacer and
+    // trend, then the detail; the table always keeps a row and every line fits.
+    #[test]
+    fn the_models_layout_sheds_the_grid_before_the_table() {
+        let full = super::models_layout(40);
+        assert!(full.grid && full.detail == super::MODEL_DETAIL_LINES);
+        for h in 1..40 {
+            let l = super::models_layout(h);
+            let used = if l.grid { super::MODELS_HEADER_ROWS } else { 0 } + 1 + l.detail + l.rows;
+            assert!(l.rows >= 1, "{h}");
+            assert!(used <= h.max(2), "{h}: {used} lines for {h}");
+            assert!(l.detail == 0 || l.detail >= 3, "{h}: a stub detail");
+            if l.grid {
+                assert!(l.rows >= super::MODEL_MIN_ROWS, "{h}: grid kept over rows");
+            }
+        }
+        let short = super::models_layout(12);
+        assert!(
+            !short.grid && short.rows >= super::MODEL_MIN_ROWS,
+            "{}",
+            short.rows
+        );
+    }
+
+    // A narrow popup drops the rightmost columns, keeping name and tokens.
+    #[test]
+    fn the_model_table_drops_columns_from_the_right_when_narrow() {
+        use super::ModelCol;
+        assert_eq!(super::model_columns(200), ModelCol::ALL.to_vec());
+        let narrow = super::model_columns(60);
+        assert!(narrow.len() < ModelCol::ALL.len());
+        assert_eq!(narrow[..2], [ModelCol::Tokens, ModelCol::TokenShare]);
+        assert!(!narrow.contains(&ModelCol::LastUsed));
+        let used = 3 + super::MODEL_NAME_W + narrow.iter().map(|c| c.width()).sum::<usize>();
+        assert!(used <= 60, "{used}");
+    }
+
     use super::push_month_divider_line;
     use super::{cost_caption_spans, eco_top_row};
     use ratatui::text::Line;

@@ -2,16 +2,16 @@ use std::io;
 
 use chrono::Local;
 
-use crate::domain::{ContentBlock, EntryType, MessageContent, Role};
+use crate::domain::{ContentBlock, EntryType, LogEntry, MessageContent, Role};
 use crate::parser::JsonlParser;
 
 /// Maximum characters of a `thinking` block to keep in the conversation preview.
 /// Long thinking blocks are common; truncation keeps the popup readable.
 const MAX_THINKING_PREVIEW_CHARS: usize = 500;
 
-/// Maximum characters of a tool result to keep in the conversation preview.
-/// Some tool outputs (search hits, file dumps) can be huge.
-const MAX_TOOL_RESULT_PREVIEW_CHARS: usize = 2000;
+/// Characters kept of one tool input value or result. The view shows a call
+/// in full, but a dumped file or log can run to megabytes per call.
+const MAX_TOOL_TEXT_CHARS: usize = 100_000;
 
 /// Maximum characters of a Bash `command` value rendered in the tool-input summary.
 const MAX_BASH_COMMAND_PREVIEW_CHARS: usize = 80;
@@ -20,8 +20,19 @@ const MAX_BASH_COMMAND_PREVIEW_CHARS: usize = 80;
 pub enum ConversationBlock {
     Text(String),
     Thinking(String),
-    ToolUse { name: String, input_summary: String },
-    ToolResult { content: String, is_error: bool },
+    ToolUse {
+        /// Pairs the call with its result, which arrives in a later message.
+        id: String,
+        name: String,
+        input_summary: String,
+        /// Every input field as `(key, value)`; non-string values as JSON.
+        input: Vec<(String, String)>,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,10 +46,9 @@ pub struct ConversationMessage {
     pub timestamp_utc: Option<chrono::DateTime<chrono::Utc>>,
     pub model: Option<String>,
     pub tokens: Option<(u64, u64)>,
-    /// Full per-message usage (input / output / 5m cw / 1h cw / read) so
-    /// the conv pane can compute per-turn cost without losing the
-    /// 1h-vs-5m cache split that drives ~half of subscription spend.
-    pub usage: Option<crate::aggregator::stats::TokenStats>,
+    /// Each billed attempt as `(pricing key, usage)`, the returned one
+    /// first, so a turn's cost keeps the 1h-vs-5m cache split.
+    pub billed: Vec<(String, crate::aggregator::stats::TokenStats)>,
 }
 
 impl ConversationMessage {
@@ -53,6 +63,7 @@ impl ConversationMessage {
                 ConversationBlock::ToolUse {
                     name,
                     input_summary,
+                    ..
                 } => {
                     s.push_str(name);
                     s.push(' ');
@@ -98,8 +109,24 @@ pub fn load_conversation(
 ) -> Result<Vec<ConversationMessage>, LoadError> {
     let entries =
         JsonlParser::parse_file(file_path).map_err(|e| LoadError::Parse(e.to_string()))?;
+    Ok(messages_from_entries(entries))
+}
 
-    let messages = entries
+/// `load_conversation`, counting the bytes read off disk into `read`.
+///
+/// # Errors
+/// Returns `LoadError` if the file cannot be read or parsed.
+pub fn load_conversation_tracked(
+    file_path: &std::path::Path,
+    read: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<ConversationMessage>, LoadError> {
+    let entries = JsonlParser::parse_file_tracked(file_path, read)
+        .map_err(|e| LoadError::Parse(e.to_string()))?;
+    Ok(messages_from_entries(entries))
+}
+
+fn messages_from_entries(entries: Vec<LogEntry>) -> Vec<ConversationMessage> {
+    entries
         .into_iter()
         .filter(|e| matches!(e.entry_type, EntryType::User | EntryType::Assistant))
         .filter_map(|e| {
@@ -133,36 +160,31 @@ pub fn load_conversation(
                                 Some(ConversationBlock::Thinking(truncated))
                             }
                         }
-                        ContentBlock::ToolUse { name, input, .. } => {
-                            let input_summary = summarize_tool_input(name, input);
+                        ContentBlock::ToolUse { id, name, input } => {
                             Some(ConversationBlock::ToolUse {
+                                id: id.clone().unwrap_or_default(),
                                 name: name.clone(),
-                                input_summary,
+                                input_summary: summarize_tool_input(name, input),
+                                input: tool_input_fields(input),
                             })
                         }
                         ContentBlock::ToolResult {
-                            content, is_error, ..
+                            tool_use_id,
+                            content,
+                            is_error,
                         } => {
-                            let content_str = match content {
-                                serde_json::Value::String(s) => {
-                                    s.chars().take(MAX_TOOL_RESULT_PREVIEW_CHARS).collect()
-                                }
-                                serde_json::Value::Array(arr) => {
-                                    let joined = arr
-                                        .iter()
-                                        .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    joined.chars().take(MAX_TOOL_RESULT_PREVIEW_CHARS).collect()
-                                }
-                                _ => content
-                                    .to_string()
-                                    .chars()
-                                    .take(MAX_TOOL_RESULT_PREVIEW_CHARS)
-                                    .collect(),
+                            let text = match content {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Array(arr) => arr
+                                    .iter()
+                                    .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                                _ => content.to_string(),
                             };
                             Some(ConversationBlock::ToolResult {
-                                content: content_str,
+                                tool_use_id: tool_use_id.clone().unwrap_or_default(),
+                                content: cap_tool_text(text),
                                 is_error: *is_error,
                             })
                         }
@@ -191,30 +213,22 @@ pub fn load_conversation(
                 .map(|ts| ts.with_timezone(&Local).format("%H:%M:%S").to_string());
             let timestamp_utc = e.timestamp;
 
-            let tokens = message
-                .usage
-                .as_ref()
-                .map(|u| (u.input_tokens, u.output_tokens));
-            // Mirror the per-TTL split logic in aggregator::stats::TokenStats::add:
-            // prefer the structured cache_creation object (1h / 5m); fall back to
-            // the flat field at 5m rate for older JSONLs.
-            let usage = message.usage.as_ref().map(|u| {
-                let (m5, m1) = u.cache_creation.as_ref().map_or_else(
-                    || (u.cache_creation_input_tokens, 0),
-                    |c| (c.ephemeral_5m_input_tokens, c.ephemeral_1h_input_tokens),
-                );
-                crate::aggregator::stats::TokenStats {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    cache_creation_tokens: u.cache_creation_input_tokens,
-                    cache_read_tokens: u.cache_read_input_tokens,
-                    cache_creation_5m_tokens: m5,
-                    cache_creation_1h_tokens: m1,
-                    non_standard_speed: u
-                        .speed
-                        .as_deref()
-                        .is_some_and(|s| s != crate::aggregator::stats::KNOWN_SPEED),
-                }
+            let billed = message.usage.as_ref().map_or_else(Vec::new, |u| {
+                let model = message.model.as_deref().unwrap_or_default();
+                crate::aggregator::billed_attempts(model, u, timestamp_utc)
+                    .into_iter()
+                    .map(|(key, attempt)| {
+                        let mut stats = crate::aggregator::TokenStats::default();
+                        stats.add(&attempt);
+                        (key, stats)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // Counted over the same attempts as the turn's cost.
+            let tokens = message.usage.is_some().then(|| {
+                billed.iter().fold((0, 0), |(i, o), (_, t)| {
+                    (i + t.input_tokens, o + t.output_tokens)
+                })
             });
 
             Some(ConversationMessage {
@@ -224,12 +238,10 @@ pub fn load_conversation(
                 timestamp_utc,
                 model: message.model,
                 tokens,
-                usage,
+                billed,
             })
         })
-        .collect();
-
-    Ok(messages)
+        .collect()
 }
 
 /// Last `n` user/assistant messages that carry visible text, oldest-first,
@@ -274,6 +286,34 @@ pub fn recent_message_previews(
     }
     out.reverse();
     out
+}
+
+/// Keeps the first [`MAX_TOOL_TEXT_CHARS`] and says how much was cut, so a
+/// shortened value never reads as the whole.
+fn cap_tool_text(text: String) -> String {
+    let total = text.chars().count();
+    if total <= MAX_TOOL_TEXT_CHARS {
+        return text;
+    }
+    let kept: String = text.chars().take(MAX_TOOL_TEXT_CHARS).collect(); // lint-ok: truncate — a stored cap, not a display cut
+    format!(
+        "{kept}\n… ({} more characters)",
+        total - MAX_TOOL_TEXT_CHARS
+    )
+}
+
+/// A tool input's fields in key order; strings as written, anything else as
+/// pretty JSON. Input that is not an object becomes one `input` field.
+fn tool_input_fields(input: &serde_json::Value) -> Vec<(String, String)> {
+    let show = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => cap_tool_text(s.clone()),
+        other => cap_tool_text(serde_json::to_string_pretty(other).unwrap_or_default()),
+    };
+    match input {
+        serde_json::Value::Object(map) => map.iter().map(|(k, v)| (k.clone(), show(v))).collect(),
+        serde_json::Value::Null => Vec::new(),
+        other => vec![("input".to_string(), show(other))],
+    }
 }
 
 fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
@@ -453,6 +493,36 @@ mod tests {
         })
     }
 
+    // A fallback turn's tokens and cost both cover every billed attempt,
+    // so the header's in/out never disagree with the cost beside them.
+    #[test]
+    fn a_fallback_turn_counts_tokens_over_the_attempts_it_bills() {
+        let path = write_jsonl(&[serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-02-25T10:00:00Z", // lint-ok: date-literal
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": "ok",
+                "usage": {
+                    "input_tokens": 10, "output_tokens": 7,
+                    "iterations": [
+                        {"type": "message", "model": "claude-fable-5",
+                         "input_tokens": 20, "output_tokens": 5},
+                        {"type": "fallback_message", "input_tokens": 10, "output_tokens": 7}
+                    ]
+                }
+            }
+        })]);
+        let msgs = load_conversation(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let msg = &msgs[0];
+        let keys: Vec<&str> = msg.billed.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["claude-opus-4-8", "claude-fable-5"]);
+        assert_eq!(msg.tokens, Some((30, 12)));
+    }
+
     #[test]
     fn test_load_conversation_basic_text() {
         let path = write_jsonl(&[
@@ -466,6 +536,65 @@ mod tests {
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
         assert!(matches!(&msgs[0].blocks[0], ConversationBlock::Text(t) if t == "Hello"));
+    }
+
+    // A tool call keeps its id and every input field, and its result keeps
+    // the whole output: the conversation view shows a call in full.
+    #[test]
+    fn a_tool_call_keeps_its_whole_input_and_output() {
+        let long = "line\n".repeat(1_000);
+        let path = write_jsonl(&[
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": "call-1", "name": "Bash",
+                    "input": {"command": "make test", "description": "Run the tests", "timeout": 600}
+                }]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "call-1", "content": long
+                }]}
+            }),
+        ]);
+        let msgs = load_conversation(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let ConversationBlock::ToolUse { id, input, .. } = &msgs[0].blocks[0] else {
+            panic!("{:?}", msgs[0].blocks);
+        };
+        assert_eq!(id, "call-1");
+        let field = |k: &str| {
+            input
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(field("command"), Some("make test"));
+        assert_eq!(field("description"), Some("Run the tests"));
+        assert_eq!(field("timeout"), Some("600"));
+        let ConversationBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = &msgs[1].blocks[0]
+        else {
+            panic!("{:?}", msgs[1].blocks);
+        };
+        assert_eq!(tool_use_id, "call-1");
+        assert_eq!(content, &long, "the whole output, not a preview");
+    }
+
+    #[test]
+    fn an_oversized_tool_text_says_how_much_was_cut() {
+        let text = "x".repeat(MAX_TOOL_TEXT_CHARS + 5);
+        let capped = cap_tool_text(text);
+        assert!(
+            capped.ends_with("… (5 more characters)"),
+            "{}",
+            &capped[capped.len() - 40..]
+        );
+        assert_eq!(cap_tool_text("short".into()), "short");
     }
 
     #[test]
@@ -531,7 +660,7 @@ mod tests {
             matches!(&msgs[0].blocks[0], ConversationBlock::Text(t) if t.contains("read the file"))
         );
         assert!(
-            matches!(&msgs[0].blocks[1], ConversationBlock::ToolUse { name, input_summary } if name == "Read" && input_summary.contains("main.rs"))
+            matches!(&msgs[0].blocks[1], ConversationBlock::ToolUse { name, input_summary, .. } if name == "Read" && input_summary.contains("main.rs"))
         );
         assert_eq!(msgs[0].model.as_deref(), Some("claude-sonnet-4-20250514"));
     }
@@ -552,9 +681,9 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(msgs.len(), 1);
-        assert!(
-            matches!(&msgs[0].blocks[0], ConversationBlock::ToolResult { content, is_error } if content == "file contents here" && !is_error)
-        );
+        assert!(matches!(&msgs[0].blocks[0], ConversationBlock::ToolResult {
+ content, is_error, ..
+ } if content == "file contents here" && !is_error));
     }
 
     #[test]
@@ -642,7 +771,7 @@ mod tests {
             timestamp_utc: None,
             model: None,
             tokens: None,
-            usage: None,
+            billed: Vec::new(),
         }
     }
 
@@ -656,6 +785,8 @@ mod tests {
             msg(
                 "user",
                 vec![ToolUse {
+                    id: String::new(),
+                    input: Vec::new(),
                     name: "Read".into(),
                     input_summary: "x".into(),
                 }],

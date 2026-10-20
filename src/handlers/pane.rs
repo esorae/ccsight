@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use crate::aggregator::DailyGroup;
-use crate::state::{ConvListMode, ConversationPane, MAX_PANES};
-use crate::{AppState, ConversationMessage, ui};
+use crate::state::{ConvListMode, ConversationPane};
+use crate::{AppState, ConversationMessage};
 
 type CachedMessages = Arc<Vec<ConversationMessage>>;
 
@@ -43,8 +43,10 @@ fn conv_cache_put(path: PathBuf, mtime: u64, messages: CachedMessages) {
     }
 }
 
+/// `read` counts the bytes parsed so far, for the loading view.
 pub(crate) fn spawn_load_conversation(
     file_path: &std::path::Path,
+    read: Arc<std::sync::atomic::AtomicU64>,
 ) -> mpsc::Receiver<CachedMessages> {
     let fp = file_path.to_path_buf();
     let (tx, rx) = mpsc::channel();
@@ -58,7 +60,9 @@ pub(crate) fn spawn_load_conversation(
         return rx;
     }
     std::thread::spawn(move || {
-        let messages = Arc::new(ui::load_conversation(&fp).unwrap_or_default());
+        let messages = Arc::new(
+            crate::conversation::load_conversation_tracked(&fp, &read).unwrap_or_default(),
+        );
         if mtime != 0 {
             conv_cache_put(fp, mtime, Arc::clone(&messages));
         }
@@ -76,6 +80,46 @@ pub(crate) fn current_selected_session(state: &AppState) -> Option<crate::aggreg
         .get(state.selected_day)
         .and_then(|g| g.user_sessions().nth(state.selected_session))
         .cloned()
+}
+
+/// The session the detail popup shows, which every detail key then acts on:
+/// the Live tab's override when it opened the popup; in the conversation view,
+/// the focused pane's transcript (else the list cursor's); otherwise the Daily
+/// cursor's. Unfiltered groups, so an override-free lookup still finds it.
+pub(crate) fn detail_session(state: &AppState) -> Option<crate::aggregator::SessionInfo> {
+    if let Some(s) = &state.session_detail_override {
+        return Some(s.clone());
+    }
+    if !state.show_conversation {
+        return current_selected_session(state);
+    }
+    let path = conv_focused_path(state)?;
+    state
+        .original_daily_groups
+        .iter()
+        .find_map(|g| g.sessions.iter().find(|s| s.file_path == path))
+        .cloned()
+}
+
+/// [`detail_session`]'s transcript path, without cloning the session.
+pub(crate) fn detail_session_path(state: &AppState) -> Option<std::path::PathBuf> {
+    if let Some(s) = &state.session_detail_override {
+        return Some(s.file_path.clone());
+    }
+    if state.show_conversation {
+        return conv_focused_path(state);
+    }
+    current_selected_session(state).map(|s| s.file_path)
+}
+
+/// In the conversation view: the focused pane's transcript, else the list
+/// cursor's under the list's current mode.
+pub(crate) fn conv_focused_path(state: &AppState) -> Option<std::path::PathBuf> {
+    state
+        .active_pane_index
+        .and_then(|i| state.panes.get(i))
+        .and_then(|p| p.file_path.clone())
+        .or_else(|| get_conv_session_file(state, state.selected_session))
 }
 
 /// Locate a session by its on-disk path, returning `(day, sess, raw_idx)` where
@@ -153,14 +197,18 @@ pub(crate) fn preview_conversation_in_pane(state: &mut AppState) {
 }
 
 pub(crate) fn open_conversation_in_pane(state: &mut AppState) {
-    let no_loading = state.panes.iter().all(|p| !p.loading);
-    if !no_loading || state.panes.len() >= MAX_PANES {
-        return;
+    if let Some(file_path) = get_conv_session_file(state, state.selected_session) {
+        open_path_in_pane(state, &file_path);
     }
+}
 
-    let Some(file_path) = get_conv_session_file(state, state.selected_session) else {
-        return;
-    };
+/// Loads `file_path` into the empty pane, else the active one: it replaces
+/// a pane, so a full set of panes does not block it. `false` while another
+/// pane is still loading.
+pub(crate) fn open_path_in_pane(state: &mut AppState, file_path: &std::path::Path) -> bool {
+    if state.panes.iter().any(|p| p.loading) {
+        return false;
+    }
 
     let target_idx = state
         .panes
@@ -168,7 +216,7 @@ pub(crate) fn open_conversation_in_pane(state: &mut AppState) {
         .position(|p| p.file_path.is_none())
         .unwrap_or_else(|| state.active_pane_index.unwrap_or(0));
 
-    let new_pane = ConversationPane::load_from(&file_path);
+    let new_pane = ConversationPane::load_from(file_path);
     if target_idx < state.panes.len() {
         state.panes[target_idx] = new_pane;
     } else {
@@ -177,6 +225,7 @@ pub(crate) fn open_conversation_in_pane(state: &mut AppState) {
 
     state.active_pane_index = Some(target_idx);
     state.show_conversation = true;
+    true
 }
 
 /// Persist pins, surfacing a save failure as a toast. Pins are the only
@@ -238,7 +287,7 @@ pub(crate) fn open_live_session_detail(state: &mut AppState) -> bool {
     if let Some(session) = find_indexed_session_by_path(state, &jsonl) {
         state.session_detail_override = Some(session);
         state.session_detail_live_extra = Some((pid, status, started));
-        state.active_popup = crate::ActivePopup::Detail;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
         state.session_detail_scroll = 0;
         true
     } else {

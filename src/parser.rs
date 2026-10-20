@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -30,6 +31,9 @@ const MAX_MAX_LINE_SIZE: usize = 100 * 1024 * 1024; // 100MB
 // `DEFAULT_MAX_FILE_SIZE` is 2GB: real heavy-use transcripts reach these
 // sizes, and dropping their tail is worse than the memory it costs.
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
+// Bounds the lines held at once to a batch, not the whole file. Big enough
+// that a transcript of multi-MB lines still fills every core.
+const BATCH_BYTES: usize = 64 * 1024 * 1024;
 const MIN_MAX_ENTRIES: usize = 100;
 const MAX_MAX_ENTRIES: usize = 1_000_000;
 
@@ -63,6 +67,8 @@ fn clamp_entries(raw: Option<&str>) -> usize {
 struct Limits {
     line_size: usize,
     entries: usize,
+    /// Bytes of lines deserialized in parallel at once; never changes the result.
+    batch_bytes: usize,
 }
 
 impl Limits {
@@ -70,6 +76,7 @@ impl Limits {
         Self {
             line_size: clamp_line_size(std::env::var("CCSIGHT_MAX_LINE_SIZE").ok().as_deref()),
             entries: clamp_entries(std::env::var("CCSIGHT_MAX_ENTRIES").ok().as_deref()),
+            batch_bytes: BATCH_BYTES,
         }
     }
 }
@@ -94,7 +101,21 @@ impl JsonlParser {
         Self::parse_file_with(path, Limits::from_env())
     }
 
+    /// `parse_file`, adding every byte read off disk to `read` as it goes, so
+    /// a caller on another thread can show how far a long parse has got.
+    pub fn parse_file_tracked(path: &Path, read: &AtomicU64) -> Result<Vec<LogEntry>> {
+        Self::parse_file_counted(path, Limits::from_env(), Some(read))
+    }
+
     fn parse_file_with(path: &Path, limits: Limits) -> Result<Vec<LogEntry>> {
+        Self::parse_file_counted(path, limits, None)
+    }
+
+    fn parse_file_counted(
+        path: &Path,
+        limits: Limits,
+        read: Option<&AtomicU64>,
+    ) -> Result<Vec<LogEntry>> {
         let file =
             File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
 
@@ -108,7 +129,8 @@ impl JsonlParser {
             );
         }
 
-        let (entries, truncated) = Self::parse_lines_reporting(BufReader::new(file), limits);
+        let reader = BufReader::new(CountingReader { inner: file, read });
+        let (entries, truncated) = Self::parse_lines_reporting(reader, limits)?;
         if truncated && let Ok(mut set) = TRUNCATED_FILES.lock() {
             set.insert(path.to_path_buf());
         }
@@ -124,65 +146,69 @@ impl JsonlParser {
     }
 
     fn parse_lines<R: BufRead>(reader: R, limits: Limits) -> Vec<LogEntry> {
-        Self::parse_lines_reporting(reader, limits).0
+        // An in-memory reader fails only on invalid UTF-8, which the walk skips.
+        Self::parse_lines_reporting(reader, limits)
+            .map(|(entries, _)| entries)
+            .unwrap_or_default()
     }
 
-    /// `true` = the entry cap stopped the walk, so the tail of the file is
-    /// missing. Private: the public byte seam stays `-> Vec<LogEntry>`.
-    fn parse_lines_reporting<R: BufRead>(reader: R, limits: Limits) -> (Vec<LogEntry>, bool) {
-        let mut truncated = false;
-        let mut entries = Vec::new();
-        let mut hash_to_index: HashMap<String, usize> = HashMap::new();
-        let entry_limit = limits.entries;
-        let line_size_limit = limits.line_size;
-
+    /// `true` = the entry cap stopped the walk, so the file's tail is missing.
+    /// Any read error but invalid UTF-8 fails the walk, as a partial result
+    /// would be cached as the whole file. Batches parse in parallel and fold
+    /// in file order, so dedup and the cap see what a serial walk would.
+    /// Private: the public byte seam stays `-> Vec<LogEntry>`.
+    fn parse_lines_reporting<R: BufRead>(
+        reader: R,
+        limits: Limits,
+    ) -> std::io::Result<(Vec<LogEntry>, bool)> {
+        let mut fold = Fold {
+            entries: Vec::new(),
+            hash_to_index: HashMap::new(),
+            limit: limits.entries,
+            truncated: false,
+        };
+        let mut batch: Vec<String> = Vec::new();
+        let mut batch_bytes = 0;
         for line_result in reader.lines() {
-            if entries.len() >= entry_limit {
-                truncated = true;
-                break;
-            }
-
-            let Ok(line) = line_result else {
-                continue;
+            let line = match line_result {
+                Ok(line) => line,
+                // Invalid UTF-8 has consumed its line; any other error may
+                // repeat on every call and never let the walk end.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+                Err(e) => return Err(e),
             };
-
-            if line.len() > line_size_limit {
-                continue;
-            }
-
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let Ok(mut entry) = serde_json::from_str::<LogEntry>(&line) else {
-                continue;
-            };
-
-            // Cowork `audit.jsonl` puts the wall-clock time in `_audit_timestamp`
-            // and leaves the standard `timestamp` field null. Fill the gap so
-            // downstream date-grouping / hourly aggregation works without
-            // every consumer needing to know about the alternate field.
-            if entry.timestamp.is_none()
-                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
-                && let Some(ts_str) = value.get("_audit_timestamp").and_then(|v| v.as_str())
-                && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str)
-            {
-                entry.timestamp = Some(ts.with_timezone(&chrono::Utc));
-            }
-
-            if let Some(hash) = Self::create_dedup_hash(&entry) {
-                if let Some(&existing_idx) = hash_to_index.get(&hash) {
-                    entries[existing_idx] = entry;
-                } else {
-                    hash_to_index.insert(hash, entries.len());
-                    entries.push(entry);
+            batch_bytes += line.len();
+            batch.push(line);
+            if batch_bytes >= limits.batch_bytes {
+                if !fold.extend(&mut batch, limits.line_size) {
+                    return Ok((fold.entries, true));
                 }
-            } else {
-                entries.push(entry);
+                batch_bytes = 0;
             }
         }
+        fold.extend(&mut batch, limits.line_size);
 
-        (entries, truncated)
+        Ok((fold.entries, fold.truncated))
+    }
+
+    fn parse_line(line: &str, line_size_limit: usize) -> Option<LogEntry> {
+        if line.len() > line_size_limit || line.trim().is_empty() {
+            return None;
+        }
+        let mut entry = serde_json::from_str::<LogEntry>(line).ok()?;
+
+        // Cowork `audit.jsonl` puts the wall-clock time in `_audit_timestamp`
+        // and leaves the standard `timestamp` field null. Fill the gap so
+        // downstream date-grouping / hourly aggregation works without
+        // every consumer needing to know about the alternate field.
+        if entry.timestamp.is_none()
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(ts_str) = value.get("_audit_timestamp").and_then(|v| v.as_str())
+            && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str)
+        {
+            entry.timestamp = Some(ts.with_timezone(&chrono::Utc));
+        }
+        Some(entry)
     }
 
     pub fn entry_hash(entry: &LogEntry) -> Option<String> {
@@ -193,6 +219,66 @@ impl JsonlParser {
         let request_id = entry.request_id.as_ref()?;
         let message_id = entry.message.as_ref()?.id.as_ref()?;
         Some(format!("{message_id}:{request_id}"))
+    }
+}
+
+/// Adds each read's byte count to `read`; a pass-through when `None`.
+struct CountingReader<'a, R> {
+    inner: R,
+    read: Option<&'a AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Some(read) = self.read {
+            read.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        Ok(n)
+    }
+}
+
+/// The in-order half of a parse: dedup by message + request id, and the
+/// entry cap. `push` takes one slot per input line, parsed or not, and
+/// returns `false` once the cap has stopped the walk.
+struct Fold {
+    entries: Vec<LogEntry>,
+    hash_to_index: HashMap<String, usize>,
+    limit: usize,
+    truncated: bool,
+}
+
+impl Fold {
+    /// Parses `batch` in parallel and folds it in order, leaving it empty.
+    fn extend(&mut self, batch: &mut Vec<String>, line_size_limit: usize) -> bool {
+        use rayon::prelude::*;
+        let parsed: Vec<Option<LogEntry>> = batch
+            .par_iter()
+            .map(|line| JsonlParser::parse_line(line, line_size_limit))
+            .collect();
+        batch.clear();
+        parsed.into_iter().all(|entry| self.push(entry))
+    }
+
+    fn push(&mut self, entry: Option<LogEntry>) -> bool {
+        if self.entries.len() >= self.limit {
+            self.truncated = true;
+            return false;
+        }
+        let Some(entry) = entry else {
+            return true;
+        };
+        if let Some(hash) = JsonlParser::create_dedup_hash(&entry) {
+            if let Some(&existing_idx) = self.hash_to_index.get(&hash) {
+                self.entries[existing_idx] = entry;
+            } else {
+                self.hash_to_index.insert(hash, self.entries.len());
+                self.entries.push(entry);
+            }
+        } else {
+            self.entries.push(entry);
+        }
+        true
     }
 }
 
@@ -208,6 +294,7 @@ mod tests {
         let limits = || Limits {
             line_size: 1 << 20,
             entries: 2,
+            batch_bytes: BATCH_BYTES,
         };
         let before = truncated_file_count();
         // Every reload re-parses the same file; the warning counts files.
@@ -284,6 +371,30 @@ mod tests {
             b"{\"type\":\"user\",\"toolUseResult\":{\"structuredPatch\":{\"x\":1},\"filePath\":\"/a\"},\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
             1,
         ),
+        // A fallback's per-attempt record: each attempt bills, so an entry
+        // dropped over its shape takes every attempt's tokens with it.
+        (
+            "usage_iterations",
+            b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"output_tokens\":1,\"iterations\":[{\"type\":\"message\",\"model\":\"m\",\"output_tokens\":2,\"extra\":{}},{\"type\":\"fallback_message\",\"output_tokens\":1}]}}}\n",
+            1,
+        ),
+        // Whatever shape `iterations` takes, its entry survives with its
+        // top-level tokens; only the malformed attempts are lost.
+        (
+            "usage_iterations_null",
+            b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"output_tokens\":1,\"iterations\":null}}}\n",
+            1,
+        ),
+        (
+            "usage_iterations_mistyped",
+            b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"output_tokens\":1,\"iterations\":[7,\"x\",[1],{\"model\":3,\"output_tokens\":null,\"cache_creation\":[1]}]}}}\n",
+            1,
+        ),
+        (
+            "usage_iterations_object",
+            b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"output_tokens\":1,\"iterations\":{\"a\":[{}]}}}}\n",
+            1,
+        ),
     ];
 
     // Non-panic alone is a weak oracle: an entry the parser accepted but that
@@ -330,9 +441,10 @@ mod tests {
         let limits = Limits {
             line_size: DEFAULT_MAX_LINE_SIZE,
             entries: 2,
+            batch_bytes: BATCH_BYTES,
         };
         let (entries, truncated) =
-            JsonlParser::parse_lines_reporting(BufReader::new(body.as_bytes()), limits);
+            JsonlParser::parse_lines_reporting(BufReader::new(body.as_bytes()), limits).unwrap();
         assert_eq!(entries.len(), 2, "the cap must stop the walk, not the file");
         // The dropped entries are the NEWEST ones, so a silent cap understates
         // both the totals and the last-activity time.
@@ -341,8 +453,10 @@ mod tests {
         let under = Limits {
             line_size: DEFAULT_MAX_LINE_SIZE,
             entries: 99,
+            batch_bytes: BATCH_BYTES,
         };
-        let (all, hit) = JsonlParser::parse_lines_reporting(BufReader::new(body.as_bytes()), under);
+        let (all, hit) =
+            JsonlParser::parse_lines_reporting(BufReader::new(body.as_bytes()), under).unwrap();
         assert_eq!(all.len(), 5);
         assert!(!hit, "a file inside the cap is not truncated");
     }
@@ -362,6 +476,7 @@ mod tests {
         let limits = Limits {
             line_size: 64,
             entries: DEFAULT_MAX_ENTRIES,
+            batch_bytes: BATCH_BYTES,
         };
         let entries = JsonlParser::parse_lines(BufReader::new(body.as_bytes()), limits);
         assert_eq!(entries.len(), 1, "only the over-cap line should drop");
@@ -512,6 +627,35 @@ mod tests {
     }
 
     // A document = mix of valid lines and arbitrary garbage, newline-joined.
+    /// Any JSON value, its object keys drawn partly from the usage field
+    /// names so a mistyped known field is generated, not only unknown ones.
+    fn arb_json() -> impl Strategy<Value = serde_json::Value> {
+        use serde_json::Value;
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(Value::from),
+            any::<u64>().prop_map(Value::from),
+            any::<f64>().prop_map(Value::from),
+            ".{0,8}".prop_map(Value::String),
+        ];
+        let key = prop_oneof![
+            Just("model".to_string()),
+            Just("output_tokens".to_string()),
+            Just("input_tokens".to_string()),
+            Just("cache_creation".to_string()),
+            Just("ephemeral_1h_input_tokens".to_string()),
+            "[a-z_]{1,8}",
+        ];
+        leaf.prop_recursive(4, 48, 6, move |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
+                proptest::collection::btree_map(key.clone(), inner, 0..6)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
     fn arb_doc() -> impl Strategy<Value = Vec<u8>> {
         proptest::collection::vec(
             prop_oneof![
@@ -524,8 +668,91 @@ mod tests {
         .prop_map(|lines| lines.join("\n").into_bytes())
     }
 
+    // Lines drawn from a few message / request ids so retries collide and
+    // dedup replaces a kept entry, mixed with garbage and blank lines.
+    fn arb_dedup_doc() -> impl Strategy<Value = String> {
+        let line = (0u8..3, 0u8..2, any::<u16>()).prop_map(|(m, r, n)| {
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": format!("u{n}"),
+                "requestId": format!("r{r}"),
+                "message": {"role": "assistant", "content": "x", "id": format!("m{m}")},
+            })
+            .to_string()
+        });
+        proptest::collection::vec(
+            prop_oneof![
+                4 => line,
+                1 => Just("{\"type\":\"user\"}".to_string()),
+                1 => Just("not json".to_string()),
+                1 => Just(String::new()),
+            ],
+            0..16,
+        )
+        .prop_map(|lines| lines.join("\n"))
+    }
+
+    // A read error past the first line (a failing disk or mount) fails the
+    // walk: returning the lines before it would be cached as the whole file.
+    #[test]
+    fn a_read_error_fails_the_parse_instead_of_returning_part_of_it() {
+        struct FailsAfter(&'static [u8]);
+        impl std::io::Read for FailsAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    return Err(std::io::Error::other("device error"));
+                }
+                let n = buf.len().min(self.0.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let limits = Limits {
+            line_size: DEFAULT_MAX_LINE_SIZE,
+            entries: DEFAULT_MAX_ENTRIES,
+            batch_bytes: BATCH_BYTES,
+        };
+        let good = b"{\"type\":\"user\"}\n";
+        let result = JsonlParser::parse_lines_reporting(BufReader::new(FailsAfter(good)), limits);
+        assert!(result.is_err(), "a partial walk must not pass as complete");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
+
+        // Batching is invisible: one line per batch and the whole doc in one
+        // batch agree on every entry, on dedup, and on where the cap stops.
+        #[test]
+        fn the_batch_size_never_changes_the_parse(doc in arb_dedup_doc(), cap in 1usize..10) {
+            let run = |batch_bytes| {
+                let limits = Limits { line_size: DEFAULT_MAX_LINE_SIZE, entries: cap, batch_bytes };
+                let (entries, truncated) =
+                    JsonlParser::parse_lines_reporting(BufReader::new(doc.as_bytes()), limits)
+                        .unwrap();
+                let json: Vec<String> =
+                    entries.iter().map(|e| serde_json::to_string(e).unwrap()).collect();
+                (json, truncated)
+            };
+            prop_assert_eq!(run(1), run(usize::MAX));
+        }
+
+        // Whatever JSON `usage.iterations` holds, its entry survives with the
+        // top-level counts it carries.
+        #[test]
+        fn a_malformed_iterations_never_costs_its_entry_or_tokens(
+            iterations in arb_json(), output in 0u64..1_000_000,
+        ) {
+            let line = serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [],
+                    "usage": {"output_tokens": output, "iterations": iterations}},
+            });
+            let entries = JsonlParser::parse_entries(line.to_string().as_bytes());
+            prop_assert_eq!(entries.len(), 1);
+            let usage = entries[0].message.as_ref().and_then(|m| m.usage.as_ref());
+            prop_assert_eq!(usage.map(|u| u.output_tokens), Some(output));
+        }
 
         // Arbitrary bytes through the parse seam never panic.
         #[test]

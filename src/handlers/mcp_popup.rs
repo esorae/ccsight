@@ -124,8 +124,11 @@ fn mcp_pre_server_offset(state: &AppState) -> usize {
     // per-row ⚠ marker, and the Tier 3 alert all share one threshold.
     // Reimplementing the check inline (e.g. `> 30`) drifts off-by-one
     // against the legend (`>= 30`) and produces mismatched displays.
-    let now = chrono::Utc::now();
-    let any_stale = state.mcp_status.iter().any(|s| s.is_underutilized(now, 30));
+    let stale_at = state.stale_reference();
+    let any_stale = state
+        .mcp_status
+        .iter()
+        .any(|s| s.is_underutilized(stale_at, 30));
     1 + usize::from(any_stale)
 }
 

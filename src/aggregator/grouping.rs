@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, NaiveDate, Timelike, Utc};
 
-use crate::aggregator::stats::DailyStats;
-use crate::aggregator::{StatsAggregator, TokenStats};
+use crate::aggregator::TokenStats;
 use crate::domain::EntryType;
 use crate::infrastructure::Cache;
 use crate::parser::JsonlParser;
@@ -33,6 +32,9 @@ pub struct SessionInfo {
     /// The share of `day_user_msgs` someone typed — `day_user_msgs` also
     /// counts every tool result, which Claude Code files under the user role.
     pub day_prompts: u64,
+    /// Tool results that errored / succeeded on this day.
+    pub day_tool_errors: usize,
+    pub day_tool_successes: usize,
     /// Assistant-role messages emitted on this day. Counted per assistant
     /// entry regardless of whether it carried tool calls or just text.
     pub day_assistant_msgs: u64,
@@ -62,6 +64,20 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
+    /// Minutes from this day's first entry to its last.
+    pub fn day_duration_mins(&self) -> i64 {
+        (self.day_last_timestamp - self.day_first_timestamp).num_minutes()
+    }
+
+    /// This day's usage summed over its models (cache reads / writes included).
+    pub fn day_token_total(&self) -> TokenStats {
+        let mut total = TokenStats::default();
+        for t in self.day_tokens_by_model.values() {
+            total.merge(t);
+        }
+        total
+    }
+
     /// Sum of `day_input_tokens + day_output_tokens` — the "work" (non-cache)
     /// token total used everywhere we display a per-session token count.
     /// Centralised so callers don't keep re-typing the addition.
@@ -93,13 +109,13 @@ impl SessionInfo {
             .or(self.summary.as_deref())
     }
 
-    /// True when any of this day's models lacks a pricing entry — that
+    /// True when any of this day's models has no known cost — that
     /// model's share of [`Self::cost`] is silently 0, so displays must mark
     /// the figure ("$?" / "*") instead of presenting it as a real total.
     pub fn has_unpriced_model(&self, calculator: &crate::aggregator::CostCalculator) -> bool {
         self.day_tokens_by_model
-            .keys()
-            .any(|model| calculator.get_pricing(Some(model)).is_none())
+            .iter()
+            .any(|(model, tokens)| calculator.is_unpriced(model, tokens))
     }
 
     /// Per-day cost summed over `day_tokens_by_model`. Single source so
@@ -175,6 +191,12 @@ impl DailyGroup {
         self.sessions.iter().filter(|s| !s.is_subagent)
     }
 
+    /// The day's work tokens, subagents included — the figure every per-day
+    /// token surface shows, so a day reads the same in each of them.
+    pub fn work_tokens(&self) -> u64 {
+        self.sessions.iter().map(SessionInfo::work_tokens).sum()
+    }
+
     /// Tokens Anthropic bills for on this day, subagents included. Zero means
     /// the day holds only activity that costs nothing — an abandoned prompt,
     /// system events, or `<synthetic>` assistant replies from failed calls.
@@ -188,6 +210,40 @@ impl DailyGroup {
                 t.input_tokens + t.output_tokens + t.cache_creation_tokens + t.cache_read_tokens
             })
             .sum()
+    }
+
+    /// This day's cost, subagents included.
+    pub fn cost(&self, calculator: &crate::aggregator::CostCalculator) -> f64 {
+        self.sessions.iter().map(|s| s.cost(calculator)).sum()
+    }
+}
+
+/// Every cost figure a view shows, priced slice by slice so the total, the
+/// per-model split and the per-day rows are sums of the same numbers.
+pub(crate) struct CostSummary {
+    pub(crate) total: f64,
+    pub(crate) by_model: Vec<(String, f64)>,
+    /// Newest first; days with no billable tokens are left out.
+    pub(crate) daily: Vec<(NaiveDate, f64)>,
+}
+
+pub(crate) fn cost_summary(groups: &[DailyGroup]) -> CostSummary {
+    let calculator = crate::aggregator::CostCalculator::global();
+    let by_model = calculator.calculate_costs_by_model(
+        groups
+            .iter()
+            .flat_map(|g| &g.sessions)
+            .flat_map(|s| &s.day_tokens_by_model),
+    );
+    let daily: Vec<(NaiveDate, f64)> = groups
+        .iter()
+        .filter(|g| g.billable_tokens() > 0)
+        .map(|g| (g.date, g.cost(calculator)))
+        .collect();
+    CostSummary {
+        total: daily.iter().map(|(_, c)| c).sum(),
+        by_model,
+        daily,
     }
 }
 
@@ -216,17 +272,31 @@ pub(crate) fn credited_churn(
     }
 }
 
-/// Count distinct non-subagent sessions across day groups, deduped by
-/// `file_path`. `daily_groups` carries one entry per (session, active day), so a
-/// plain sum over `user_sessions()` is session-days — it double-counts a session
-/// resumed across multiple days. This collapses those back to true session count.
-pub fn distinct_user_session_count(groups: &[DailyGroup]) -> usize {
-    groups
-        .iter()
-        .flat_map(DailyGroup::user_sessions)
-        .map(|s| &s.file_path)
-        .collect::<std::collections::HashSet<_>>()
-        .len()
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Files walked / total for the running load. A process global rather than a
+/// threaded parameter because the only reader is the render thread, which has
+/// no call path into the walk.
+static PROGRESS_DONE: AtomicUsize = AtomicUsize::new(0);
+static PROGRESS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// `(files walked, files to walk)`. `(_, 0)` means no pass has started.
+pub fn load_progress() -> (usize, usize) {
+    (
+        PROGRESS_DONE.load(Ordering::Relaxed),
+        PROGRESS_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
+/// `(mtime secs, size)` — the pair `Cache::is_valid` compares against.
+fn file_stamp(file: &Path) -> (u64, u64) {
+    let meta = std::fs::metadata(file).ok();
+    let modified_secs = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    (modified_secs, meta.map_or(0, |m| m.len()))
 }
 
 pub struct DailyGrouper;
@@ -236,22 +306,29 @@ impl DailyGrouper {
         files: &[PathBuf],
         cache: &mut Option<Cache>,
     ) -> Vec<DailyGroup> {
+        Self::group_by_date_counted(files, cache).0
+    }
+
+    /// [`Self::group_by_date_with_shared_cache`] plus how many files came from
+    /// the cache versus a fresh parse, for the TUI header.
+    pub fn group_by_date_counted(
+        files: &[PathBuf],
+        cache: &mut Option<Cache>,
+    ) -> (Vec<DailyGroup>, crate::aggregator::CacheStats) {
         let mut date_map: HashMap<NaiveDate, Vec<SessionInfo>> = HashMap::new();
 
         // Resume/branch rewrites duplicate (msg_id, requestId) across files but
         // bill once, so cache hits' hashes are pre-loaded. Hits are decided
         // ONCE and shared with the walk: a file the walk re-parses anyway
-        // (appended to mid-pass, or a valid entry without per-day stats) would
-        // otherwise be parsed against its own hashes and credit itself nothing.
+        // (appended to mid-pass) would otherwise be parsed against its own
+        // hashes and credit itself nothing.
         let hits: std::collections::HashSet<&PathBuf> =
             cache
                 .as_ref()
                 .map_or_else(std::collections::HashSet::new, |c| {
                     files
                         .iter()
-                        .filter(|f| {
-                            c.is_valid(f) && c.get(f).is_some_and(|e| !e.daily_stats.is_empty())
-                        })
+                        .filter(|f| c.is_valid(f) && c.get(f).is_some())
                         .collect()
                 });
         let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -271,11 +348,21 @@ impl DailyGrouper {
         sorted_files.sort();
 
         let mut parsed_any = false;
+        let mut cache_stats = crate::aggregator::CacheStats {
+            cached_files: 0,
+            parsed_files: 0,
+        };
+        PROGRESS_DONE.store(0, Ordering::Relaxed);
+        PROGRESS_TOTAL.store(sorted_files.len(), Ordering::Relaxed);
         for file in &sorted_files {
+            PROGRESS_DONE.fetch_add(1, Ordering::Relaxed);
             let (sessions_by_date, parsed) =
                 Self::get_sessions_by_date(file, cache, &mut global_seen, hits.contains(*file));
             if parsed {
                 parsed_any = true;
+                cache_stats.parsed_files += 1;
+            } else {
+                cache_stats.cached_files += 1;
             }
             for (date, session) in sessions_by_date {
                 date_map.entry(date).or_default().push(session);
@@ -304,7 +391,7 @@ impl DailyGrouper {
             .collect();
 
         groups.sort_by_key(|g| std::cmp::Reverse(g.date));
-        groups
+        (groups, cache_stats)
     }
 
     fn get_sessions_by_date(
@@ -317,9 +404,8 @@ impl DailyGrouper {
             && let Some(c) = cache.as_ref()
             && let Some(cached) = c.get(file)
         {
-            // Cache hit: hashes are already in `global_seen`
-            // from the pre-load pass at the top of
-            // `group_by_date_with_shared_cache`.
+            // Cache hit: hashes are already in `global_seen` from the
+            // pre-load pass at the top of `group_by_date_counted`.
             return (Self::build_sessions_from_cache(file, cached), false);
         }
 
@@ -371,6 +457,8 @@ impl DailyGrouper {
                         day_output_tokens: ds.output_tokens,
                         day_user_msgs: ds.user_msgs,
                         day_prompts: ds.prompts,
+                        day_tool_errors: ds.tool_errors,
+                        day_tool_successes: ds.tool_successes,
                         day_assistant_msgs: ds.assistant_msgs,
                         day_tokens_by_model: tokens_by_model,
                         day_hourly_activity: ds.hourly_activity.clone(),
@@ -398,18 +486,40 @@ impl DailyGrouper {
         cache: &mut Option<Cache>,
         global_seen: &mut std::collections::HashSet<String>,
     ) -> Vec<(NaiveDate, SessionInfo)> {
+        // Stamped before the read: lines appended mid-parse then leave the
+        // entry stale, so the next load re-parses them.
+        let stamp = file_stamp(file);
+        Self::parse_and_build_sessions_stamped(file, stamp, cache, global_seen)
+    }
+
+    /// `stamp` is the file's `(mtime secs, size)` taken before parsing; the
+    /// cache entry records it as the version these slices cover.
+    fn parse_and_build_sessions_stamped(
+        file: &Path,
+        (modified_secs, file_size): (u64, u64),
+        cache: &mut Option<Cache>,
+        global_seen: &mut std::collections::HashSet<String>,
+    ) -> Vec<(NaiveDate, SessionInfo)> {
         let Ok(entries) = JsonlParser::parse_file(file) else {
             return vec![];
         };
 
-        if entries.is_empty() {
-            return vec![];
-        }
-
         let entries_with_timestamp: Vec<_> =
             entries.iter().filter(|e| e.timestamp.is_some()).collect();
 
+        // Nothing timestamped belongs to no day. Cache that, so the file is a
+        // hit next pass instead of a re-parse (and a cache save) every reload.
         if entries_with_timestamp.is_empty() {
+            if let Some(c) = cache.as_mut() {
+                c.insert(
+                    file,
+                    crate::infrastructure::CachedFileStats {
+                        modified_secs,
+                        file_size,
+                        ..Default::default()
+                    },
+                );
+            }
             return vec![];
         }
 
@@ -509,21 +619,13 @@ impl DailyGrouper {
 
         let model = super::extract_session_model(&entries);
 
-        let mut daily_stats: HashMap<NaiveDate, DailyStats> = HashMap::new();
+        let mut daily_stats: HashMap<NaiveDate, crate::infrastructure::CachedDailyStats> =
+            HashMap::new();
         // Hashes credited to THIS file (passed the cross-file dedup check
         // below). Stored in the cache so the next run's pre-load pass
         // restores them to global_seen without re-parsing every file.
         let mut file_unique_hashes: Vec<String> = Vec::new();
-        // Per-file rollups needed by Stats (TUI). Computed during the same
-        // entry walk so the cache entry is complete on first write — no
-        // partial / fix-up pass needed.
-        let mut file_tool_error_count: usize = 0;
-        let mut file_tool_success_count: usize = 0;
-        let mut file_model_usage: HashMap<String, usize> = HashMap::new();
         let session_id_from_entries = crate::aggregator::stats::session_id_of(&entries);
-        let parent_path = is_subagent
-            .then(|| subagent_parent_path(file, session_id_from_entries.as_deref()))
-            .flatten();
 
         for entry in &entries {
             if let Some(ts) = entry.timestamp {
@@ -559,9 +661,6 @@ impl DailyGrouper {
                         }
                     } else if matches!(message.role, crate::domain::Role::Assistant) {
                         stats.assistant_msgs += 1;
-                        if let Some(ref m) = message.model {
-                            *file_model_usage.entry(m.clone()).or_insert(0) += 1;
-                        }
                     }
                     if let MessageContent::Blocks(ref blocks) = message.content {
                         for block in blocks {
@@ -570,14 +669,14 @@ impl DailyGrouper {
                                     let key = crate::aggregator::tool_usage_key(name, input);
                                     *stats.tool_usage.entry(key).or_insert(0) += 1;
                                     let extensions =
-                                        StatsAggregator::extract_extensions_from_tool_input(
+                                        crate::aggregator::language::extensions_from_tool_input(
                                             name, input,
                                         );
                                     if extensions.is_empty() {
                                         // Special filenames (Dockerfile, Makefile, etc.) carry a
                                         // language but no extension — count them under language only.
                                         if let Some(lang) =
-                                            StatsAggregator::extract_language_from_tool_input(
+                                            crate::aggregator::language::from_tool_input(
                                                 name, input,
                                             )
                                         {
@@ -599,14 +698,12 @@ impl DailyGrouper {
                                     }
                                 }
                                 crate::domain::ContentBlock::ToolResult { is_error, .. } => {
-                                    // Tool result counts are per-file, not
-                                    // hash-deduped — matches stats.rs so a
-                                    // cache entry written here produces the
-                                    // same numbers as a fresh Stats parse.
+                                    // Not hash-deduped: a result is a call
+                                    // outcome, not billed usage.
                                     if *is_error {
-                                        file_tool_error_count += 1;
+                                        stats.tool_errors += 1;
                                     } else {
-                                        file_tool_success_count += 1;
+                                        stats.tool_successes += 1;
                                     }
                                 }
                                 _ => {}
@@ -631,218 +728,61 @@ impl DailyGrouper {
                         if !super::is_real_model(&model_key) {
                             continue;
                         }
-                        stats.input_tokens += usage.input_tokens;
-                        stats.output_tokens += usage.output_tokens;
-
-                        let model_tokens = stats.tokens_by_model.entry(model_key).or_default();
-                        model_tokens.add(usage);
-
                         let hour = ts.with_timezone(&Local).hour() as u8;
-                        let tokens = usage.input_tokens
-                            + usage.output_tokens
-                            + usage.cache_creation_input_tokens
-                            + usage.cache_read_input_tokens;
-                        let work_tokens = usage.input_tokens + usage.output_tokens;
-                        *stats.hourly_activity.entry(hour).or_insert(0) += tokens;
-                        *stats.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
+                        for (key, attempt) in
+                            crate::aggregator::billed_attempts(&model_key, usage, Some(ts))
+                        {
+                            stats.input_tokens += attempt.input_tokens;
+                            stats.output_tokens += attempt.output_tokens;
+                            stats.tokens_by_model.entry(key).or_default().add(&attempt);
+                            let tokens = attempt.input_tokens
+                                + attempt.output_tokens
+                                + attempt.cache_creation_input_tokens
+                                + attempt.cache_read_input_tokens;
+                            *stats.hourly_activity.entry(hour).or_insert(0) += tokens;
+                            *stats.hourly_work_activity.entry(hour).or_insert(0) +=
+                                attempt.work_tokens();
+                        }
                     }
                 }
             }
         }
 
-        // Write a full cache entry. Per-FILE rollups (cache_creation_tokens
-        // totals, weekday activity, tool error/success, ...) are derived
-        // from daily_stats + per-entry counters so both Stats and
-        // DailyGrouper hit the same cache without re-parsing.
-        if let Some(c) = cache.as_mut() {
-            use chrono::Datelike;
-            let mut cached_daily: HashMap<String, crate::infrastructure::CachedDailyStats> =
-                HashMap::new();
-            // Per-FILE accumulators, summed from per-day stats.
-            let mut file_input_tokens: u64 = 0;
-            let mut file_output_tokens: u64 = 0;
-            let mut file_cache_creation_tokens: u64 = 0;
-            let mut file_cache_creation_5m_tokens: u64 = 0;
-            let mut file_cache_creation_1h_tokens: u64 = 0;
-            let mut file_cache_read_tokens: u64 = 0;
-            let mut file_tool_usage: HashMap<String, usize> = HashMap::new();
-            let mut file_model_tokens: HashMap<String, TokenStats> = HashMap::new();
-            let mut file_hourly_activity: HashMap<u8, u64> = HashMap::new();
-            let mut file_hourly_work_activity: HashMap<u8, u64> = HashMap::new();
-            let mut file_weekday_activity: HashMap<u8, u64> = HashMap::new();
-            let mut file_weekday_work_activity: HashMap<u8, u64> = HashMap::new();
-            let mut file_language_usage: HashMap<String, usize> = HashMap::new();
-            let mut file_extension_usage: HashMap<String, usize> = HashMap::new();
-            for (date, ds) in &daily_stats {
-                file_input_tokens += ds.input_tokens;
-                file_output_tokens += ds.output_tokens;
-                // Sum cache breakdowns from per-day tokens_by_model.
-                let mut day_tokens_total = ds.input_tokens + ds.output_tokens;
-                for (model, ts) in &ds.tokens_by_model {
-                    file_cache_creation_tokens += ts.cache_creation_tokens;
-                    file_cache_creation_5m_tokens += ts.cache_creation_5m_tokens;
-                    file_cache_creation_1h_tokens += ts.cache_creation_1h_tokens;
-                    file_cache_read_tokens += ts.cache_read_tokens;
-                    day_tokens_total += ts.cache_creation_tokens + ts.cache_read_tokens;
-                    file_model_tokens
-                        .entry(model.clone())
-                        .or_default()
-                        .merge(ts);
-                }
-                for (k, v) in &ds.tool_usage {
-                    *file_tool_usage.entry(k.clone()).or_insert(0) += v;
-                }
-                for (k, v) in &ds.language_usage {
-                    *file_language_usage.entry(k.clone()).or_insert(0) += v;
-                }
-                for (k, v) in &ds.extension_usage {
-                    *file_extension_usage.entry(k.clone()).or_insert(0) += v;
-                }
-                for (h, v) in &ds.hourly_activity {
-                    *file_hourly_activity.entry(*h).or_insert(0) += v;
-                }
-                for (h, v) in &ds.hourly_work_activity {
-                    *file_hourly_work_activity.entry(*h).or_insert(0) += v;
-                }
-                // Weekday rollup: attribute each day's totals to its weekday.
-                let weekday = date.weekday().num_days_from_monday() as u8;
-                *file_weekday_activity.entry(weekday).or_insert(0) += day_tokens_total;
-                *file_weekday_work_activity.entry(weekday).or_insert(0) +=
-                    ds.input_tokens + ds.output_tokens;
-
-                cached_daily.insert(
-                    date.to_string(),
-                    crate::infrastructure::CachedDailyStats {
-                        first_timestamp: ds.first_timestamp,
-                        last_timestamp: ds.last_timestamp,
-                        input_tokens: ds.input_tokens,
-                        output_tokens: ds.output_tokens,
-                        tokens_by_model: ds.tokens_by_model.clone(),
-                        hourly_activity: ds.hourly_activity.clone(),
-                        hourly_work_activity: ds.hourly_work_activity.clone(),
-                        tool_usage: ds.tool_usage.clone(),
-                        language_usage: ds.language_usage.clone(),
-                        extension_usage: ds.extension_usage.clone(),
-                        user_msgs: ds.user_msgs,
-                        prompts: ds.prompts,
-                        assistant_msgs: ds.assistant_msgs,
-                        line_churn: ds.line_churn,
-                    },
-                );
-            }
-            let last_ts = daily_stats.values().filter_map(|d| d.last_timestamp).max();
-            let session_duration_mins = last_ts.map(|l| (l - session_first).num_minutes());
-            let full_entry = crate::infrastructure::CachedFileStats {
-                verified_cwd: verified_cwd.clone(),
-                modified_secs: std::fs::metadata(file)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs())
-                    })
-                    .unwrap_or(0),
-                file_size: std::fs::metadata(file).map_or(0, |m| m.len()),
-                entry_count: entries.len(),
-                input_tokens: file_input_tokens,
-                output_tokens: file_output_tokens,
-                cache_creation_tokens: file_cache_creation_tokens,
-                cache_read_tokens: file_cache_read_tokens,
-                cache_creation_5m_tokens: file_cache_creation_5m_tokens,
-                cache_creation_1h_tokens: file_cache_creation_1h_tokens,
-                unique_hashes: file_unique_hashes,
-                tool_usage: file_tool_usage,
-                model_usage: file_model_usage,
-                model_tokens: file_model_tokens,
-                session_date: Some(session_start_date),
-                project_name: Some(project_name.clone()),
-                session_id: session_id_from_entries,
-                git_branch: git_branch.clone(),
-                first_timestamp: Some(session_first),
-                last_timestamp: last_ts,
-                summary: summary.clone(),
-                custom_title: custom_title.clone(),
-                ai_title: ai_title.clone(),
-                last_user_message: last_user_message.clone(),
-                first_user_message: first_user_message.clone(),
-                model: model.clone(),
-                is_subagent,
-                daily_stats: cached_daily,
-                hourly_activity: file_hourly_activity,
-                hourly_work_activity: file_hourly_work_activity,
-                weekday_activity: file_weekday_activity,
-                weekday_work_activity: file_weekday_work_activity,
-                tool_error_count: file_tool_error_count,
-                tool_success_count: file_tool_success_count,
-                session_duration_mins,
-                language_usage: file_language_usage,
-                extension_usage: file_extension_usage,
-            };
-            c.insert(file, full_entry);
-        }
-
-        daily_stats
+        // The entry is the one source a slice is built from, fresh or cached:
+        // building both ways from it leaves no second definition to drift.
+        let daily_stats = daily_stats
             .into_iter()
-            .map(|(date, stats)| {
-                let is_continued = date != session_start_date;
-                (
-                    date,
-                    SessionInfo {
-                        file_path: file.to_path_buf(),
-                        project_name: project_name.clone(),
-                        verified_cwd: verified_cwd.clone(),
-                        git_branch: git_branch.clone(),
-                        session_first_timestamp: session_first,
-                        day_first_timestamp: stats.first_timestamp.unwrap_or(session_first),
-                        day_last_timestamp: stats.last_timestamp.unwrap_or(session_first),
-                        line_churn: stats.line_churn,
-                        day_input_tokens: stats.input_tokens,
-                        day_output_tokens: stats.output_tokens,
-                        day_user_msgs: stats.user_msgs,
-                        day_prompts: stats.prompts,
-                        day_assistant_msgs: stats.assistant_msgs,
-                        day_tokens_by_model: stats.tokens_by_model,
-                        day_hourly_activity: stats.hourly_activity,
-                        day_hourly_work_tokens: stats.hourly_work_activity,
-                        day_tool_usage: stats.tool_usage,
-                        day_language_usage: stats.language_usage,
-                        day_extension_usage: stats.extension_usage,
-                        summary: summary.clone(),
-                        custom_title: custom_title.clone(),
-                        ai_title: ai_title.clone(),
-                        last_user_message: last_user_message.clone(),
-                        first_user_message: first_user_message.clone(),
-                        model: model.clone(),
-                        is_subagent,
-                        parent_path: parent_path.clone(),
-                        is_continued,
-                    },
-                )
-            })
-            .collect()
+            .map(|(date, ds)| (date.to_string(), ds))
+            .collect();
+        let entry = crate::infrastructure::CachedFileStats {
+            modified_secs,
+            file_size,
+            unique_hashes: file_unique_hashes,
+            session_date: Some(session_start_date),
+            project_name: Some(project_name),
+            verified_cwd,
+            session_id: session_id_from_entries,
+            git_branch,
+            first_timestamp: Some(session_first),
+            summary,
+            custom_title,
+            ai_title,
+            last_user_message,
+            first_user_message,
+            model,
+            is_subagent,
+            daily_stats,
+        };
+        let sessions = Self::build_sessions_from_cache(file, &entry);
+        if let Some(c) = cache.as_mut() {
+            c.insert(file, entry);
+        }
+        sessions
     }
 
     fn extract_project_name_from_entries(entries: &[crate::domain::LogEntry]) -> Option<String> {
         super::extract_project_name(entries)
     }
-}
-
-/// Public-to-crate alias of [`extract_last_user_message`] so the stats path
-/// (which fills the cache) can use the same cleanup logic as the grouper.
-pub(crate) fn extract_last_user_message_for_cache(
-    entries: &[crate::domain::LogEntry],
-) -> Option<String> {
-    extract_last_user_message(entries)
-}
-
-/// Same as [`extract_last_user_message_for_cache`] but for the *first*
-/// user-role message — used as the universal title fallback so empty rows
-/// stop showing "—".
-pub(crate) fn extract_first_user_message_for_cache(
-    entries: &[crate::domain::LogEntry],
-) -> Option<String> {
-    extract_first_user_message(entries)
 }
 
 /// Title fallback. Shares the prompt test with the prompt count, so a
@@ -920,7 +860,7 @@ fn fold_session_day(
         Some(prev) if prev < s.day_first_timestamp => prev,
         _ => s.day_first_timestamp,
     });
-    cum.total_work_mins += (s.day_last_timestamp - s.day_first_timestamp).num_minutes();
+    cum.total_work_mins += s.day_duration_mins();
 }
 
 /// Subagent spend on the day `session` is a slice of.
@@ -1220,7 +1160,7 @@ mod tests {
                 }
                 um += s.day_user_msgs;
                 am += s.day_assistant_msgs;
-                wm += (s.day_last_timestamp - s.day_first_timestamp).num_minutes();
+                wm += s.day_duration_mins();
             }
         }
         assert_eq!(cum.cost, cost);
@@ -1540,43 +1480,8 @@ mod tests {
 
     fn make_cached_file_stats(daily_stats: HashMap<String, CachedDailyStats>) -> CachedFileStats {
         CachedFileStats {
-            verified_cwd: None,
-            modified_secs: 0,
-            file_size: 0,
-            entry_count: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_creation_5m_tokens: 0,
-            cache_creation_1h_tokens: 0,
-            unique_hashes: Vec::new(),
-            cache_read_tokens: 0,
-            tool_usage: HashMap::new(),
-            model_usage: HashMap::new(),
-            model_tokens: HashMap::new(),
-            session_date: None,
-            project_name: None,
-            session_id: None,
-            git_branch: None,
-            first_timestamp: None,
-            last_timestamp: None,
-            summary: None,
-            custom_title: None,
-            ai_title: None,
-            last_user_message: None,
-            first_user_message: None,
-            model: None,
-            is_subagent: false,
             daily_stats,
-            hourly_activity: HashMap::new(),
-            hourly_work_activity: HashMap::new(),
-            weekday_activity: HashMap::new(),
-            weekday_work_activity: HashMap::new(),
-            tool_error_count: 0,
-            tool_success_count: 0,
-            session_duration_mins: None,
-            language_usage: HashMap::new(),
-            extension_usage: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -1594,6 +1499,8 @@ mod tests {
             extension_usage: HashMap::new(),
             user_msgs: 0,
             prompts: 0,
+            tool_errors: 0,
+            tool_successes: 0,
             assistant_msgs: 0,
             line_churn: Default::default(),
         }
@@ -1621,14 +1528,10 @@ mod tests {
         daily_stats.insert("2026-02-25".to_string(), ds); // lint-ok: date-literal
 
         let mut cached = make_cached_file_stats(daily_stats);
-        cached.entry_count = 10;
-        cached.input_tokens = 1000;
-        cached.output_tokens = 500;
         cached.session_date = Some(NaiveDate::from_ymd_opt(2026, 2, 25).unwrap()); // lint-ok: date-literal
         cached.project_name = Some("~/projects/test".to_string());
         cached.git_branch = Some("main".to_string());
         cached.first_timestamp = Some(chrono::Utc::now());
-        cached.last_timestamp = Some(chrono::Utc::now());
         cached.summary = Some("test summary".to_string());
         cached.model = Some("claude-sonnet-4".to_string());
 
@@ -1761,6 +1664,31 @@ mod tests {
         assert!(!session.is_subagent);
     }
 
+    // The entry records the stamp taken before the read, not one taken after:
+    // a line appended mid-parse must leave the entry stale, not covered.
+    #[test]
+    fn the_cache_entry_records_the_pre_parse_stamp() {
+        let path =
+            std::env::temp_dir().join(format!("ccsight_stamp_test_{}.jsonl", std::process::id()));
+        let line = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-02-25T10:01:00Z",
+            "message": {"role": "assistant", "content": "hi", "usage": {"input_tokens": 1, "output_tokens": 1}}
+        });
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let mut cache = Some(crate::infrastructure::Cache::new_empty());
+        let _ = DailyGrouper::parse_and_build_sessions_stamped(
+            &path,
+            (7, 3),
+            &mut cache,
+            &mut std::collections::HashSet::new(),
+        );
+        let entry = cache.as_ref().and_then(|c| c.get(&path)).cloned();
+        std::fs::remove_file(&path).ok();
+        let entry = entry.expect("an entry is written");
+        assert_eq!((entry.modified_secs, entry.file_size), (7, 3));
+    }
+
     #[test]
     fn parse_and_build_sessions_writes_full_cache_entry() {
         use std::io::Write;
@@ -1807,11 +1735,10 @@ mod tests {
             !entry.daily_stats.is_empty(),
             "per-day stats must be populated"
         );
-        // Per-FILE rollups are derived from daily_stats so Stats and
-        // DailyGrouper share the same cache.
-        assert_eq!(entry.input_tokens, 100);
-        assert_eq!(entry.output_tokens, 50);
-        assert_eq!(entry.entry_count, 2);
+        let day_sum =
+            |f: fn(&CachedDailyStats) -> u64| entry.daily_stats.values().map(f).sum::<u64>();
+        assert_eq!(day_sum(|d| d.input_tokens), 100);
+        assert_eq!(day_sum(|d| d.output_tokens), 50);
     }
 
     // A fork or continuation copies its parent session's tool results — same
@@ -1835,7 +1762,7 @@ mod tests {
 
     #[test]
     fn a_tool_result_copied_into_another_file_counts_its_churn_once() {
-        use crate::aggregator::StatsAggregator;
+        use crate::aggregator::Stats;
         use crate::infrastructure::Cache;
         let dir = std::env::temp_dir().join(format!("ccsight-churn-dup-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -1865,10 +1792,6 @@ mod tests {
             removed: 2,
         };
 
-        let (stats, _, cache) =
-            StatsAggregator::aggregate_with_shared_cache(&files, Cache::new_empty());
-        assert_eq!(stats.line_churn, expected, "stats path, cold");
-
         let grouped_churn = |groups: &[DailyGroup]| {
             let mut c = crate::domain::LineChurn::default();
             for s in groups.iter().flat_map(|g| g.sessions.iter()) {
@@ -1876,61 +1799,67 @@ mod tests {
             }
             c
         };
-        let cold =
-            DailyGrouper::group_by_date_with_shared_cache(&files, &mut Some(Cache::new_empty()));
-        assert_eq!(grouped_churn(&cold), expected, "grouper path, cold");
+        let mut cache = Some(Cache::new_empty());
+        let cold = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
+        assert_eq!(grouped_churn(&cold), expected, "cold");
+        assert_eq!(
+            Stats::from_groups(&cold).line_churn,
+            expected,
+            "folded totals"
+        );
 
         // Warm: every file is a cache hit, restored from `unique_hashes`.
-        let (warm_stats, _, cache) = StatsAggregator::aggregate_with_shared_cache(&files, cache);
-        assert_eq!(warm_stats.line_churn, expected, "stats path, warm");
-        let warm = DailyGrouper::group_by_date_with_shared_cache(&files, &mut Some(cache));
-        assert_eq!(grouped_churn(&warm), expected, "grouper path, warm");
+        let warm = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
+        assert_eq!(grouped_churn(&warm), expected, "warm");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The pre-load and the walk must agree on which files are cache hits. A
-    // valid entry the walk still re-parses (here: one with no per-day stats)
-    // had its own hashes pre-loaded and was then parsed against them, so the
-    // file credited itself nothing. The same split opened on a timing window
-    // for any file appended to mid-pass, and cached the zero.
+    // file appended to after its entry was written is re-parsed; had its own
+    // hashes been pre-loaded, it would be parsed against them and credit
+    // itself nothing — and cache the zero.
     #[test]
     fn a_reparsed_file_is_not_deduped_against_its_own_cached_hashes() {
-        use crate::aggregator::StatsAggregator;
         use crate::infrastructure::Cache;
         let dir = std::env::temp_dir().join(format!("ccsight-selfdedup-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("s.jsonl");
-        let line = serde_json::json!({
-            "type": "assistant", "uuid": "u1", "requestId": "r1",
-            "timestamp": "2026-02-25T10:00:00Z", "cwd": "/tmp/proj", "sessionId": "s",
-            "message": {"id": "m1", "role": "assistant", "model": "claude-opus-5",
-                "content": "hi", "usage": {"input_tokens": 100, "output_tokens": 50}}
-        });
-        std::fs::write(&file, line.to_string() + "\n").unwrap();
+        let line = |id: &str, out: u64| {
+            serde_json::json!({
+                "type": "assistant", "uuid": id, "requestId": id,
+                "timestamp": "2026-02-25T10:00:00Z", "cwd": "/tmp/proj", "sessionId": "s",
+                "message": {"id": id, "role": "assistant", "model": "claude-opus-5",
+                    "content": "hi", "usage": {"input_tokens": 1, "output_tokens": out}}
+            })
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(&file, line("m1", 50)).unwrap();
         let files = vec![file.clone()];
-
-        let (_, _, mut cache) =
-            StatsAggregator::aggregate_with_shared_cache(&files, Cache::new_empty());
-        let mut entry = cache.get(&file).cloned().expect("entry written");
+        let mut cache = Some(Cache::new_empty());
+        let _ = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
+        let entry = cache
+            .as_ref()
+            .and_then(|c| c.get(&file))
+            .expect("entry written");
         assert!(
             !entry.unique_hashes.is_empty(),
             "fixture must carry a dedup hash"
         );
-        entry.daily_stats.clear();
-        cache.insert(&file, entry);
 
-        let groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut Some(cache));
+        std::fs::write(&file, line("m1", 50) + &line("m2", 7)).unwrap();
+        let groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
         let output: u64 = groups
             .iter()
             .flat_map(|g| g.sessions.iter())
             .map(|s| s.day_output_tokens)
             .sum();
-        assert_eq!(output, 50, "the file was deduped against its own hashes");
+        assert_eq!(output, 57, "the file was deduped against its own hashes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn cache_round_trip_dailygrouper_to_stats_matches_fresh_parse() {
+    fn a_cache_entry_rebuilds_the_slices_its_fresh_parse_built() {
         use std::io::Write;
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2004,9 +1933,9 @@ mod tests {
             }
         }
 
-        // Path 1: DailyGrouper parses, writes cache entry.
+        // Path 1: a fresh parse builds the slices and writes the cache entry.
         let mut cache_a = Some(crate::infrastructure::Cache::new_empty());
-        let _ = DailyGrouper::parse_and_build_sessions(
+        let fresh = DailyGrouper::parse_and_build_sessions(
             &path,
             &mut cache_a,
             &mut std::collections::HashSet::new(),
@@ -2018,26 +1947,25 @@ mod tests {
             .expect("grouper entry")
             .clone();
 
-        // Path 2: Stats parses the same file from scratch. The returned
-        // cache carries the freshly written entry, so the cross-check is
-        // hermetic (no dependency on a real ~/.ccsight cache).
-        let (_stats, _, cache_b) = StatsAggregator::aggregate_with_shared_cache(
-            std::slice::from_ref(&path),
-            crate::infrastructure::Cache::new_empty(),
-        );
-        let entry_from_stats = cache_b.get(&path).cloned();
+        // Path 2: the same slices rebuilt from that entry alone.
+        let rebuilt = DailyGrouper::build_sessions_from_cache(&path, &entry_from_grouper);
 
         std::fs::remove_file(&path).ok();
 
-        // Per-FILE rollups must reflect tool counts even when only the
-        // DailyGrouper wrote the entry — Stats's reader path depends on
-        // these fields.
-        assert_eq!(entry_from_grouper.tool_success_count, 1);
-        assert_eq!(entry_from_grouper.tool_error_count, 1);
-        assert_eq!(entry_from_grouper.input_tokens, 100);
-        assert_eq!(entry_from_grouper.output_tokens, 50);
-        assert_eq!(entry_from_grouper.cache_creation_tokens, 200);
-        assert_eq!(entry_from_grouper.cache_read_tokens, 300);
+        // The day slices carry the usage the file's entries billed.
+        let usage = entry_from_grouper
+            .daily_stats
+            .values()
+            .flat_map(|d| d.tokens_by_model.values())
+            .fold((0, 0, 0, 0), |a, t| {
+                (
+                    a.0 + t.input_tokens,
+                    a.1 + t.output_tokens,
+                    a.2 + t.cache_creation_tokens,
+                    a.3 + t.cache_read_tokens,
+                )
+            });
+        assert_eq!(usage, (100, 50, 200, 300));
         // The grouper wrote this entry cold; the churn it persisted has to be
         // the real count, not the default a forgotten accumulator leaves.
         assert_eq!(
@@ -2064,39 +1992,46 @@ mod tests {
             1,
             "DailyGrouper persisted prompts"
         );
-        assert_eq!(entry_from_grouper.weekday_activity.len(), 1);
-        assert!(
-            entry_from_grouper
-                .model_usage
-                .contains_key("claude-sonnet-4-20250514")
+        // Tool results land on their day, so a filtered view can count them.
+        let results = |e: &crate::infrastructure::CachedFileStats| {
+            e.daily_stats
+                .values()
+                .map(|d| (d.tool_successes, d.tool_errors))
+                .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        };
+        assert_eq!(
+            results(&entry_from_grouper),
+            (1, 1),
+            "DailyGrouper per-day tool results"
         );
 
-        // Cross-path comparison when Stats's cache landed on disk.
-        if let Some(stats_entry) = entry_from_stats {
-            assert_eq!(
-                prompts(&stats_entry),
-                1,
-                "StatsAggregator persisted prompts"
-            );
-            assert_eq!(
-                stats_entry.tool_success_count,
-                entry_from_grouper.tool_success_count
-            );
-            assert_eq!(
-                stats_entry.tool_error_count,
-                entry_from_grouper.tool_error_count
-            );
-            assert_eq!(stats_entry.input_tokens, entry_from_grouper.input_tokens);
-            assert_eq!(stats_entry.output_tokens, entry_from_grouper.output_tokens);
-            assert_eq!(
-                stats_entry.cache_creation_tokens,
-                entry_from_grouper.cache_creation_tokens
-            );
-            assert_eq!(
-                stats_entry.cache_read_tokens,
-                entry_from_grouper.cache_read_tokens
-            );
-        }
+        // Every per-day figure a view reads survives the round trip.
+        let figures = |v: &[(NaiveDate, SessionInfo)]| {
+            v.iter()
+                .map(|(d, s)| {
+                    (
+                        *d,
+                        s.day_input_tokens,
+                        s.day_output_tokens,
+                        s.day_prompts,
+                        s.day_user_msgs,
+                        s.day_assistant_msgs,
+                        s.day_tool_errors,
+                        s.day_tool_successes,
+                        s.line_churn,
+                        s.day_tool_usage
+                            .clone()
+                            .into_iter()
+                            .collect::<std::collections::BTreeMap<_, _>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            figures(&fresh),
+            figures(&rebuilt),
+            "a cache rebuild diverged"
+        );
     }
 
     #[test]
@@ -2147,6 +2082,41 @@ mod tests {
         assert_eq!(
             sessions[0].1.parent_path,
             Some(std::env::temp_dir().join("parent-id.jsonl"))
+        );
+    }
+
+    #[test]
+    fn one_unpriced_slice_leaves_the_rest_of_its_models_cost_counted() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let today = chrono::Local::now().date_naive();
+        let priced = make_session_with_tokens("p", 1_000_000, 0, "claude-opus-4-6");
+        let mut fast = priced.clone();
+        fast.file_path = PathBuf::from("/tmp/test/fast.jsonl");
+        if let Some(t) = fast.day_tokens_by_model.get_mut("claude-opus-4-6") {
+            t.non_standard_speed = true;
+        }
+        let expected = priced.cost(crate::aggregator::CostCalculator::global());
+        assert!(expected > 0.0);
+        let groups = vec![
+            make_daily_group(today, vec![priced]),
+            make_daily_group(today - chrono::Duration::days(1), vec![fast]),
+        ];
+        let costs = cost_summary(&groups);
+        assert!(
+            (costs.total - expected).abs() < 1e-9,
+            "total {}",
+            costs.total
+        );
+        assert_eq!(costs.by_model.len(), 1);
+        assert!(
+            (costs.by_model[0].1 - expected).abs() < 1e-9,
+            "per-model {:?}",
+            costs.by_model
+        );
+        let day_sum: f64 = costs.daily.iter().map(|(_, c)| c).sum();
+        assert!(
+            (day_sum - costs.total).abs() < 1e-9,
+            "rows sum to the total"
         );
     }
 

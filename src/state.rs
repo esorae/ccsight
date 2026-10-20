@@ -149,6 +149,16 @@ impl Tab {
     pub const ALL: [Tab; 4] = [Tab::Dashboard, Tab::Daily, Tab::Insights, Tab::Live];
 }
 
+/// The Daily panel Enter acts on. ↑ past the first session climbs to the
+/// Breakdown, then the Activity chart; ↓ comes back down the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DailyPanel {
+    #[default]
+    Sessions,
+    Breakdown,
+    Activity,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ConvListMode {
     Day,
@@ -173,19 +183,34 @@ pub enum LivePaneMode {
 /// Where closing the title editor lands. Not `Box<ActivePopup>`: only
 /// popups that offer `t` are valid return targets, and the closed set
 /// keeps restore trivially correct.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TitleEditReturn {
     #[default]
     Root,
-    Detail,
+    Detail(Option<DetailBack>),
     Summary,
+}
+
+/// The popup a session's detail was opened from, where it stood, so closing
+/// the detail lands back on the same row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailBack {
+    DayActivity {
+        scroll: usize,
+        cursor: usize,
+    },
+    ProjectDetail {
+        path: String,
+        scroll: usize,
+        cursor: usize,
+    },
 }
 
 impl TitleEditReturn {
     pub(crate) fn restore(self) -> ActivePopup {
         match self {
             TitleEditReturn::Root => ActivePopup::None,
-            TitleEditReturn::Detail => ActivePopup::Detail,
+            TitleEditReturn::Detail(back) => ActivePopup::Detail { back },
             TitleEditReturn::Summary => ActivePopup::Summary { scroll: 0 },
         }
     }
@@ -206,9 +231,11 @@ pub enum ActivePopup {
     Help {
         scroll: u16,
     },
+    /// `cursor` picks a row of the project's sessions; `scroll` follows it.
     ProjectDetail {
         path: String,
         scroll: usize,
+        cursor: usize,
     },
     /// Body scroll only — `summary_content` / `summary_type` stay on
     /// AppState: they cache an AI generation (real API cost) that must
@@ -216,10 +243,19 @@ pub enum ActivePopup {
     Summary {
         scroll: usize,
     },
-    Detail,
+    /// `back` is set when the Activity popup opened it: closing returns there.
+    Detail {
+        back: Option<DetailBack>,
+    },
     DashboardDetail,
     InsightsDetail {
         scroll: usize,
+    },
+    /// The Daily day's activity: the day against its usual weekday, and each
+    /// session's hours. `cursor` picks a session row; `scroll` follows it.
+    DayActivity {
+        scroll: usize,
+        cursor: usize,
     },
     FilterPopup {
         selected: usize,
@@ -576,8 +612,6 @@ impl RankSort {
 }
 
 pub const MAX_PANES: usize = 4;
-pub const MIN_PANE_WIDTH: u16 = 40;
-pub const SESSION_LIST_WIDTH: u16 = 28;
 pub const SCROLL_LINES: usize = 5;
 
 pub struct ConversationPane {
@@ -593,6 +627,10 @@ pub struct ConversationPane {
     pub reload_check: Option<std::time::Instant>,
     pub loading: bool,
     pub load_task: Option<mpsc::Receiver<std::sync::Arc<Vec<ConversationMessage>>>>,
+    /// Bytes of the transcript the load task has read so far, out of
+    /// `load_total` (its size when the load started): the loading view's progress.
+    pub load_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub load_total: u64,
     pub last_width: Option<u16>,
     pub selected_message: usize,
     pub focused_timestamp: Option<String>,
@@ -630,6 +668,9 @@ pub struct ConversationPane {
     /// Hash of the inputs the last `rendered` cache was built from (mode,
     /// expanded set, focused message). The draw re-renders when it changes.
     pub rendered_sig: u64,
+    /// The view sat at the transcript's end when a reload began: the next
+    /// draw scrolls to the new end, so a growing session stays followed.
+    pub follow_tail: bool,
 }
 
 // Manual `Default` (not derived) solely so `compact` starts `true`: compact is
@@ -648,6 +689,8 @@ impl Default for ConversationPane {
             reload_check: None,
             loading: false,
             load_task: None,
+            load_read: std::sync::Arc::default(),
+            load_total: 0,
             last_width: None,
             selected_message: 0,
             focused_timestamp: None,
@@ -664,6 +707,7 @@ impl Default for ConversationPane {
             search_select_all: false,
             last_visible_height: None,
             rendered_sig: 0,
+            follow_tail: false,
         }
     }
 }
@@ -673,12 +717,22 @@ impl ConversationPane {
     /// responsible for polling `load_task`.
     pub(crate) fn load_from(file_path: &std::path::Path) -> Self {
         let mut pane = Self::default();
-        pane.load_task = Some(crate::handlers::pane::spawn_load_conversation(file_path));
-        pane.loading = true;
+        pane.start_load(file_path);
         pane.scroll = usize::MAX;
         pane.file_path = Some(file_path.to_path_buf());
         pane.last_modified = std::fs::metadata(file_path).and_then(|m| m.modified()).ok();
         pane
+    }
+
+    /// Starts a background (re)load of `file_path` with fresh progress.
+    pub(crate) fn start_load(&mut self, file_path: &std::path::Path) {
+        self.load_read = std::sync::Arc::default();
+        self.load_total = std::fs::metadata(file_path).map_or(0, |m| m.len());
+        self.load_task = Some(crate::handlers::pane::spawn_load_conversation(
+            file_path,
+            std::sync::Arc::clone(&self.load_read),
+        ));
+        self.loading = true;
     }
 
     pub fn clear(&mut self) {
@@ -699,6 +753,7 @@ impl ConversationPane {
         self.search_matches.clear();
         self.search_current = 0;
         self.last_visible_height = None;
+        self.follow_tail = false;
         self.search_saved_scroll = None;
         self.expanded.clear();
         self.peek_expanded = None;
@@ -718,7 +773,6 @@ pub struct LoadedData {
     pub(crate) models_without_pricing: std::collections::HashSet<String>,
     pub(crate) daily_groups: Vec<DailyGroup>,
     pub(crate) daily_costs: Vec<(NaiveDate, f64)>,
-    pub(crate) file_count: usize,
     pub(crate) cache_stats: CacheStats,
 }
 
@@ -748,6 +802,10 @@ pub struct LayoutAreas {
     /// list position. Click selects the row; second click (or Enter) opens
     /// the per-project detail popup.
     pub project_detail_row_areas: Vec<(usize, ratatui::layout::Rect)>,
+    /// `(cursor index, area)` of each visible session row in a popup with a
+    /// session cursor (Day activity, Project detail). A click moves the
+    /// cursor there; a double-click opens it as Enter does.
+    pub cursor_row_areas: Vec<(usize, ratatui::layout::Rect)>,
     pub pane_areas: Vec<ratatui::layout::Rect>,
     pub dashboard_panel_areas: Vec<ratatui::layout::Rect>,
     pub insights_panel_areas: Vec<ratatui::layout::Rect>,
@@ -760,6 +818,7 @@ pub struct LayoutAreas {
     /// session index is `live_active.len() + row`. `None` in past view.
     pub live_paused_list_area: Option<(ratatui::layout::Rect, usize)>,
     pub breakdown_panel_area: Option<ratatui::layout::Rect>,
+    pub activity_panel_area: Option<ratatui::layout::Rect>,
     pub summary_popup_area: Option<ratatui::layout::Rect>,
     pub active_popup_area: Option<ratatui::layout::Rect>,
     pub daily_header_area: Option<ratatui::layout::Rect>,
@@ -870,14 +929,14 @@ pub struct AppState {
     pub show_conversation: bool,
     pub summary_content: String,
     pub summary_type: Option<SummaryType>,
-    pub daily_breakdown_focus: bool,
+    pub daily_breakdown_open: bool,
+    pub daily_panel: DailyPanel,
     pub daily_breakdown_scroll: usize,
     pub daily_breakdown_max_scroll: usize,
     pub generating_summary: bool,
     pub summary_task: Option<mpsc::Receiver<String>>,
     pub loading: bool,
     pub error: Option<String>,
-    pub file_count: usize,
     pub cache_stats: Option<CacheStats>,
     pub dashboard_panel: usize,
     pub dashboard_scroll: [usize; 7],
@@ -923,6 +982,9 @@ pub struct AppState {
     pub searching: bool,
     pub search_preview_mode: bool,
     pub search_saved_state: Option<(Tab, usize, usize, bool)>,
+    /// A result the cursor was on before a reload rebuilt the list, still
+    /// to come back with the content hits.
+    pub search_reselect: Option<std::path::PathBuf>,
     /// Persisted query history. ↑/↓ in search mode walks past entries;
     /// Enter (commit) appends the current input.
     pub search_history: crate::search_history::SearchHistory,
@@ -947,13 +1009,7 @@ pub struct AppState {
     pub mouse_down_pos: Option<(u16, u16)>,
     pub screen_buffer: Option<ratatui::buffer::Buffer>,
     pub updating_session: Option<(usize, usize)>,
-    pub updating_task: Option<(
-        mpsc::Receiver<Result<String, String>>,
-        PathBuf,
-        usize,
-        usize,
-        usize,
-    )>,
+    pub updating_task: Option<(mpsc::Receiver<Result<String, String>>, PathBuf)>,
     pub last_data_update: Option<std::time::Instant>,
     /// When the last successful tantivy build/incremental update finished.
     /// Throttles `start_index_build` so an actively-growing session JSONL
@@ -987,8 +1043,6 @@ pub struct AppState {
     pub session_list_hidden: bool,
     pub layout: LayoutAreas,
     pub period_filter: PeriodFilter,
-    /// Free-text buffer for the `TitleEdit` popup, and the target session's
-    /// JSONL path (the `custom-title` write is keyed by its filename stem).
     pub project_filter: Option<String>,
     pub project_list: Vec<(String, u64, NaiveDate)>,
     /// Pre-computed disambiguated display labels keyed by full project_name.
@@ -1013,6 +1067,9 @@ pub struct AppState {
     /// Sort mode for the Dashboard Models panel + detail popup. Same toggle
     /// semantics as `dashboard_projects_sort`, scoped to panel 2.
     pub dashboard_models_sort: RankSort,
+    /// First model row the Models detail table shows. Apart from the cursor
+    /// (`dashboard_scroll[2]`): the view moves only when the cursor leaves it.
+    pub models_detail_offset: usize,
     /// Sort mode for the Dashboard Ecosystem detail popup (panel 3) — all
     /// tabs' item lists and the MCP server rows. `Recency` ranks by
     /// last-used (default); the magnitude variant ranks by call count.
@@ -1097,6 +1154,11 @@ impl AppState {
         path.is_dir().then(|| path.clone())
     }
 
+    /// The focused conversation pane, if any.
+    pub(crate) fn active_pane_mut(&mut self) -> Option<&mut ConversationPane> {
+        self.active_pane_index.and_then(|i| self.panes.get_mut(i))
+    }
+
     /// Show a transient toast. Sets message and timestamp together so a caller
     /// can't leave `toast_time` unset (which would strand the toast on screen).
     pub fn toast(&mut self, msg: impl Into<String>) {
@@ -1128,6 +1190,17 @@ impl AppState {
     pub(crate) fn set_project_detail_scroll(&mut self, scroll: usize) {
         if let ActivePopup::ProjectDetail { scroll: s, .. } = &mut self.active_popup {
             *s = scroll;
+        }
+    }
+    pub(crate) fn project_detail_cursor(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::ProjectDetail { cursor, .. } => *cursor,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_project_detail_cursor(&mut self, cursor: usize) {
+        if let ActivePopup::ProjectDetail { cursor: c, .. } = &mut self.active_popup {
+            *c = cursor;
         }
     }
     pub(crate) fn project_popup_selected(&self) -> usize {
@@ -1172,6 +1245,28 @@ impl AppState {
     pub(crate) fn set_insights_detail_scroll(&mut self, scroll: usize) {
         if let ActivePopup::InsightsDetail { scroll: s } = &mut self.active_popup {
             *s = scroll;
+        }
+    }
+    pub(crate) fn day_activity_scroll(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::DayActivity { scroll, .. } => *scroll,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_day_activity_scroll(&mut self, scroll: usize) {
+        if let ActivePopup::DayActivity { scroll: s, .. } = &mut self.active_popup {
+            *s = scroll;
+        }
+    }
+    pub(crate) fn day_activity_cursor(&self) -> usize {
+        match &self.active_popup {
+            ActivePopup::DayActivity { cursor, .. } => *cursor,
+            _ => 0,
+        }
+    }
+    pub(crate) fn set_day_activity_cursor(&mut self, cursor: usize) {
+        if let ActivePopup::DayActivity { cursor: c, .. } = &mut self.active_popup {
+            *c = cursor;
         }
     }
     pub(crate) fn filter_popup_selected(&self) -> usize {
@@ -1243,13 +1338,39 @@ impl AppState {
         matches!(self.active_popup, ActivePopup::Summary { .. })
     }
     pub fn show_detail(&self) -> bool {
-        self.active_popup == ActivePopup::Detail
+        matches!(self.active_popup, ActivePopup::Detail { .. })
+    }
+    /// Closes the session detail, back to the Activity popup it came from.
+    pub(crate) fn close_detail(&mut self) {
+        self.active_popup = match std::mem::take(&mut self.active_popup) {
+            ActivePopup::Detail {
+                back: Some(DetailBack::DayActivity { scroll, cursor }),
+            } => ActivePopup::DayActivity { scroll, cursor },
+            ActivePopup::Detail {
+                back:
+                    Some(DetailBack::ProjectDetail {
+                        path,
+                        scroll,
+                        cursor,
+                    }),
+            } => ActivePopup::ProjectDetail {
+                path,
+                scroll,
+                cursor,
+            },
+            _ => ActivePopup::None,
+        };
+        self.session_detail_override = None;
+        self.session_detail_live_extra = None;
     }
     pub fn show_dashboard_detail(&self) -> bool {
         self.active_popup == ActivePopup::DashboardDetail
     }
     pub fn show_insights_detail(&self) -> bool {
         matches!(self.active_popup, ActivePopup::InsightsDetail { .. })
+    }
+    pub fn show_day_activity(&self) -> bool {
+        matches!(self.active_popup, ActivePopup::DayActivity { .. })
     }
     pub fn show_filter_popup(&self) -> bool {
         matches!(self.active_popup, ActivePopup::FilterPopup { .. })
@@ -1306,11 +1427,26 @@ impl AppState {
         matches!(self.active_popup, ActivePopup::ProjectPopup { .. })
     }
 
+    /// When the view's MCP servers are judged stale; see `stale_reference`.
+    pub(crate) fn stale_reference(&self) -> chrono::DateTime<chrono::Utc> {
+        crate::infrastructure::stale_reference(self.period_filter.date_range().1)
+    }
+
     /// Single source of truth for "active days" — calendar days with at
     /// least one billable-token session. Matches the Costs panel ratio
     /// and the Overview headline so all surfaces agree.
     pub(crate) fn active_days(&self) -> usize {
         self.daily_costs.len()
+    }
+
+    /// Days from the view's first active day through `today`, idle days
+    /// included: the divisor every per-day average uses.
+    pub(crate) fn calendar_days(&self, today: chrono::NaiveDate) -> usize {
+        self.daily_groups
+            .iter()
+            .map(|g| g.date)
+            .min()
+            .map_or(1, |first| (today - first).num_days().max(0) as usize + 1)
     }
 
     /// Project filter popup row order — follows the same sort mode as the
@@ -1507,14 +1643,14 @@ impl AppState {
             show_conversation: false,
             summary_content: String::new(),
             summary_type: None,
-            daily_breakdown_focus: false,
+            daily_breakdown_open: false,
+            daily_panel: DailyPanel::Sessions,
             daily_breakdown_scroll: 0,
             daily_breakdown_max_scroll: 0,
             generating_summary: false,
             summary_task: None,
             loading: true,
             error: None,
-            file_count: 0,
             cache_stats: None,
             dashboard_panel: 0,
             dashboard_scroll: [0; 7],
@@ -1534,6 +1670,7 @@ impl AppState {
             searching: false,
             search_preview_mode: false,
             search_saved_state: None,
+            search_reselect: None,
             search_history: crate::search_history::SearchHistory::load(),
             mcp_status: Vec::new(),
             configured_resources: crate::infrastructure::ConfiguredResources::default(),
@@ -1581,6 +1718,7 @@ impl AppState {
             original_aggregated_model_tokens: std::collections::HashMap::new(),
             dashboard_projects_sort: RankSort::default(),
             dashboard_models_sort: RankSort::default(),
+            models_detail_offset: 0,
             dashboard_ecosystem_sort: RankSort::default(),
             dashboard_languages_sort: RankSort::default(),
         }
@@ -1624,7 +1762,6 @@ impl AppState {
         self.models_without_pricing = data.models_without_pricing;
         self.daily_groups = data.daily_groups;
         self.daily_costs = data.daily_costs;
-        self.file_count = data.file_count;
         self.cache_stats = Some(data.cache_stats);
         self.last_data_update = Some(std::time::Instant::now());
         self.mcp_status = crate::infrastructure::compute_mcp_status(&self.original_daily_groups);
@@ -1703,70 +1840,24 @@ impl AppState {
             }
             self.daily_groups = groups;
 
-            if has_project || has_pinned {
-                // Recompute from the filtered `daily_groups` because both
-                // filters retain only a subset of sessions per day; using
-                // `original_daily_costs` filtered by date range only would
-                // sum every session that day even when most don't match.
-                let calculator = CostCalculator::global();
-                let mut date_cost: std::collections::HashMap<NaiveDate, f64> =
-                    std::collections::HashMap::new();
-                for group in &self.daily_groups {
-                    for session in &group.sessions {
-                        for (model, tokens) in &session.day_tokens_by_model {
-                            *date_cost.entry(group.date).or_insert(0.0) += calculator
-                                .calculate_cost(tokens, Some(model))
-                                .unwrap_or(0.0);
-                        }
-                    }
-                }
-                let mut costs: Vec<_> = date_cost.into_iter().collect();
-                costs.sort_by_key(|c| std::cmp::Reverse(c.0));
-                self.daily_costs = costs;
-            } else {
-                self.daily_costs = self
-                    .original_daily_costs
-                    .iter()
-                    .filter(|(date, _)| in_range(date))
-                    .copied()
-                    .collect();
-            }
-
-            self.total_cost = self.daily_costs.iter().map(|(_, c)| c).sum();
-
-            let calculator = CostCalculator::global();
-            let mut all_model_tokens: std::collections::HashMap<String, TokenStats> =
-                std::collections::HashMap::new();
-            // Include subagent tokens — same scope as `daily_costs` (cost
-            // accounting is subagent-inclusive after 1.1.0). Without this
-            // a model used only inside subagents would silently drop out of
-            // `aggregated_model_tokens` / `models_without_pricing` whenever
-            // a project filter is applied, contradicting the unfiltered view.
-            for group in &self.daily_groups {
-                for session in &group.sessions {
-                    for (model, tokens) in &session.day_tokens_by_model {
-                        // merge() carries the 5m/1h cache split — calculate_cost
-                        // prices those (no fallback to the flat total), so a
-                        // hand-rolled 4-field fold would zero the cache-write
-                        // cost for every model.
-                        all_model_tokens
-                            .entry(model.clone())
-                            .or_default()
-                            .merge(tokens);
-                    }
-                }
-            }
-            self.model_costs = calculator.calculate_costs_by_model(&all_model_tokens);
-            self.aggregated_model_tokens =
-                CostCalculator::aggregate_tokens_by_model(&all_model_tokens);
-            self.models_without_pricing = calculator.models_without_pricing(&all_model_tokens);
-
+            // Every figure folds the filtered slices, so a project or pin
+            // filter (which keeps only some of a day's sessions) prices only
+            // what it kept.
             self.rebuild_filtered_stats();
+            let costs = crate::aggregator::cost_summary(&self.daily_groups);
+            self.daily_costs = costs.daily;
+            self.total_cost = costs.total;
+            self.model_costs = costs.by_model;
+            let calculator = CostCalculator::global();
+            self.aggregated_model_tokens =
+                CostCalculator::aggregate_tokens_by_model(&self.stats.model_tokens);
+            self.models_without_pricing =
+                calculator.models_without_pricing(&self.stats.model_tokens);
         }
 
-        // Compute against unfiltered groups so "stale (≥30d)" stays a
-        // wall-clock predicate regardless of the active period filter.
-        self.mcp_status = crate::infrastructure::compute_mcp_status(&self.original_daily_groups);
+        // The view's own calls and last uses; staleness is then judged at the
+        // view's end (`stale_reference`), so a past range is not all stale.
+        self.mcp_status = crate::infrastructure::compute_mcp_status(&self.daily_groups);
 
         if self.selected_day >= self.daily_groups.len() {
             self.selected_day = self.daily_groups.len().saturating_sub(1);
@@ -1780,114 +1871,7 @@ impl AppState {
     }
 
     fn rebuild_filtered_stats(&mut self) {
-        use chrono::Datelike;
-        let mut stats = Stats::default();
-        // `daily_groups` repeats a session once per active day. `total_sessions_count`
-        // is a distinct-session count (matching the unfiltered StatsAggregator), so
-        // dedup by path; `total_session_days` and tool adoption stay per-day (their
-        // denominators are session-days).
-        let mut seen_paths: std::collections::HashSet<&std::path::PathBuf> =
-            std::collections::HashSet::new();
-
-        for group in &self.daily_groups {
-            for session in &group.sessions {
-                // Subagent rule (matches unfiltered StatsAggregator): only
-                // counts exclude subagents; tokens / model / activity /
-                // project / tool / language are subagent-inclusive so
-                // filtered totals reconcile with subagent-inclusive cost.
-                let first_sighting = !session.is_subagent && seen_paths.insert(&session.file_path);
-                if !session.is_subagent {
-                    stats.total_session_days += 1;
-                    if first_sighting {
-                        stats.total_sessions_count += 1;
-                    }
-                    crate::aggregator::StatsAggregator::add_session_adoption(
-                        &mut stats,
-                        session.day_tool_usage.keys(),
-                    );
-                }
-                // Every session, subagents included: the scope `tool_usage`
-                // counts calls in, as the unfiltered aggregation uses.
-                crate::aggregator::StatsAggregator::add_tool_sessions(
-                    &mut stats,
-                    session.day_tool_usage.keys(),
-                );
-
-                let work_tokens = session.work_tokens();
-                stats.line_churn.add(session.line_churn);
-                stats.total_tokens.input_tokens += session.day_input_tokens;
-                stats.total_tokens.output_tokens += session.day_output_tokens;
-
-                for (model, tokens) in &session.day_tokens_by_model {
-                    stats
-                        .model_tokens
-                        .entry(model.clone())
-                        .or_default()
-                        .merge(tokens);
-
-                    stats.total_tokens.cache_creation_tokens += tokens.cache_creation_tokens;
-                    stats.total_tokens.cache_creation_5m_tokens += tokens.cache_creation_5m_tokens;
-                    stats.total_tokens.cache_creation_1h_tokens += tokens.cache_creation_1h_tokens;
-                    stats.total_tokens.cache_read_tokens += tokens.cache_read_tokens;
-
-                    *stats.model_usage.entry(model.clone()).or_insert(0) += 1;
-                }
-
-                *stats.daily_activity.entry(group.date).or_insert(0) += session.day_input_tokens
-                    + session.day_output_tokens
-                    + session
-                        .day_tokens_by_model
-                        .values()
-                        .map(|t| t.cache_creation_tokens + t.cache_read_tokens)
-                        .sum::<u64>();
-                *stats.daily_work_activity.entry(group.date).or_insert(0) += work_tokens;
-
-                for (hour, tokens) in &session.day_hourly_activity {
-                    *stats.hourly_activity.entry(*hour).or_insert(0) += tokens;
-                }
-                for (hour, tokens) in &session.day_hourly_work_tokens {
-                    *stats.hourly_work_activity.entry(*hour).or_insert(0) += tokens;
-                }
-
-                let weekday = group.date.weekday();
-                *stats.weekday_activity.entry(weekday).or_insert(0) += work_tokens;
-                *stats.weekday_work_activity.entry(weekday).or_insert(0) += work_tokens;
-
-                let project_stats = stats
-                    .project_stats
-                    .entry(session.project_name.clone())
-                    .or_default();
-                // Distinct user sessions, as the unfiltered aggregation counts.
-                project_stats.sessions += usize::from(first_sighting);
-                project_stats.work_tokens += work_tokens;
-                project_stats.tokens += work_tokens;
-
-                for (tool, count) in &session.day_tool_usage {
-                    *stats.tool_usage.entry(tool.clone()).or_insert(0) += count;
-                }
-                for (lang, count) in &session.day_language_usage {
-                    *stats.language_usage.entry(lang.clone()).or_insert(0) += count;
-                }
-                for (ext, count) in &session.day_extension_usage {
-                    *stats.extension_usage.entry(ext.clone()).or_insert(0) += count;
-                }
-            }
-        }
-
-        // tool_error/success counts are file-level aggregates not available
-        // per-session, so we use unfiltered values as approximation. When the
-        // filter resolves to zero sessions, the unfiltered numbers would
-        // render against an empty view; zero them so the success-rate row
-        // stays consistent with the rest of the metrics.
-        if self.daily_groups.is_empty() {
-            stats.tool_error_count = 0;
-            stats.tool_success_count = 0;
-        } else {
-            stats.tool_error_count = self.original_stats.tool_error_count;
-            stats.tool_success_count = self.original_stats.tool_success_count;
-        }
-
-        self.stats = stats;
+        self.stats = Stats::from_groups(&self.daily_groups);
     }
 
     pub(crate) fn rebuild_project_list(&mut self) {
@@ -1921,13 +1905,14 @@ impl AppState {
         let mut basename_counts: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
         for (name, _, _) in &list {
-            let basename = name.rsplit('/').next().unwrap_or(name.as_str());
-            *basename_counts.entry(basename).or_insert(0) += 1;
+            *basename_counts
+                .entry(crate::ui::shorten_project(name))
+                .or_insert(0) += 1;
         }
         self.project_labels = list
             .iter()
             .map(|(name, _, _)| {
-                let basename = name.rsplit('/').next().unwrap_or(name.as_str());
+                let basename = crate::ui::shorten_project(name);
                 let label = if basename_counts.get(basename).copied().unwrap_or(0) <= 1 {
                     basename.to_string()
                 } else {
@@ -2033,6 +2018,37 @@ mod filtered_stats_tests {
     }
 
     #[test]
+    fn a_filtered_view_counts_its_own_tool_results_and_cache_tokens() {
+        let day = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let model = "claude-sonnet-4-20250514";
+        let mut kept = make_session_with_tokens("~/proj", 10, 0, model);
+        kept.day_tool_successes = 3;
+        kept.day_tool_errors = 1;
+        if let Some(t) = kept.day_tokens_by_model.get_mut(model) {
+            t.cache_read_tokens = 90;
+        }
+        let mut dropped = make_session_with_tokens("~/proj", 10, 0, model);
+        dropped.day_tool_errors = 50;
+        let older = day - chrono::Duration::days(5);
+        let mut state = make_test_app_state(vec![
+            make_daily_group(day, vec![kept]),
+            make_daily_group(older, vec![dropped]),
+        ]);
+        state.original_stats.tool_error_count = 999;
+        state.period_filter = PeriodFilter::Custom(day, Some(day));
+        state.apply_filter();
+        assert_eq!(
+            (state.stats.tool_success_count, state.stats.tool_error_count),
+            (3, 1),
+            "the view's own results, not the unfiltered totals"
+        );
+        assert_eq!(
+            state.stats.project_stats["~/proj"].tokens, 100,
+            "cache counts"
+        );
+    }
+
+    #[test]
     fn filtered_rebuild_counts_a_projects_distinct_user_sessions() {
         let day = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
         let model = "claude-sonnet-4-20250514";
@@ -2053,10 +2069,11 @@ mod filtered_stats_tests {
         assert_eq!(p.work_tokens, 30);
     }
 
-    // `tool_sessions` has the scope `tool_usage` has — every session,
-    // subagents included — or a filtered view reads `N calls · 0 ses`.
+    // A filtered view counts a tool's sessions as user sessions, crediting a
+    // subagent's use to its parent — never `N calls · 0 ses`, never above the
+    // view's session count.
     #[test]
-    fn filtered_rebuild_counts_tool_sessions_over_every_session() {
+    fn filtered_rebuild_credits_a_subagents_tools_to_its_parent_session() {
         let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
         let model = "claude-sonnet-4-20250514";
         let mut user = make_session_with_tokens("~/proj", 1, 1, model);
@@ -2064,17 +2081,42 @@ mod filtered_stats_tests {
         let mut sub = make_session_with_tokens("~/proj", 1, 1, model);
         sub.is_subagent = true;
         sub.file_path = std::path::PathBuf::from("/tmp/test/sub.jsonl");
+        sub.parent_path = Some(user.file_path.clone());
         sub.day_tool_usage.insert("Read".to_string(), 2);
         sub.day_tool_usage.insert("Grep".to_string(), 1);
         let mut state = make_test_app_state(vec![make_daily_group(date, vec![user, sub])]);
         state.period_filter = PeriodFilter::Custom(date, Some(date));
         state.apply_filter();
-        assert_eq!(state.stats.tool_sessions.get("Read"), Some(&2));
+        assert_eq!(state.stats.tool_sessions.get("Read"), Some(&1));
         assert_eq!(
             state.stats.tool_sessions.get("Grep"),
             Some(&1),
             "subagent-only tool"
         );
+        assert_eq!(state.stats.tool_usage.get("Read"), Some(&5));
+    }
+
+    // Under a filter, a server's calls are the view's own calls.
+    #[test]
+    fn a_filtered_view_counts_mcp_calls_in_its_own_range() {
+        let today = chrono::Local::now().date_naive();
+        let old = today - chrono::Duration::days(60);
+        let call = |date, n| {
+            let mut s = make_session_with_tokens("~/proj", 1, 1, "claude-sonnet-4");
+            s.file_path = std::path::PathBuf::from(format!("/tmp/test/{date}.jsonl"));
+            s.day_tool_usage
+                .insert("mcp__server1__action".to_string(), n);
+            make_daily_group(date, vec![s])
+        };
+        let mut state = make_test_app_state(vec![call(today, 2), call(old, 5)]);
+        state.period_filter = PeriodFilter::Custom(today, Some(today));
+        state.apply_filter();
+        let s = state
+            .mcp_status
+            .iter()
+            .find(|s| s.name == "server1")
+            .unwrap();
+        assert_eq!(s.total_calls, 2);
     }
 
     // The per-model fold must carry the 5m/1h cache split — calculate_cost

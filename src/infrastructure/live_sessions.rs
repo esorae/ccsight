@@ -138,12 +138,27 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 fn jsonl_path_for(cwd: &Path, session_id: &str) -> Option<PathBuf> {
-    let projects = claude_projects_dir()?;
-    Some(
-        projects
-            .join(cwd_to_project_dir(cwd))
-            .join(format!("{session_id}.jsonl")),
-    )
+    Some(locate_jsonl(&claude_projects_dir()?, cwd, session_id))
+}
+
+/// Where a live session's transcript is. Claude Code keeps writing under the
+/// directory it was launched in, while the pid's cwd follows any later `cd`,
+/// so the cwd's own slug, then each ancestor's, then any project holding the
+/// id is tried. Nothing on disk yet (no line written) → the cwd's own slug.
+fn locate_jsonl(projects: &Path, cwd: &Path, session_id: &str) -> PathBuf {
+    let file = format!("{session_id}.jsonl");
+    let at = |dir: &Path| projects.join(cwd_to_project_dir(dir)).join(&file);
+    cwd.ancestors()
+        .map(at)
+        .find(|p| p.is_file())
+        .or_else(|| {
+            std::fs::read_dir(projects)
+                .ok()?
+                .flatten()
+                .map(|e| e.path().join(&file))
+                .find(|p| p.is_file())
+        })
+        .unwrap_or_else(|| at(cwd))
 }
 
 fn mtime_utc(path: &Path) -> Option<DateTime<Utc>> {
@@ -372,6 +387,34 @@ pub fn mark_was_recently_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The transcript stays under the launch dir's slug while the pid's cwd
+    // follows a `cd`: an ancestor's slug, then any project holding the id,
+    // and the cwd's own slug only when nothing is on disk yet.
+    #[test]
+    fn a_live_transcript_is_found_after_its_session_changed_directory() {
+        let projects = std::env::temp_dir().join(format!("ccsight-locate-{}", std::process::id()));
+        let launch = projects.join(cwd_to_project_dir(Path::new("/w/proj")));
+        let elsewhere = projects.join("-other-place");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(launch.join("a1.jsonl"), "{}\n").unwrap();
+        std::fs::write(elsewhere.join("b2.jsonl"), "{}\n").unwrap();
+
+        let into_subdir = locate_jsonl(&projects, Path::new("/w/proj/app/src"), "a1");
+        let unrelated = locate_jsonl(&projects, Path::new("/somewhere/else"), "b2");
+        let not_yet = locate_jsonl(&projects, Path::new("/w/proj/app"), "c3");
+        std::fs::remove_dir_all(&projects).ok();
+
+        assert_eq!(into_subdir, launch.join("a1.jsonl"));
+        assert_eq!(unrelated, elsewhere.join("b2.jsonl"));
+        assert_eq!(
+            not_yet,
+            projects
+                .join(cwd_to_project_dir(Path::new("/w/proj/app")))
+                .join("c3.jsonl")
+        );
+    }
     use std::path::PathBuf;
 
     #[test]
