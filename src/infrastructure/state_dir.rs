@@ -9,6 +9,7 @@
 //!   ~/.ccsight/cache-v*.json — parsed-session JSON cache, one file per version
 //!   ~/.ccsight/index/       — tantivy full-text index segments
 //!   ~/.ccsight/pins.json    — pinned-session list
+//!   ~/.ccsight/generated/   — cwd of ccsight's own `claude -p` calls
 //!
 //! `migrate_legacy_state_dirs()` runs once at startup and renames leftover
 //! index and pins files from `~/.cache/ccsight/` and `~/.config/ccsight/`
@@ -47,6 +48,12 @@ pub fn live_diagnostic_path() -> Result<PathBuf> {
 /// write semantics (diff detection + 30-min debounce, tiered retention).
 pub fn live_snapshots_dir() -> Result<PathBuf> {
     Ok(state_root()?.join("live_snapshots"))
+}
+
+/// Where ccsight runs `claude -p`: its transcripts land under one project
+/// named for ccsight, so their spend stays counted and recognizable.
+pub fn generated_dir() -> Result<PathBuf> {
+    Ok(state_root()?.join("generated"))
 }
 
 pub fn search_history_path() -> Result<PathBuf> {

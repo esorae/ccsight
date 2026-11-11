@@ -292,7 +292,16 @@ pub fn parse_text_with_code_blocks(text: &str) -> Vec<TextSegment> {
 /// Code emits them as whole messages. A tag further in is quoted content (a
 /// pasted component, a recap), and matching it would drop a real prompt.
 pub fn looks_like_system_injection(s: &str) -> bool {
-    let Some(rest) = s.trim_start().strip_prefix('<') else {
+    let s = s.trim_start();
+    // Claude Code's own notes in plain prose, sent with the user role.
+    const HARNESS_NOTES: [&str; 2] = [
+        "[Request interrupted by user",
+        "Another Claude session sent a message:",
+    ];
+    if HARNESS_NOTES.iter().any(|note| s.starts_with(note)) {
+        return true;
+    }
+    let Some(rest) = s.strip_prefix('<') else {
         return false;
     };
     let Some(end) = rest.find('>') else {
@@ -340,6 +349,15 @@ pub fn clean_user_message_preview(raw: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// `1 session`, `2 sessions`: a count with its noun in the right number.
+pub fn count_noun(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +370,13 @@ mod tests {
         assert_eq!(format_bytes(5_240_000), "5.2 MB");
         assert_eq!(format_bytes(560_700_000), "561 MB");
         assert_eq!(format_bytes(2_100_000_000), "2.1 GB");
+    }
+
+    #[test]
+    fn a_count_of_one_takes_the_singular() {
+        assert_eq!(count_noun(1, "session"), "1 session");
+        assert_eq!(count_noun(0, "session"), "0 sessions");
+        assert_eq!(count_noun(12, "session"), "12 sessions");
     }
 
     #[test]
@@ -557,6 +582,13 @@ mod tests {
     #[test]
     fn only_a_leading_kebab_tag_marks_a_system_injection() {
         assert!(looks_like_system_injection("<task-notification> done"));
+        assert!(looks_like_system_injection(
+            "[Request interrupted by user for tool use]"
+        ));
+        assert!(looks_like_system_injection(
+            "Another Claude session sent a message: <agent-message from=\"x\">"
+        ));
+        assert!(!looks_like_system_injection("[note] the user typed this"));
         assert!(looks_like_system_injection("  </local-command-stdout>"));
         assert!(!looks_like_system_injection(
             "why does <my-button> not render?"

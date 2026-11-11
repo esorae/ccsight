@@ -346,7 +346,9 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
                     .filter_input()
                     .map(|i| i.text.clone())
                     .unwrap_or_default();
-                if let Some(filter) = PeriodFilter::parse_custom(&text) {
+                if let Ok(filter) =
+                    PeriodFilter::check_custom(&text, chrono::Local::now().date_naive())
+                {
                     state.period_filter = filter;
                     state.apply_filter();
                     state.active_popup = crate::ActivePopup::None;
@@ -429,9 +431,8 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
 }
 
 /// `ActivePopup::Detail { back: None }` branch — Session detail popup. Esc/q/i close,
-/// Enter opens the conversation, ↑↓/j/k scroll, Space toggles pin, C opens
-/// conversation in a new pane, S/r kicks off (re-)summary, R regenerates the
-/// JSONL summary.
+/// Enter opens the conversation, ↑↓/j/k scroll, Space toggles pin, y copies
+/// the resume command, C opens a new pane, s opens the summary, t the title.
 pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => state.close_detail(),
@@ -481,11 +482,19 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
         }
         KeyCode::Char('C') => {
             let no_loading_panes = state.panes.iter().all(|p| !p.loading);
-            if no_loading_panes
-                && let Some(session) = crate::handlers::pane::detail_session(state)
-                && open_or_focus_pane(state, &session.file_path)
+            if no_loading_panes && let Some(session) = crate::handlers::pane::detail_session(state)
             {
-                state.conv_list_mode = ConvListMode::Day;
+                // The list follows where the detail came from, as Enter's does.
+                let from_tab = !state.show_conversation;
+                if !open_or_focus_pane(state, &session.file_path) {
+                    return;
+                }
+                if from_tab && state.tab == Tab::Live {
+                    state.conv_list_mode = ConvListMode::Live;
+                    state.selected_session = state.live_selected;
+                } else if from_tab {
+                    state.conv_list_mode = ConvListMode::Day;
+                }
                 state.show_conversation = true;
                 state.active_popup = crate::ActivePopup::None;
                 state.session_detail_override = None;
@@ -538,11 +547,54 @@ fn copy_resume_command(state: &mut AppState, jsonl_path: &std::path::Path) {
     match state.resume_dir(jsonl_path) {
         Some(dir) => {
             let cmd = crate::shell::resume_command(&dir.to_string_lossy(), session_id);
-            state.clipboard_task = Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
-            state.toast(format!("Copied: {cmd}"));
+            copy_resume(state, session_id, cmd);
         }
         None => state.toast("Resume dir unknown — use the `claude --resume` picker"),
     }
+}
+
+/// Resume command for Live row `idx` (the tab and the conversation view's Live
+/// list share the index).
+fn copy_live_row_resume(state: &mut AppState, idx: usize) {
+    let Some((jsonl_path, pid_cwd, session_id)) = crate::live_row(state, idx)
+        .map(|s| (s.jsonl_path.clone(), s.cwd.clone(), s.session_id.clone()))
+    else {
+        return;
+    };
+    match jsonl_path {
+        Some(path) => copy_resume_command(state, &path),
+        None => {
+            // No transcript yet: its storage slug will derive from this pid
+            // cwd when the first entry lands, so the cwd is right by construction.
+            let cmd = crate::shell::resume_command(&pid_cwd.to_string_lossy(), &session_id);
+            copy_resume(state, &session_id, cmd);
+        }
+    }
+}
+
+/// A session still open in another terminal is easy to resume twice by
+/// mistake, so the copy names the process and directory that already have it.
+fn copy_resume(state: &mut AppState, session_id: &str, cmd: String) {
+    state.clipboard_task = Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
+    match running_elsewhere(state, session_id) {
+        Some(msg) => state.toast_warn(msg),
+        None => state.toast(format!("Copied: {cmd}")),
+    }
+}
+
+fn running_elsewhere(state: &AppState, session_id: &str) -> Option<String> {
+    let s = state
+        .live_active
+        .iter()
+        .find(|s| s.is_live && s.session_id == session_id)?;
+    let dir = s.cwd.file_name().map_or_else(
+        || s.cwd.to_string_lossy().into_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    Some(format!(
+        "⚠ Already open in pid {} ({dir}) — switch to it; copied anyway",
+        s.pid
+    ))
 }
 
 /// Lines ↑↓ move through a message taller than the pane: small enough to
@@ -614,22 +666,27 @@ pub(crate) fn open_filter_popup(state: &mut AppState) {
     };
 }
 
-/// Project popup with the cursor on the active project. Preselects against
-/// `project_list_sorted`, the order the popup renders and Enter indexes — the
-/// raw `project_list` order would land on an unrelated project.
+/// Project popup with the cursor on the active project, found in
+/// `project_popup_view`, the order the popup renders and Enter indexes.
 pub(crate) fn open_project_popup(state: &mut AppState) {
-    let selected = match &state.project_filter {
-        Some(name) => state
-            .project_list_sorted()
-            .iter()
-            .position(|(n, _, _)| n == name)
-            .map_or(0, |i| i + 1),
-        None => 0,
-    };
     state.active_popup = crate::ActivePopup::ProjectPopup {
-        selected,
+        selected: 0,
         scroll: 0,
+        query: crate::state::TextInput::default(),
     };
+    let selected = project_popup_row_of(state, state.project_filter.clone().as_deref());
+    state.set_project_popup_selected(selected);
+}
+
+/// The picker row holding `project` (row 0 is "All"), or "All" when the
+/// project is not in the current view.
+fn project_popup_row_of(state: &mut AppState, project: Option<&str>) -> usize {
+    let Some(project) = project else { return 0 };
+    let view = state.project_popup_view();
+    let rows = state.project_rows.as_deref().unwrap_or_default();
+    view.iter()
+        .position(|&i| rows[i].name == project)
+        .map_or(0, |p| p + 1)
 }
 
 /// Enter / double-click in the filter popup: apply a preset, or start editing
@@ -657,14 +714,16 @@ pub(crate) fn choose_filter_row(state: &mut AppState) {
 }
 
 /// Enter / double-click in the project popup. Row 0 is "All"; the rest index
-/// `project_list_sorted`, the order the popup renders.
+/// `project_popup_view`, the order the popup renders.
 pub(crate) fn choose_project_row(state: &mut AppState) {
     let selected = state.project_popup_selected();
+    let view = state.project_popup_view();
     state.project_filter = selected.checked_sub(1).and_then(|i| {
+        let row = *view.get(i)?;
         state
-            .project_list_sorted()
-            .get(i)
-            .map(|(name, _, _)| (*name).clone())
+            .project_rows
+            .as_ref()
+            .map(|rows| rows[row].name.clone())
     });
     state.apply_filter();
     state.active_popup = crate::ActivePopup::None;
@@ -684,20 +743,38 @@ pub(crate) fn open_project_detail(state: &mut AppState, row: usize) {
     }
 }
 
-/// `s` on a ranked panel (Projects 1, Models 2, Ecosystem 3, Languages 4):
-/// flip recency vs magnitude. The cursor indexes the sorted rows, so it and
-/// the viewport restart at the top instead of landing on an unrelated row.
-fn toggle_panel_sort(state: &mut AppState, panel: usize) {
+/// `s` on a ranked panel: flip recency vs magnitude. A scrolled list restarts
+/// at its top; the Models table's cursor follows its model to its new row.
+fn toggle_panel_sort(state: &mut AppState, panel: crate::DashPanel) {
+    use crate::DashPanel::{Activity, Costs, Ecosystem, Hourly, Languages, Models, Projects};
     match panel {
-        1 => state.dashboard_projects_sort = state.dashboard_projects_sort.toggle(),
-        2 => state.dashboard_models_sort = state.dashboard_models_sort.toggle(),
-        3 => {
+        Projects => state.dashboard_projects_sort = state.dashboard_projects_sort.toggle(),
+        Models => {
+            // The Models table has a cursor: it stays on its model.
+            let order = |state: &AppState| -> Vec<String> {
+                let mut rows: Vec<(String, u64, ())> = state
+                    .aggregated_model_tokens
+                    .iter()
+                    .map(|(name, ts)| (name.clone(), ts.work_tokens(), ()))
+                    .collect();
+                state.sort_models(&mut rows);
+                rows.into_iter().map(|(name, _, ())| name).collect()
+            };
+            let current = order(state).get(state.dashboard_scroll[panel]).cloned();
+            state.dashboard_models_sort = state.dashboard_models_sort.toggle();
+            let row = current
+                .and_then(|name| order(state).iter().position(|n| *n == name))
+                .unwrap_or(0);
+            state.dashboard_scroll[panel] = row;
+            return;
+        }
+        Ecosystem => {
             state.dashboard_ecosystem_sort = state.dashboard_ecosystem_sort.toggle();
             state.mcp_selected_server = 0;
             state.mcp_selected_tool = None;
         }
-        4 => state.dashboard_languages_sort = state.dashboard_languages_sort.toggle(),
-        _ => return,
+        Languages => state.dashboard_languages_sort = state.dashboard_languages_sort.toggle(),
+        Costs | Activity | Hourly => return,
     }
     state.dashboard_scroll[panel] = 0;
     state.dashboard_viewport[panel] = 0;
@@ -705,13 +782,7 @@ fn toggle_panel_sort(state: &mut AppState, panel: usize) {
 
 /// h / l across the dashboard panels, wrapping at both ends.
 fn step_dashboard_panel(state: &mut AppState, forward: bool) {
-    // One scroll slot per panel, so the array length is the panel count.
-    let panels = state.dashboard_scroll.len();
-    state.dashboard_panel = if forward {
-        (state.dashboard_panel + 1) % panels
-    } else {
-        (state.dashboard_panel + panels - 1) % panels
-    };
+    state.dashboard_panel = state.dashboard_panel.step(forward);
 }
 
 /// Show Ecosystem section `section` from its top. Section 0 (Tools) holds the
@@ -719,7 +790,7 @@ fn step_dashboard_panel(state: &mut AppState, forward: bool) {
 /// cannot sit past the visible server list.
 pub(crate) fn set_ecosystem_section(state: &mut AppState, section: usize) {
     state.tools_detail_section = section;
-    state.dashboard_scroll[3] = 0;
+    state.dashboard_scroll[crate::DashPanel::Ecosystem] = 0;
     if section == 0 {
         state.mcp_selected_server = 0;
         state.mcp_selected_tool = None;
@@ -773,13 +844,17 @@ pub(crate) fn open_pinned_view(state: &mut AppState, preview: fn(&mut AppState))
 /// S-Tab / a click on the list title: Day → Pinned (when any) → All → Day,
 /// with a lone pane following the list's new first row.
 pub(crate) fn cycle_conv_list_mode(state: &mut AppState, preview: fn(&mut AppState)) {
+    // Sticky once entered from the Live tab, so j/k keeps walking live rows;
+    // the list and the open conversation stay as they are.
+    if state.conv_list_mode == ConvListMode::Live {
+        state.toast("Live list — Esc returns to the Live tab, m shows pins");
+        return;
+    }
     state.conv_list_mode = match state.conv_list_mode {
         ConvListMode::Day if state.pins.entries().is_empty() => ConvListMode::All,
         ConvListMode::Day => ConvListMode::Pinned,
         ConvListMode::Pinned => ConvListMode::All,
-        ConvListMode::All => ConvListMode::Day,
-        // Sticky once entered from the Live tab, so j/k keeps walking live rows.
-        ConvListMode::Live => ConvListMode::Live,
+        ConvListMode::All | ConvListMode::Live => ConvListMode::Day,
     };
     state.selected_session = 0;
     if state.panes.len() == 1 {
@@ -1212,11 +1287,23 @@ pub(crate) fn handle_conversation_key(
             // (mirrors the default-mode handler so multi-pane is reachable
             // without escaping the conversation view first).
             let no_loading = state.panes.iter().all(|p| !p.loading);
-            if no_loading
-                // Mode-aware, like the digit keys: the day list's Nth session
-                // is a different one while Pinned / Live is showing.
-                && let Some(file_path) = get_conv_session_file(state, state.selected_session)
-            {
+            // Mode-aware, like the digit keys: the day list's Nth session
+            // is a different one while Pinned / Live is showing.
+            let cursor = get_conv_session_file(state, state.selected_session);
+            let shown = cursor.as_deref().is_some_and(|f| {
+                state
+                    .panes
+                    .iter()
+                    .any(|p| p.file_path.as_deref() == Some(f))
+            });
+            if no_loading && shown && state.panes.len() == 1 {
+                // A lone pane previews the cursor's row, so the cursor always
+                // names what is open: split instead, the list keeps focus, and
+                // Enter loads the next pick into the empty pane.
+                state.panes.push(ConversationPane::default());
+                state.active_pane_index = None;
+                state.toast("New pane — pick a session, Enter opens it there");
+            } else if no_loading && let Some(file_path) = cursor {
                 open_or_focus_pane(state, &file_path);
             }
         }
@@ -1440,6 +1527,21 @@ pub(crate) fn handle_conversation_key(
                 let len = content.chars().count();
                 state.toast(format!("Copied ({len} chars)"));
                 state.clipboard_task = Some(crate::handlers::tasks::spawn_clipboard_write(content));
+            } else if state.active_pane_index.is_none() {
+                // On the list, `y` means what it means on every session list.
+                if state.conv_list_mode == ConvListMode::Live {
+                    copy_live_row_resume(state, state.selected_session);
+                } else if let Some(fp) = get_conv_session_file(state, state.selected_session) {
+                    copy_resume_command(state, &fp);
+                }
+            }
+        }
+        KeyCode::Char('t') if state.active_pane_index.is_none() => {
+            let session = get_conv_session_file(state, state.selected_session)
+                .and_then(|fp| crate::handlers::pane::find_indexed_session_by_path(state, &fp));
+            match session {
+                Some(session) => open_title_editor(state, &session, crate::TitleEditReturn::Root),
+                None => state.toast("Session not yet indexed; ccsight reloads every 30s"),
             }
         }
         KeyCode::Char('i') => {
@@ -1477,6 +1579,14 @@ pub(crate) fn handle_default_key(
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
     {
+        return false;
+    }
+    // Another Daily panel's focus hides the session highlight, so a session
+    // key there would act on a row the user cannot see.
+    let session_key = matches!(key.code, KeyCode::Char(' ' | 'y' | 't' | 's' | 'C'))
+        || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT));
+    if session_key && state.tab == Tab::Daily && state.daily_panel != DailyPanel::Sessions {
+        state.toast("Move down to the session list first");
         return false;
     }
     match key.code {
@@ -1524,23 +1634,7 @@ pub(crate) fn handle_default_key(
             state.live_paused_scroll = 0;
         }
         KeyCode::Char('y') if state.tab == Tab::Live => {
-            // Snapshot the fields before mutating `state` (toast) so the
-            // `live_selected_session` borrow is released.
-            let sel = crate::live_selected_session(state)
-                .map(|s| (s.jsonl_path.clone(), s.cwd.clone(), s.session_id.clone()));
-            if let Some((jsonl_path, pid_cwd, session_id)) = sel {
-                if let Some(path) = jsonl_path {
-                    copy_resume_command(state, &path);
-                } else {
-                    // No transcript on disk yet: its storage slug will derive
-                    // from this very pid cwd when the first entry lands, so
-                    // the pid cwd is correct by construction.
-                    let cmd = crate::shell::resume_command(&pid_cwd.to_string_lossy(), &session_id);
-                    state.clipboard_task =
-                        Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
-                    state.toast(format!("Copied: {cmd}"));
-                }
-            }
+            copy_live_row_resume(state, state.live_selected);
         }
         KeyCode::Enter if state.tab == Tab::Live => {
             // A session too new to be indexed has no detail yet; its
@@ -1650,9 +1744,9 @@ pub(crate) fn handle_default_key(
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if state.tab == Tab::Dashboard {
-                // Panel 5 (heatmap) uses inverted scroll: older dates are at top
-                if state.dashboard_panel == 5 {
-                    let scroll = &mut state.dashboard_scroll[5];
+                // The Activity heatmap scrolls inverted: older dates are at top
+                if state.dashboard_panel == crate::DashPanel::Activity {
+                    let scroll = &mut state.dashboard_scroll[crate::DashPanel::Activity];
                     *scroll = scroll.saturating_add(1);
                 } else {
                     let scroll = &mut state.dashboard_scroll[state.dashboard_panel];
@@ -1685,8 +1779,8 @@ pub(crate) fn handle_default_key(
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if state.tab == Tab::Dashboard {
-                if state.dashboard_panel == 5 {
-                    let scroll = &mut state.dashboard_scroll[5];
+                if state.dashboard_panel == crate::DashPanel::Activity {
+                    let scroll = &mut state.dashboard_scroll[crate::DashPanel::Activity];
                     *scroll = scroll.saturating_sub(1);
                 } else {
                     let max_items = crate::dashboard_max_items(state);
@@ -1750,6 +1844,11 @@ pub(crate) fn handle_default_key(
             }
         }
         KeyCode::Char('C') if state.tab == Tab::Daily => open_selected_session_in_new_pane(state),
+        KeyCode::Char('y') if state.tab == Tab::Daily => {
+            if let Some(session) = crate::current_selected_session(state) {
+                copy_resume_command(state, &session.file_path);
+            }
+        }
         KeyCode::Char('S') => {
             if state.tab == Tab::Daily
                 && state.summary_task.is_none()
@@ -1764,9 +1863,18 @@ pub(crate) fn handle_default_key(
                 && let Some(session) = crate::current_selected_session(state)
             {
                 handlers::tasks::start_session_summary(state, session, false);
+            } else if state.tab == Tab::Live && state.summary_task.is_none() {
+                let jsonl = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone());
+                match jsonl
+                    .and_then(|p| crate::handlers::pane::find_indexed_session_by_path(state, &p))
+                {
+                    Some(session) => handlers::tasks::start_session_summary(state, session, false),
+                    None => state.toast("Session not yet indexed; ccsight reloads every 30s"),
+                }
             } else if state.tab == Tab::Dashboard {
                 // The compact Ecosystem panel has no ranked list to reorder.
-                if matches!(state.dashboard_panel, 1 | 2 | 4) {
+                use crate::DashPanel::{Languages, Models, Projects};
+                if matches!(state.dashboard_panel, Projects | Models | Languages) {
                     toggle_panel_sort(state, state.dashboard_panel);
                 }
             }
@@ -1830,7 +1938,8 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
     // After the Built-in/MCP merge, MCP server-grouped rendering lives inside
     // the Tools tab (index 0). MCP-specific keys (Enter/Space/o/c, j/k cursor)
     // still target MCP rows there — built-in rows above them are non-navigable.
-    let mcp_tab_active = state.dashboard_panel == 3 && state.tools_detail_section == 0;
+    let mcp_tab_active =
+        state.dashboard_panel == crate::DashPanel::Ecosystem && state.tools_detail_section == 0;
     match key.code {
         KeyCode::Enter | KeyCode::Char(' ')
             if mcp_tab_active && state.mcp_selected_tool.is_none() =>
@@ -1893,27 +2002,36 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             }
             crate::adjust_mcp_scroll(state, &servers);
         }
-        KeyCode::Char('s') if (1..=4).contains(&state.dashboard_panel) => {
+        KeyCode::Char('s')
+            if matches!(
+                state.dashboard_panel,
+                crate::DashPanel::Projects
+                    | crate::DashPanel::Models
+                    | crate::DashPanel::Ecosystem
+                    | crate::DashPanel::Languages
+            ) =>
+        {
             toggle_panel_sort(state, state.dashboard_panel);
         }
-        KeyCode::Enter if state.dashboard_panel == 1 => {
-            open_project_detail(state, state.dashboard_scroll[1]);
+        KeyCode::Enter if state.dashboard_panel == crate::DashPanel::Projects => {
+            open_project_detail(state, state.dashboard_scroll[crate::DashPanel::Projects]);
         }
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
             state.active_popup = crate::ActivePopup::None;
         }
-        KeyCode::Char('w') if state.dashboard_panel == 5 => {
+        KeyCode::Char('w') if state.dashboard_panel == crate::DashPanel::Activity => {
             state.activity_view_weekly = !state.activity_view_weekly;
             // Reset scroll so flipping modes always lands the user at the top
             // of the new dataset; otherwise an out-of-range index from the
             // longer (daily) list would silently saturate at the end.
-            state.dashboard_scroll[5] = 0;
+            state.dashboard_scroll[crate::DashPanel::Activity] = 0;
         }
         // Costs (0) and Daily-Activity (5) share the active-day date set; toggle
         // filling idle calendar days. Reset scroll for the same reason as `w`.
         KeyCode::Char('z')
-            if state.dashboard_panel == 0
-                || (state.dashboard_panel == 5 && !state.activity_view_weekly) =>
+            if state.dashboard_panel == crate::DashPanel::Costs
+                || (state.dashboard_panel == crate::DashPanel::Activity
+                    && !state.activity_view_weekly) =>
         {
             state.show_empty_days = !state.show_empty_days;
             state.dashboard_scroll[state.dashboard_panel] = 0;
@@ -1944,16 +2062,20 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             let max_items = crate::dashboard_max_items(state);
             state.dashboard_scroll[state.dashboard_panel] = max_items.saturating_sub(1);
         }
-        KeyCode::Char(c @ '1'..='4') if state.dashboard_panel == 3 => {
+        KeyCode::Char(c @ '1'..='4') if state.dashboard_panel == crate::DashPanel::Ecosystem => {
             set_ecosystem_section(state, (c as u8 - b'1') as usize);
         }
         // Tab/BackTab + ←/→ + h/l all cycle the Ecosystem section.
         // Forward (Tab / Right / l) advances; backward (BackTab /
         // Left / h) retreats. Mirrors number keys 1-4.
-        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') if state.dashboard_panel == 3 => {
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l')
+            if state.dashboard_panel == crate::DashPanel::Ecosystem =>
+        {
             set_ecosystem_section(state, (state.tools_detail_section + 1) % 4);
         }
-        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') if state.dashboard_panel == 3 => {
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h')
+            if state.dashboard_panel == crate::DashPanel::Ecosystem =>
+        {
             set_ecosystem_section(state, (state.tools_detail_section + 3) % 4);
         }
         KeyCode::Left | KeyCode::Char('h') => step_dashboard_panel(state, false),
@@ -2144,21 +2266,51 @@ pub(crate) fn handle_search_mode_key(
 
 /// `ActivePopup::ProjectPopup` branch — Esc/q/p close, ↑↓/j/k navigate,
 /// Enter applies the project filter (idx 0 = "All").
+/// Letters narrow the list, so movement is on the arrows only; Esc clears a
+/// query before it closes, as the search popup's does.
 pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
-    let total = state.project_list.len() + 1;
+    let total = state.project_popup_view().len() + 1;
+    let selected = state.project_popup_selected();
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
-            state.active_popup = crate::ActivePopup::None;
+        KeyCode::Esc if !state.project_popup_query().is_empty() => {
+            edit_project_query(state, crate::state::TextInput::clear);
         }
-        KeyCode::Up | KeyCode::Char('k') if state.project_popup_selected() > 0 => {
-            state.set_project_popup_selected(state.project_popup_selected() - 1);
+        KeyCode::Esc => state.active_popup = crate::ActivePopup::None,
+        KeyCode::Up if selected > 0 => state.set_project_popup_selected(selected - 1),
+        KeyCode::Down if selected + 1 < total => state.set_project_popup_selected(selected + 1),
+        KeyCode::Tab => {
+            // Re-find the row under the cursor so a re-sort keeps it chosen.
+            let current = selected.checked_sub(1).and_then(|i| {
+                let row = *state.project_popup_view().get(i)?;
+                state.project_rows.as_ref().map(|r| r[row].name.clone())
+            });
+            state.project_popup_sort = state.project_popup_sort.next();
+            let row = project_popup_row_of(state, current.as_deref());
+            state.set_project_popup_selected(row);
         }
-        KeyCode::Down | KeyCode::Char('j') if state.project_popup_selected() < total - 1 => {
-            state.set_project_popup_selected(state.project_popup_selected() + 1);
-        }
+        KeyCode::Backspace => edit_project_query(state, crate::state::TextInput::delete_back),
         KeyCode::Enter => choose_project_row(state),
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            edit_project_query(state, |q| q.insert_char(c));
+        }
         _ => {}
     }
+}
+
+/// Edit the picker's query; the cursor moves to the first match, or stays on
+/// "All" when the query is cleared.
+fn edit_project_query(state: &mut AppState, edit: impl FnOnce(&mut crate::state::TextInput)) {
+    if let Some(q) = state.project_popup_query_mut() {
+        edit(q);
+    }
+    let has_match = !state.project_popup_view().is_empty();
+    let first = usize::from(!state.project_popup_query().is_empty() && has_match);
+    state.set_project_popup_selected(first);
+    state.set_project_popup_scroll(0);
 }
 
 #[cfg(test)]
@@ -2167,6 +2319,151 @@ mod tests {
 
     fn press(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
         handle_default_key(state, KeyEvent::new(code, mods), |_| {});
+    }
+
+    fn detail_key(state: &mut AppState, code: KeyCode) {
+        handle_dashboard_detail_key(state, KeyEvent::from(code));
+    }
+
+    fn dashboard_detail(panel: crate::DashPanel) -> AppState {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.tab = Tab::Dashboard;
+        state.dashboard_panel = panel;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state
+    }
+
+    // Each detail key acts on its own panel only, and a sort or view switch
+    // restarts the list at its top.
+    #[test]
+    fn dashboard_detail_keys_act_on_their_own_panel() {
+        use crate::DashPanel::{Activity, Costs, Ecosystem, Hourly, Models};
+        let mut state = dashboard_detail(Models);
+        let before = state.dashboard_models_sort;
+        state.dashboard_scroll[Models] = 3;
+        detail_key(&mut state, KeyCode::Char('s'));
+        assert_ne!(state.dashboard_models_sort, before, "s sorts Models");
+        assert_eq!(state.dashboard_scroll[Models], 0, "from the top");
+
+        let mut state = dashboard_detail(Hourly);
+        let sorts = (state.dashboard_models_sort, state.dashboard_projects_sort);
+        detail_key(&mut state, KeyCode::Char('s'));
+        assert_eq!(
+            (state.dashboard_models_sort, state.dashboard_projects_sort),
+            sorts
+        );
+
+        let mut state = dashboard_detail(Activity);
+        state.dashboard_scroll[Activity] = 4;
+        detail_key(&mut state, KeyCode::Char('w'));
+        assert!(state.activity_view_weekly);
+        assert_eq!(state.dashboard_scroll[Activity], 0);
+        detail_key(&mut state, KeyCode::Char('z'));
+        assert!(!state.show_empty_days, "z does nothing in the weekly view");
+        let mut state = dashboard_detail(Costs);
+        detail_key(&mut state, KeyCode::Char('w'));
+        assert!(!state.activity_view_weekly, "w belongs to Activity");
+        detail_key(&mut state, KeyCode::Char('z'));
+        assert!(state.show_empty_days, "z fills idle days in Costs");
+
+        let mut state = dashboard_detail(Ecosystem);
+        detail_key(&mut state, KeyCode::Right);
+        assert_eq!(state.tools_detail_section, 1);
+        detail_key(&mut state, KeyCode::Left);
+        detail_key(&mut state, KeyCode::Left);
+        assert_eq!(state.tools_detail_section, 3, "sections wrap");
+        detail_key(&mut state, KeyCode::Char('2'));
+        assert_eq!(state.tools_detail_section, 1);
+        assert_eq!(state.dashboard_panel, Ecosystem, "←→ stay on the panel");
+
+        let mut state = dashboard_detail(Costs);
+        detail_key(&mut state, KeyCode::Right);
+        assert_eq!(
+            state.dashboard_panel,
+            crate::DashPanel::Projects,
+            "→ steps panels"
+        );
+    }
+
+    // Keys that belong to one panel leave the others alone: Enter drills into
+    // Projects only, digits and ← move Ecosystem sections only (elsewhere ←
+    // steps back a panel), z fills idle days in the daily Activity view too,
+    // and Enter on the MCP tab expands the server under the cursor.
+    #[test]
+    fn dashboard_detail_keys_belong_to_their_panels() {
+        use crate::DashPanel::{Activity, Costs, Ecosystem, Models, Projects};
+        let mut state = dashboard_detail(Projects);
+        state
+            .stats
+            .project_stats
+            .insert("~/p".to_string(), Default::default());
+        detail_key(&mut state, KeyCode::Enter);
+        assert!(state.show_project_detail(), "Enter opens the project");
+        let mut state = dashboard_detail(Models);
+        detail_key(&mut state, KeyCode::Enter);
+        assert!(!state.show_dashboard_detail(), "Enter closes elsewhere");
+
+        let mut state = dashboard_detail(Models);
+        state.tools_detail_section = 2;
+        detail_key(&mut state, KeyCode::Char('1'));
+        detail_key(&mut state, KeyCode::Left);
+        assert_eq!(state.tools_detail_section, 2, "no section moved");
+        assert_eq!(state.dashboard_panel, Projects, "← stepped back a panel");
+
+        let mut state = dashboard_detail(Activity);
+        detail_key(&mut state, KeyCode::Char('z'));
+        assert!(state.show_empty_days, "z in the daily Activity view");
+
+        let mut state = dashboard_detail(Ecosystem);
+        state
+            .stats
+            .tool_usage
+            .insert("mcp__server1__do".to_string(), 1);
+        detail_key(&mut state, KeyCode::Enter);
+        assert!(
+            state.mcp_expanded_servers.contains("server1"),
+            "{:?}",
+            state.mcp_expanded_servers
+        );
+        assert!(state.show_dashboard_detail(), "the popup stays open");
+        let mut state = dashboard_detail(Costs);
+        state
+            .stats
+            .tool_usage
+            .insert("mcp__server1__do".to_string(), 1);
+        detail_key(&mut state, KeyCode::Enter);
+        assert!(state.mcp_expanded_servers.is_empty(), "not off the MCP tab");
+    }
+
+    // ↓ / ↑ / Home / PageDown / PageUp move the row, ↑ stops at the top, and
+    // ↓ and End stop on the last row, which is the panel's own item count.
+    #[test]
+    fn dashboard_detail_rows_move_within_the_list() {
+        use crate::DashPanel::Hourly;
+        let mut state = dashboard_detail(Hourly);
+        detail_key(&mut state, KeyCode::Up);
+        assert_eq!(state.dashboard_scroll[Hourly], 0, "↑ stops at the top");
+        detail_key(&mut state, KeyCode::Down);
+        assert_eq!(state.dashboard_scroll[Hourly], 1);
+        detail_key(&mut state, KeyCode::PageDown);
+        assert_eq!(state.dashboard_scroll[Hourly], 11);
+        detail_key(&mut state, KeyCode::PageUp);
+        assert_eq!(state.dashboard_scroll[Hourly], 1);
+        detail_key(&mut state, KeyCode::Home);
+        assert_eq!(state.dashboard_scroll[Hourly], 0);
+    }
+
+    // ↓ and End stop on the last row, which is the panel's own item count.
+    #[test]
+    fn dashboard_detail_scrolling_stops_at_the_last_row() {
+        use crate::DashPanel::Hourly;
+        let mut state = dashboard_detail(Hourly);
+        detail_key(&mut state, KeyCode::End);
+        assert_eq!(state.dashboard_scroll[Hourly], 23, "24 hour rows");
+        detail_key(&mut state, KeyCode::Down);
+        assert_eq!(state.dashboard_scroll[Hourly], 23);
+        detail_key(&mut state, KeyCode::Up);
+        assert_eq!(state.dashboard_scroll[Hourly], 22);
     }
 
     #[test]
@@ -2249,17 +2546,21 @@ mod tests {
     fn the_models_popup_opens_on_the_panels_cursor() {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
         state.tab = Tab::Dashboard;
-        state.dashboard_panel = 2;
-        state.dashboard_scroll[2] = 3;
+        state.dashboard_panel = crate::DashPanel::Models;
+        state.dashboard_scroll[crate::DashPanel::Models] = 3;
         press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
         assert!(state.show_dashboard_detail());
-        assert_eq!(state.dashboard_scroll[2], 3);
+        assert_eq!(state.dashboard_scroll[crate::DashPanel::Models], 3);
 
         state.active_popup = crate::ActivePopup::None;
-        state.dashboard_panel = 1;
-        state.dashboard_scroll[1] = 3;
+        state.dashboard_panel = crate::DashPanel::Projects;
+        state.dashboard_scroll[crate::DashPanel::Projects] = 3;
         press(&mut state, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(state.dashboard_scroll[1], 3, "Projects keeps its cursor");
+        assert_eq!(
+            state.dashboard_scroll[crate::DashPanel::Projects],
+            3,
+            "Projects keeps its cursor"
+        );
     }
 
     // The detail's Enter replaces the focused pane, so four open panes do not
@@ -3092,6 +3393,313 @@ mod tests {
         assert!(state.show_conversation);
     }
 
+    /// Every list that selects a session gives `Space` / `y` / `t` the same
+    /// meaning, acting on the cursor's row (the second, so an off-by-one shows).
+    #[test]
+    fn session_keys_act_on_the_cursor_in_every_session_list() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        type Send = fn(&mut AppState, KeyCode);
+        fn default(state: &mut AppState, code: KeyCode) {
+            handle_default_key(state, KeyEvent::from(code), noop);
+        }
+        fn conv(state: &mut AppState, code: KeyCode) {
+            handle_conversation_key(
+                state,
+                KeyEvent::from(code),
+                noop,
+                noop,
+                crate::handlers::pane::get_conv_session_file,
+                crate::handlers::pane::get_conv_session_count,
+            );
+        }
+        fn detail(state: &mut AppState, code: KeyCode) {
+            handle_session_detail_key(state, KeyEvent::from(code));
+        }
+        let dir = std::env::temp_dir();
+        let slug =
+            crate::infrastructure::live_sessions::official_project_slug(&dir.to_string_lossy());
+        let path = |id: &str| std::path::PathBuf::from(format!("/x/projects/{slug}/{id}.jsonl"));
+        let sessions: Vec<_> = ["sess-a", "sess-b"]
+            .iter()
+            .map(|id| {
+                let mut s = make_session("p", None, None);
+                s.file_path = path(id);
+                s
+            })
+            .collect();
+        let live = |id: &str| crate::infrastructure::live_sessions::LiveSession {
+            session_id: id.to_string(),
+            jsonl_path: Some(path(id)),
+            cwd: dir.clone(),
+            name: None,
+            status: None,
+            pid: 1,
+            started_at: None,
+            updated_at: None,
+            jsonl_mtime: None,
+            is_live: false,
+            was_recently_live: false,
+        };
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let target = path("sess-b");
+        let contexts: [(&str, fn(&mut AppState), Send); 6] = [
+            (
+                "Daily",
+                |s| {
+                    s.tab = Tab::Daily;
+                    s.selected_session = 1;
+                },
+                default,
+            ),
+            (
+                "Live",
+                |s| {
+                    s.tab = Tab::Live;
+                    s.live_selected = 1;
+                },
+                default,
+            ),
+            (
+                "Detail",
+                |s| {
+                    s.tab = Tab::Daily;
+                    s.selected_session = 1;
+                    s.active_popup = crate::ActivePopup::Detail { back: None };
+                },
+                detail,
+            ),
+            (
+                "conversation Day list",
+                |s| {
+                    s.show_conversation = true;
+                    s.conv_list_mode = ConvListMode::Day;
+                    s.selected_session = 1;
+                },
+                conv,
+            ),
+            (
+                "conversation Live list",
+                |s| {
+                    s.show_conversation = true;
+                    s.conv_list_mode = ConvListMode::Live;
+                    s.selected_session = 1;
+                },
+                conv,
+            ),
+            (
+                "conversation All list",
+                |s| {
+                    s.show_conversation = true;
+                    s.conv_list_mode = ConvListMode::All;
+                    s.selected_session = 1;
+                },
+                conv,
+            ),
+        ];
+        for (name, setup, send) in contexts {
+            let fresh = || {
+                let mut s = make_test_app_state(vec![make_daily_group(day, sessions.clone())]);
+                s.verified_project_paths.insert(slug.clone(), dir.clone());
+                s.live_active = vec![live("sess-a"), live("sess-b")];
+                setup(&mut s);
+                s
+            };
+
+            let mut s = fresh();
+            send(&mut s, KeyCode::Char(' '));
+            assert!(
+                s.pins.is_pinned(&target),
+                "{name}: Space pins the cursor's row"
+            );
+
+            let mut s = fresh();
+            send(&mut s, KeyCode::Char('y'));
+            let want = crate::shell::resume_command(&dir.to_string_lossy(), "sess-b");
+            assert_eq!(
+                s.clipboard_task.as_ref().map(|t| t.text.as_str()),
+                Some(want.as_str()),
+                "{name}: y copies the cursor's resume command"
+            );
+
+            let mut s = fresh();
+            send(&mut s, KeyCode::Char('t'));
+            assert!(
+                matches!(&s.active_popup, crate::ActivePopup::TitleEdit { path, .. } if *path == target),
+                "{name}: t edits the cursor's title, got {:?}",
+                s.active_popup
+            );
+        }
+    }
+
+    /// A search typed deep in a transcript starts at the next match from
+    /// there, wrapping to the top, instead of jumping back to message one.
+    #[test]
+    fn a_pane_search_starts_from_where_it_was_opened() {
+        let mut pane = conv_test_pane(&["needle", "hay", "needle", "needle"]);
+        pane.message_lines = vec![(0, 0), (1, 1), (2, 2), (3, 3)];
+        pane.search_saved_scroll = Some((0, 1));
+        pane.search_input.set("needle".into());
+        ui::on_pane_search_edit(&mut pane);
+        assert_eq!(pane.search_matches[pane.search_current].0, 2);
+        pane.search_saved_scroll = Some((0, 3));
+        pane.search_input.set("hay".into());
+        ui::on_pane_search_edit(&mut pane);
+        assert_eq!(
+            pane.search_matches[pane.search_current].0, 1,
+            "wraps to the top"
+        );
+    }
+
+    #[test]
+    fn shift_tab_on_the_live_list_keeps_the_open_conversation() {
+        fn fail_preview(_: &mut AppState) {
+            panic!("the open conversation must not be swapped");
+        }
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.conv_list_mode = ConvListMode::Live;
+        state.selected_session = 3;
+        state.panes = vec![ConversationPane::default()];
+        cycle_conv_list_mode(&mut state, fail_preview);
+        assert!(matches!(state.conv_list_mode, ConvListMode::Live));
+        assert_eq!(state.selected_session, 3, "the cursor stays on its row");
+        assert!(
+            state.toast_message.is_some(),
+            "the key says why nothing changed"
+        );
+    }
+
+    /// A lone pane previews the cursor's row, so `C` on it splits instead of
+    /// answering "already open": the list keeps focus for the next pick.
+    #[test]
+    fn c_on_the_previewed_session_splits_the_view() {
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let session = crate::test_helpers::helpers::make_session("p", None, None);
+        let path = session.file_path.clone();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            crate::test_helpers::helpers::make_daily_group(day, vec![session]),
+        ]);
+        state.show_conversation = true;
+        state.conv_list_mode = ConvListMode::Day;
+        let mut pane = ConversationPane::default();
+        pane.file_path = Some(path);
+        state.panes = vec![pane];
+        handle_conversation_key(
+            &mut state,
+            KeyEvent::from(KeyCode::Char('C')),
+            noop,
+            noop,
+            crate::handlers::pane::get_conv_session_file,
+            crate::handlers::pane::get_conv_session_count,
+        );
+        assert_eq!(state.panes.len(), 2);
+        assert!(
+            state.panes[1].file_path.is_none(),
+            "the new pane waits for a pick"
+        );
+        assert_eq!(state.active_pane_index, None, "the list keeps focus");
+    }
+
+    #[test]
+    fn daily_session_keys_wait_for_the_session_list() {
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let session = crate::test_helpers::helpers::make_session("p", None, None);
+        let target = session.file_path.clone();
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            crate::test_helpers::helpers::make_daily_group(day, vec![session]),
+        ]);
+        state.tab = Tab::Daily;
+        state.daily_panel = DailyPanel::Breakdown;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char(' ')), noop);
+        assert!(
+            !state.pins.is_pinned(&target),
+            "the hidden row stays unpinned"
+        );
+        assert!(
+            state.toast_message.is_some(),
+            "the key says why it did nothing"
+        );
+
+        state.daily_panel = DailyPanel::Sessions;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char(' ')), noop);
+        assert!(state.pins.is_pinned(&target));
+    }
+
+    #[test]
+    fn the_conversation_live_list_follows_a_past_snapshot() {
+        let row = |id: &str| crate::infrastructure::live_sessions::LiveSession {
+            session_id: id.to_string(),
+            jsonl_path: Some(std::path::PathBuf::from(format!("/tmp/{id}.jsonl"))),
+            cwd: std::path::PathBuf::from("/tmp"),
+            name: None,
+            status: None,
+            pid: 1,
+            started_at: None,
+            updated_at: None,
+            jsonl_mtime: None,
+            is_live: false,
+            was_recently_live: false,
+        };
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.live_active = vec![row("today")];
+        state.live_past_sessions = vec![row("past-a"), row("past-b")];
+        state.live_view_snapshot_offset = 1;
+        state.conv_list_mode = ConvListMode::Live;
+        assert_eq!(crate::handlers::pane::get_conv_session_count(&state), 2);
+        assert_eq!(
+            crate::handlers::pane::get_conv_session_file(&state, 1),
+            Some(std::path::PathBuf::from("/tmp/past-b.jsonl"))
+        );
+    }
+
+    #[test]
+    fn y_on_a_daily_session_copies_its_resume_command() {
+        let dir = std::env::temp_dir();
+        let slug =
+            crate::infrastructure::live_sessions::official_project_slug(&dir.to_string_lossy());
+        let mut session = crate::test_helpers::helpers::make_session("p", None, None);
+        session.file_path = std::path::PathBuf::from(format!("/x/projects/{slug}/sess-abc.jsonl"));
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            crate::test_helpers::helpers::make_daily_group(day, vec![session]),
+        ]);
+        state.verified_project_paths.insert(slug, dir.clone());
+        state.tab = Tab::Daily;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('y')), noop);
+        let want = crate::shell::resume_command(&dir.to_string_lossy(), "sess-abc");
+        assert_eq!(
+            state.clipboard_task.as_ref().map(|t| t.text.as_str()),
+            Some(want.as_str())
+        );
+        assert_eq!(state.toast_message, Some(format!("Copied: {want}")));
+    }
+
+    #[test]
+    fn a_resume_copy_names_the_process_that_still_runs_the_session() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        let live = |id: &str, pid, is_live| crate::infrastructure::live_sessions::LiveSession {
+            session_id: id.to_string(),
+            jsonl_path: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            name: None,
+            status: None,
+            pid,
+            started_at: None,
+            updated_at: None,
+            jsonl_mtime: None,
+            is_live,
+            was_recently_live: false,
+        };
+        state.live_active = vec![live("other", 7, true), live("sess-1", 42, true)];
+        assert_eq!(
+            running_elsewhere(&state, "sess-1").as_deref(),
+            Some("⚠ Already open in pid 42 (tmp) — switch to it; copied anyway")
+        );
+        assert_eq!(running_elsewhere(&state, "sess-2"), None);
+        // A row rebuilt from the transcript alone has no process behind it.
+        state.live_active = vec![live("sess-1", 42, false)];
+        assert_eq!(running_elsewhere(&state, "sess-1"), None);
+    }
+
     #[test]
     fn live_t_on_unindexed_session_toasts_instead_of_opening_editor() {
         let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
@@ -3321,7 +3929,7 @@ mod tests {
         assert_eq!(
             state.insights_panel,
             crate::ui::INSIGHTS_PANELS - 1,
-            "left from panel 0 wraps to last"
+            "left from the first panel wraps to the last"
         );
         assert_eq!(state.insights_detail_scroll(), 0, "switch resets scroll");
         handle_insights_detail_key(&mut state, KeyEvent::from(KeyCode::Char('l')));
@@ -3455,10 +4063,13 @@ mod tests {
     }
 
     fn state_with_projects(n: usize) -> AppState {
-        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
         let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
-        state.project_list = (0..n).map(|i| (format!("proj{i}"), 100, date)).collect();
-        state
+        let sessions = (0..n)
+            .map(|i| crate::test_helpers::helpers::make_session(&format!("proj{i}"), None, None))
+            .collect();
+        crate::test_helpers::helpers::make_test_app_state(vec![
+            crate::test_helpers::helpers::make_daily_group(date, sessions),
+        ])
     }
 
     #[test]
@@ -3469,16 +4080,99 @@ mod tests {
         state.active_popup = crate::ActivePopup::ProjectPopup {
             selected: 0,
             scroll: 0,
+            query: crate::state::TextInput::default(),
         };
-        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Char('k')));
-        assert_eq!(state.project_popup_selected(), 0, "k at top stays at top");
+        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Up));
+        assert_eq!(state.project_popup_selected(), 0, "↑ at top stays at top");
         for _ in 0..10 {
-            handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Char('j')));
+            handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Down));
         }
         assert_eq!(
             state.project_popup_selected(),
             2,
-            "j clamps at the last project row"
+            "↓ clamps at the last project row"
+        );
+    }
+
+    /// Re-sorting the Models table keeps the cursor on its model, now on
+    /// another row, rather than dropping it on whatever sits first.
+    #[test]
+    fn re_sorting_models_keeps_the_cursor_on_its_model() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+        let d = |day| chrono::NaiveDate::from_ymd_opt(2026, 3, day).unwrap(); // lint-ok: date-literal
+        let mut state = crate::test_helpers::helpers::make_test_app_state(vec![
+            make_daily_group(
+                d(1),
+                vec![make_session_with_tokens("p", 900, 0, "claude-opus-5-5")],
+            ),
+            make_daily_group(
+                d(2),
+                vec![make_session_with_tokens("p", 10, 0, "claude-haiku-5-5")],
+            ),
+        ]);
+        for (model, tokens) in [("claude-opus-5-5", 900), ("claude-haiku-5-5", 10)] {
+            let name = crate::aggregator::normalize_model_name(model);
+            let ts = crate::aggregator::TokenStats {
+                input_tokens: tokens,
+                ..Default::default()
+            };
+            state.aggregated_model_tokens.insert(name, ts);
+        }
+        state.dashboard_models_sort = crate::state::RankSort::Tokens;
+        state.dashboard_scroll[crate::DashPanel::Models] = 1; // Haiku, the lighter
+        toggle_panel_sort(&mut state, crate::DashPanel::Models);
+        // By recency Haiku, used last, moves to the top, and the cursor with it.
+        assert_eq!(state.dashboard_scroll[crate::DashPanel::Models], 0);
+    }
+
+    #[test]
+    fn typing_narrows_the_project_picker_and_esc_clears_before_closing() {
+        let mut state = state_with_projects(3);
+        open_project_popup(&mut state);
+        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Char('2')));
+        assert_eq!(state.project_popup_query(), "2");
+        assert_eq!(state.project_popup_view().len(), 1);
+        assert_eq!(
+            state.project_popup_selected(),
+            1,
+            "the cursor lands on the match"
+        );
+        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.project_filter.as_deref(), Some("proj2"));
+
+        open_project_popup(&mut state);
+        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Char('x')));
+        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert!(
+            state.show_project_popup(),
+            "the first Esc only clears the query"
+        );
+        assert_eq!(state.project_popup_query(), "");
+        handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert!(!state.show_project_popup());
+    }
+
+    #[test]
+    fn re_sorting_the_project_picker_keeps_the_cursor_on_its_project() {
+        let mut state = state_with_projects(3);
+        open_project_popup(&mut state);
+        state.set_project_popup_selected(2);
+        let name_at = |state: &mut AppState, row: usize| {
+            let view = state.project_popup_view();
+            state.project_rows.as_ref().unwrap()[view[row - 1]]
+                .name
+                .clone()
+        };
+        let before = name_at(&mut state, 2);
+        for _ in 0..4 {
+            handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Tab));
+            let row = state.project_popup_selected();
+            assert_eq!(name_at(&mut state, row), before);
+        }
+        assert_eq!(
+            state.project_popup_sort,
+            crate::state::ProjectSort::Recent,
+            "four steps wrap"
         );
     }
 
@@ -3489,6 +4183,7 @@ mod tests {
         state.active_popup = crate::ActivePopup::ProjectPopup {
             selected: 0,
             scroll: 0,
+            query: crate::state::TextInput::default(),
         };
         handle_project_popup_key(&mut state, KeyEvent::from(KeyCode::Enter));
         assert_eq!(state.project_filter, None, "row 0 = All clears the filter");
@@ -3574,6 +4269,7 @@ mod tests {
                 crate::ActivePopup::ProjectPopup {
                     selected: 0,
                     scroll: 0,
+                    query: crate::state::TextInput::default(),
                 },
                 handle_project_popup_key,
             ),
@@ -3590,6 +4286,10 @@ mod tests {
         ];
         for (name, popup, handler) in &cases {
             for code in [KeyCode::Esc, KeyCode::Char('q')] {
+                // The project picker's letters narrow its list; Esc alone closes.
+                if *name == "project" && code == KeyCode::Char('q') {
+                    continue;
+                }
                 let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
                 state.active_popup = popup.clone();
                 handler(&mut state, KeyEvent::from(code));

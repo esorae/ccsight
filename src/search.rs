@@ -512,6 +512,169 @@ pub fn search_session_content(file_path: &Path, query: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// One query token and what it should parse into: the generator builds
+    /// the expected filters alongside the text, so the test needs no second
+    /// parser to compare against.
+    #[derive(Debug, Clone)]
+    enum Part {
+        State(SessionStateFilter),
+        Period(PeriodFilter),
+        Project(String),
+        Model(String),
+        Branch(String),
+        Free(String),
+    }
+
+    fn arb_part() -> impl proptest::strategy::Strategy<Value = Part> {
+        use proptest::prelude::*;
+        let word = "[a-z0-9-]{1,6}";
+        let state = prop_oneof![
+            Just(SessionStateFilter::Live),
+            Just(SessionStateFilter::Paused),
+            Just(SessionStateFilter::Busy),
+        ];
+        let day = (2020i32..2030, 1u32..13, 1u32..29)
+            .prop_map(|(y, m, d)| NaiveDate::from_ymd_opt(y, m, d).unwrap());
+        let period = prop_oneof![
+            Just(PeriodFilter::Today),
+            Just(PeriodFilter::Week),
+            Just(PeriodFilter::Month),
+            day.prop_map(PeriodFilter::On),
+        ];
+        prop_oneof![
+            state.prop_map(Part::State),
+            period.prop_map(Part::Period),
+            word.prop_map(Part::Project),
+            word.prop_map(Part::Model),
+            word.prop_map(Part::Branch),
+            // Free text: plain words, an empty-valued key, an unknown filter.
+            prop_oneof![
+                word.prop_map(String::from),
+                Just("project:".to_string()),
+                Just("model:".to_string()),
+                Just("branch:".to_string()),
+                Just("filter:nope".to_string()),
+                Just("filter:date:x".to_string()),
+            ]
+            .prop_map(Part::Free),
+        ]
+    }
+
+    fn token(part: &Part, upper: bool) -> String {
+        let key = |k: &str| {
+            if upper {
+                k.to_uppercase()
+            } else {
+                k.to_string()
+            }
+        };
+        match part {
+            Part::State(s) => format!(
+                "{}:{}",
+                key("filter"),
+                key(&format!("{s:?}").to_lowercase())
+            ),
+            Part::Period(PeriodFilter::On(d)) => {
+                format!("{}:date:{}", key("filter"), d.format("%Y-%m-%d"))
+            }
+            Part::Period(p) => format!(
+                "{}:{}",
+                key("filter"),
+                key(&format!("{p:?}").to_lowercase())
+            ),
+            Part::Project(v) => format!("{}:{v}", key("project")),
+            Part::Model(v) => format!("{}:{v}", key("model")),
+            Part::Branch(v) => format!("{}:{v}", key("branch")),
+            Part::Free(w) => w.clone(),
+        }
+    }
+
+    proptest::proptest! {
+        // Every token lands where it belongs, the last of each kind wins, and
+        // whatever is not a filter stays as free text in its order.
+        #[test]
+        fn a_query_parses_into_the_filters_its_tokens_name(
+            parts in proptest::collection::vec(arb_part(), 0..8),
+            upper in proptest::prelude::any::<bool>(),
+        ) {
+            let query = parts.iter().map(|p| token(p, upper)).collect::<Vec<_>>().join(" ");
+            let mut want = SearchFilters::default();
+            let mut free = Vec::new();
+            for part in &parts {
+                match part {
+                    Part::State(s) => want.state = Some(*s),
+                    Part::Period(p) => want.period = Some(*p),
+                    Part::Project(v) => want.project = Some(v.clone()),
+                    Part::Model(v) => want.model = Some(v.clone()),
+                    Part::Branch(v) => want.branch = Some(v.clone()),
+                    Part::Free(w) => free.push(w.clone()),
+                }
+            }
+            let (got, text) = parse_search_query(&query);
+            proptest::prop_assert_eq!(got.is_empty(), want == SearchFilters::default());
+            proptest::prop_assert_eq!(got, want);
+            proptest::prop_assert_eq!(text, free.join(" "));
+        }
+
+        // A session passes exactly when every filter set on it holds: its
+        // live state, and each needle inside its field, case aside.
+        #[test]
+        fn a_session_passes_exactly_the_filters_it_satisfies(
+            state in proptest::option::of(0usize..3),
+            membership in proptest::array::uniform3(proptest::prelude::any::<bool>()),
+            needles in proptest::array::uniform3(proptest::option::of("[ab]{1,2}")),
+            fields in proptest::array::uniform3(proptest::option::of("[abAB]{0,4}")),
+        ) {
+            let mut session = crate::test_helpers::helpers::make_session("p", None, None);
+            session.project_name = fields[0].clone().unwrap_or_default();
+            session.model = fields[1].clone();
+            session.git_branch = fields[2].clone();
+            let path = session.file_path.clone();
+            let set = |on: bool| on.then(|| path.clone()).into_iter().collect::<HashSet<_>>();
+            let (live, busy, paused) = (set(membership[0]), set(membership[1]), set(membership[2]));
+            let ctx = SearchFiltersContext {
+                today: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
+                live_paths: &live,
+                busy_paths: &busy,
+                paused_paths: &paused,
+            };
+            let states = [SessionStateFilter::Live, SessionStateFilter::Busy, SessionStateFilter::Paused];
+            let filters = SearchFilters {
+                state: state.map(|i| states[i]),
+                period: None,
+                project: needles[0].clone(),
+                model: needles[1].clone(),
+                branch: needles[2].clone(),
+            };
+            let holds = |needle: &Option<String>, field: Option<&str>| {
+                needle.as_ref().is_none_or(|n| {
+                    field.is_some_and(|f| f.to_lowercase().contains(&n.to_lowercase()))
+                })
+            };
+            let want = state.is_none_or(|i| membership[i])
+                && holds(&needles[0], Some(session.project_name.as_str()))
+                && holds(&needles[1], session.model.as_deref())
+                && holds(&needles[2], session.git_branch.as_deref());
+            proptest::prop_assert_eq!(session_passes_filters(&session, &filters, &ctx), want);
+        }
+
+        // A period keeps exactly the days its window covers, counted back
+        // from today inclusive.
+        #[test]
+        fn a_period_keeps_exactly_its_window(back in -3i64..40, pick in 0usize..4) {
+            let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+            let day = today - chrono::Duration::days(back);
+            let (period, want) = match pick {
+                0 => (PeriodFilter::Today, back == 0),
+                1 => (PeriodFilter::Week, (0..=6).contains(&back)),
+                2 => (PeriodFilter::Month, (0..=29).contains(&back)),
+                _ => (PeriodFilter::On(today - chrono::Duration::days(7)), back == 7),
+            };
+            proptest::prop_assert_eq!(period_matches_for_filter(day, Some(period), today), want);
+            proptest::prop_assert!(period_matches_for_filter(day, None, today));
+        }
+    }
+
     #[test]
     fn test_extract_snippet_empty_query() {
         let result = extract_snippet("hello world", "", 20);

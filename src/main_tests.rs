@@ -1534,11 +1534,23 @@ mod tests {
         assert!(state.search_saved_state.is_none(), "a later `/` would restore it");
     }
 
-    /// Deliver one Live poll whose active rows arrive in `order`.
+    /// Deliver one Live poll whose active rows arrive in `order`, each last
+    /// active a minute before the one ahead of it, as the list sorts them.
     fn deliver_live_poll(state: &mut AppState, order: &[&str]) {
+        let now = chrono::Utc::now();
+        let rows = order.iter().enumerate().map(|(i, id)| {
+            let mut s = live(id);
+            s.jsonl_path = None;
+            s.updated_at = Some(now - chrono::Duration::minutes(i as i64 + 1));
+            s
+        });
         let (tx, rx) = mpsc::channel();
-        tx.send((order.iter().map(|id| live(id)).collect(), Vec::new()))
-            .unwrap();
+        tx.send((
+            rows.collect(),
+            Vec::new(),
+            crate::state::LiveCaches::new(),
+        ))
+        .unwrap();
         state.live_sessions_task = Some(rx);
         poll_live_sessions_task(state);
     }
@@ -1576,7 +1588,12 @@ mod tests {
         state.live_active = vec![live("a"), live("b"), live("c")];
         state.live_selected = 2; // on "c", which goes idle below
         let (tx, rx) = mpsc::channel();
-        tx.send((vec![live("a"), live("b")], vec![live("c")])).unwrap();
+        tx.send((
+            vec![live("a"), live("b")],
+            vec![live("c")],
+            crate::state::LiveCaches::new(),
+        ))
+        .unwrap();
         state.live_sessions_task = Some(rx);
         poll_live_sessions_task(&mut state);
         assert_eq!(state.live_selected, 1, "cursor left the active pane");

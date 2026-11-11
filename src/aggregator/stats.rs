@@ -236,6 +236,14 @@ impl TokenStats {
         self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
     }
 
+    /// Share of input served from cache, the one definition every surface
+    /// shows: reads over all input — reads, writes and uncached alike, as
+    /// Claude Code's own prompt-cache hit ratio counts it. `None` with no input.
+    pub fn cache_hit_pct(&self) -> Option<f64> {
+        let input = self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens;
+        (input > 0).then(|| self.cache_read_tokens as f64 / input as f64 * 100.0)
+    }
+
     pub fn add(&mut self, usage: &Usage) {
         self.non_standard_speed |= is_unrated_speed(usage.speed.as_deref());
         self.input_tokens += usage.input_tokens;
@@ -319,6 +327,18 @@ fn adoption_slot(key: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_hit_share_counts_writes_in_its_input() {
+        let ts = TokenStats {
+            input_tokens: 10,
+            cache_read_tokens: 60,
+            cache_creation_tokens: 30,
+            ..TokenStats::default()
+        };
+        assert_eq!(ts.cache_hit_pct(), Some(60.0));
+        assert_eq!(TokenStats::default().cache_hit_pct(), None);
+    }
 
     #[test]
     fn test_token_stats_work_tokens_excludes_cache() {

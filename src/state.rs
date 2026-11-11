@@ -7,6 +7,8 @@ use ratatui::text::{Line, Span};
 
 use crate::aggregator::{CacheStats, CostCalculator, DailyGroup, Stats, TokenStats};
 use crate::infrastructure::{RetentionWarning, SearchIndex};
+use std::collections::HashMap;
+
 use crate::{ConversationMessage, pins, search};
 
 /// Canonical text-input field. `cursor` is a CHAR index translated via
@@ -151,6 +153,121 @@ impl Tab {
 
 /// The Daily panel Enter acts on. ↑ past the first session climbs to the
 /// Breakdown, then the Activity chart; ↓ comes back down the same way.
+/// One project in the picker: enough to tell projects apart and to choose.
+/// Counts follow the subagent rule (sessions leave subagents out; tokens,
+/// cost and activity take them in), as `Stats::from_groups` does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectRow {
+    pub name: String,
+    pub sessions: usize,
+    pub work_tokens: u64,
+    pub cost: f64,
+    /// Some model has no price, so `cost` is a lower bound.
+    pub unpriced: bool,
+    pub first: NaiveDate,
+    pub last: chrono::DateTime<chrono::Utc>,
+    pub daily_work_tokens: HashMap<NaiveDate, u64>,
+    pub branches: usize,
+    /// The model with the most work tokens, by display name, and its share.
+    pub top_model: Option<(String, f64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectSort {
+    #[default]
+    Recent,
+    Tokens,
+    Cost,
+    Sessions,
+}
+
+impl ProjectSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Recent => Self::Tokens,
+            Self::Tokens => Self::Cost,
+            Self::Cost => Self::Sessions,
+            Self::Sessions => Self::Recent,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Tokens => "tokens",
+            Self::Cost => "cost",
+            Self::Sessions => "sessions",
+        }
+    }
+}
+
+/// Fold every session slice into its project's row, unfiltered: the picker
+/// chooses among all projects, whatever filter is on now.
+pub(crate) fn build_project_rows(groups: &[DailyGroup]) -> Vec<ProjectRow> {
+    let calc = crate::aggregator::CostCalculator::global();
+    let mut rows: HashMap<&str, ProjectRow> = HashMap::new();
+    let mut seen: std::collections::HashSet<&std::path::Path> = std::collections::HashSet::new();
+    let mut branches: HashMap<&str, std::collections::HashSet<&str>> = HashMap::new();
+    let mut models: HashMap<&str, HashMap<String, u64>> = HashMap::new();
+    for group in groups {
+        for s in &group.sessions {
+            let row = rows.entry(&s.project_name).or_insert_with(|| ProjectRow {
+                name: s.project_name.clone(),
+                sessions: 0,
+                work_tokens: 0,
+                cost: 0.0,
+                unpriced: false,
+                first: group.date,
+                last: s.day_last_timestamp,
+                daily_work_tokens: HashMap::new(),
+                branches: 0,
+                top_model: None,
+            });
+            if !s.is_subagent && seen.insert(&s.file_path) {
+                row.sessions += 1;
+            }
+            let work = s.work_tokens();
+            row.work_tokens += work;
+            row.cost += s.cost(calc);
+            row.unpriced |= s.has_unpriced_model(calc);
+            row.first = row.first.min(group.date);
+            row.last = row.last.max(s.day_last_timestamp);
+            *row.daily_work_tokens.entry(group.date).or_insert(0) += work;
+            if let Some(b) = s.git_branch.as_deref().filter(|_| !s.is_subagent) {
+                branches.entry(&s.project_name).or_default().insert(b);
+            }
+            let per_model = models.entry(&s.project_name).or_default();
+            for (model, t) in &s.day_tokens_by_model {
+                *per_model
+                    .entry(crate::aggregator::normalize_model_name(model))
+                    .or_insert(0) += t.input_tokens + t.output_tokens;
+            }
+        }
+    }
+    rows.into_iter()
+        .map(|(name, mut row)| {
+            row.branches = branches.get(name).map_or(0, std::collections::HashSet::len);
+            if let Some(per_model) = models.get(name) {
+                let total: u64 = per_model.values().sum();
+                row.top_model = per_model
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                    .filter(|_| total > 0)
+                    .map(|(m, t)| (m.clone(), *t as f64 / total as f64));
+            }
+            row
+        })
+        .collect()
+}
+
+pub type LiveCaches = std::collections::HashMap<
+    String,
+    (
+        Option<std::time::SystemTime>,
+        crate::session_state::CacheTail,
+    ),
+>;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DailyPanel {
     #[default]
@@ -167,6 +284,59 @@ pub enum ConvListMode {
     /// Conv view was opened from the Live tab — left list shows live
     /// sessions (active + paused) and j/k navigates among them.
     Live,
+}
+
+/// The Dashboard's panels, in focus and click-area order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DashPanel {
+    #[default]
+    Costs,
+    Projects,
+    Models,
+    Ecosystem,
+    Languages,
+    Activity,
+    Hourly,
+}
+
+impl DashPanel {
+    pub const ALL: [Self; 7] = [
+        Self::Costs,
+        Self::Projects,
+        Self::Models,
+        Self::Ecosystem,
+        Self::Languages,
+        Self::Activity,
+        Self::Hourly,
+    ];
+
+    /// The panel after this one, wrapping; `forward = false` steps back.
+    pub fn step(self, forward: bool) -> Self {
+        let n = Self::ALL.len();
+        let i = self as usize;
+        Self::ALL[if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        }]
+    }
+}
+
+/// One value per Dashboard panel, indexed by the panel itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PerPanel<T>(pub [T; 7]);
+
+impl<T> std::ops::Index<DashPanel> for PerPanel<T> {
+    type Output = T;
+    fn index(&self, panel: DashPanel) -> &T {
+        &self.0[panel as usize]
+    }
+}
+
+impl<T> std::ops::IndexMut<DashPanel> for PerPanel<T> {
+    fn index_mut(&mut self, panel: DashPanel) -> &mut T {
+        &mut self.0[panel as usize]
+    }
 }
 
 /// Which Live-tab panes are shown. `v` cycles Split → ActiveOnly → PausedOnly.
@@ -266,6 +436,8 @@ pub enum ActivePopup {
     ProjectPopup {
         selected: usize,
         scroll: usize,
+        /// Typed text narrowing the list to projects whose name holds it.
+        query: TextInput,
     },
     /// Free-text editor for a session's custom title. Enter saves the
     /// typed text as a `custom-title` row for `path`; empty Enter is
@@ -324,8 +496,9 @@ impl PeriodFilter {
         match self {
             PeriodFilter::All | PeriodFilter::Pinned => (None, None),
             PeriodFilter::Today => (Some(today), None),
-            PeriodFilter::Last7d => (Some(today - chrono::Duration::days(7)), None),
-            PeriodFilter::Last30d => (Some(today - chrono::Duration::days(30)), None),
+            // N days counting today, as `filter:week` / `filter:month` count.
+            PeriodFilter::Last7d => (Some(today - chrono::Duration::days(6)), None),
+            PeriodFilter::Last30d => (Some(today - chrono::Duration::days(29)), None),
             PeriodFilter::ThisMonth => {
                 let first = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap();
                 (Some(first), None)
@@ -337,7 +510,7 @@ impl PeriodFilter {
                     NaiveDate::from_ymd_opt(last_prev.year(), last_prev.month(), 1).unwrap();
                 (Some(first_prev), Some(last_prev))
             }
-            PeriodFilter::Last90d => (Some(today - chrono::Duration::days(90)), None),
+            PeriodFilter::Last90d => (Some(today - chrono::Duration::days(89)), None),
             PeriodFilter::Custom(start, end) => (Some(start), end),
         }
     }
@@ -363,6 +536,26 @@ impl PeriodFilter {
                 format!("({}{sep}{})", s.format(fmt), e.format(fmt))
             }
             _ => String::new(),
+        }
+    }
+
+    /// [`Self::parse_custom`], or why the input cannot be a period: the
+    /// message names the fix, so a wrong digit is told from a wrong shape.
+    pub fn check_custom(input: &str, today: NaiveDate) -> Result<PeriodFilter, &'static str> {
+        match Self::parse_custom(input) {
+            Some(PeriodFilter::Custom(start, _)) if start > today => {
+                Err("Starts after today — nothing to show yet")
+            }
+            Some(p) => Ok(p),
+            None if !input.trim().is_empty()
+                && input
+                    .trim()
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '-' || c == '.') =>
+            {
+                Err("No such date — check the month and day")
+            }
+            None => Err("Use YYYY, YYYY-MM, YYYY-MM-DD or FROM..TO"),
         }
     }
 
@@ -437,6 +630,35 @@ mod tab_tests {
 #[cfg(test)]
 mod period_filter_tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_custom_period_says_what_to_fix() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(); // lint-ok: date-literal
+        assert!(PeriodFilter::check_custom("2026-10", today).is_ok());
+        let err = |s: &str| PeriodFilter::check_custom(s, today).unwrap_err();
+        assert!(err("2026-02-30").starts_with("No such date")); // lint-ok: date-literal
+        assert!(err("2026-13").starts_with("No such date"));
+        assert!(err("2030").starts_with("Starts after today"));
+        assert!(err("last week").starts_with("Use YYYY"));
+    }
+
+    /// `7d` and `filter:week` (and `30d` / `filter:month`) are one range:
+    /// N days counting today, so the preset and the search token agree.
+    #[test]
+    fn a_preset_spans_the_same_days_as_its_search_token() {
+        use crate::search::{PeriodFilter as Token, period_bounds};
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(
+            PeriodFilter::Last7d.date_range().0,
+            period_bounds(Some(Token::Week), today).0
+        );
+        assert_eq!(
+            PeriodFilter::Last30d.date_range().0,
+            period_bounds(Some(Token::Month), today).0
+        );
+        let (from, _) = PeriodFilter::Last90d.date_range();
+        assert_eq!((today - from.unwrap()).num_days() + 1, 90);
+    }
 
     #[test]
     fn test_parse_custom_year_only() {
@@ -517,6 +739,110 @@ mod resume_dir_tests {
                 .is_none()
         );
         std::fs::remove_dir_all(&real).ok();
+    }
+}
+
+#[cfg(test)]
+mod view_end_tests {
+    use super::*;
+    use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+
+    /// A past period divides by its own days: running on to today would
+    /// count every day since as an idle one and shrink each per-day figure.
+    #[test]
+    fn a_past_period_averages_over_its_own_days() {
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap(); // lint-ok: date-literal
+        let mut state = make_test_app_state(vec![make_daily_group(
+            d(9, 1),
+            vec![make_session("p", None, None)],
+        )]);
+        let today = d(10, 26);
+        state.period_filter = PeriodFilter::Custom(d(9, 1), Some(d(9, 30)));
+        assert_eq!(state.view_end(today), d(9, 30));
+        assert_eq!(state.calendar_days(today), 30);
+        // An open-ended period runs to today, and never past it.
+        state.period_filter = PeriodFilter::Custom(d(9, 1), None);
+        assert_eq!(state.calendar_days(today), 56);
+        state.period_filter = PeriodFilter::Custom(d(9, 1), Some(d(12, 31)));
+        assert_eq!(state.view_end(today), today);
+    }
+}
+
+#[cfg(test)]
+mod project_rows_tests {
+    use super::*;
+    use crate::test_helpers::helpers::{make_daily_group, make_session_with_tokens};
+
+    /// A session that spans two days counts once; its subagent spends but is
+    /// not a session; branches and the leading model come from the main chain.
+    #[test]
+    fn a_project_row_follows_the_subagent_rule_and_counts_a_session_once() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(); // lint-ok: date-literal
+        let d2 = NaiveDate::from_ymd_opt(2026, 3, 2).unwrap(); // lint-ok: date-literal
+        let main = |branch: &str| {
+            let mut s = make_session_with_tokens("p", 100, 50, "claude-opus-5-5");
+            s.file_path = PathBuf::from("/x/main.jsonl");
+            s.git_branch = Some(branch.into());
+            s
+        };
+        let mut sub = make_session_with_tokens("p", 10, 5, "claude-haiku-5-5");
+        sub.file_path = PathBuf::from("/x/main/subagents/agent-1.jsonl");
+        sub.is_subagent = true;
+        sub.git_branch = Some("sub-branch".into());
+        let groups = vec![
+            make_daily_group(d1, vec![main("a")]),
+            make_daily_group(d2, vec![main("b"), sub]),
+        ];
+        let rows = build_project_rows(&groups);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(
+            r.sessions, 1,
+            "one transcript over two days, subagent left out"
+        );
+        assert_eq!(r.work_tokens, 150 + 150 + 15, "subagent work counts");
+        assert_eq!((r.first, r.branches), (d1, 2));
+        assert_eq!(r.daily_work_tokens.get(&d2), Some(&165));
+        let (model, share) = r.top_model.clone().unwrap();
+        assert_eq!(
+            model,
+            crate::aggregator::normalize_model_name("claude-opus-5-5")
+        );
+        assert!((share - 300.0 / 315.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_picker_view_narrows_by_query_and_orders_by_its_sort() {
+        let d = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(); // lint-ok: date-literal
+        let groups = vec![make_daily_group(
+            d,
+            vec![
+                make_session_with_tokens("~/a/alpha", 900, 0, "claude-opus-5-5"),
+                make_session_with_tokens("~/a/beta", 100, 0, "claude-opus-5-5"),
+                make_session_with_tokens("~/a/alphabet", 500, 0, "claude-opus-5-5"),
+            ],
+        )];
+        let mut state = crate::test_helpers::helpers::make_test_app_state(groups);
+        state.active_popup = ActivePopup::ProjectPopup {
+            selected: 0,
+            scroll: 0,
+            query: TextInput::default(),
+        };
+        let names = |state: &mut AppState| -> Vec<String> {
+            let view = state.project_popup_view();
+            let rows = state.project_rows.as_deref().unwrap_or_default();
+            view.iter().map(|&i| rows[i].name.clone()).collect()
+        };
+        state.project_popup_sort = ProjectSort::Tokens;
+        assert_eq!(names(&mut state), ["~/a/alpha", "~/a/alphabet", "~/a/beta"]);
+        if let Some(q) = state.project_popup_query_mut() {
+            q.set("ALPHA".into());
+        }
+        assert_eq!(
+            names(&mut state),
+            ["~/a/alpha", "~/a/alphabet"],
+            "case-insensitive"
+        );
     }
 }
 
@@ -798,7 +1124,7 @@ pub struct LayoutAreas {
     /// Clicking a recorded area toggles expansion and moves the cursor to that server.
     pub mcp_server_row_areas: Vec<(usize, ratatui::layout::Rect)>,
     /// Click areas for project rows in the Projects detail popup (Dashboard
-    /// panel 1). `(project_index, area)` where index is the sorted projects
+    /// Projects). `(project_index, area)` where index is the sorted projects
     /// list position. Click selects the row; second click (or Enter) opens
     /// the per-project detail popup.
     pub project_detail_row_areas: Vec<(usize, ratatui::layout::Rect)>,
@@ -806,8 +1132,11 @@ pub struct LayoutAreas {
     /// session cursor (Day activity, Project detail). A click moves the
     /// cursor there; a double-click opens it as Enter does.
     pub cursor_row_areas: Vec<(usize, ratatui::layout::Rect)>,
+    /// Every on-screen `key:action` hint and the key it stands for: a click
+    /// presses that key, so anything a footer advertises works by mouse.
+    pub hint_areas: Vec<(ratatui::layout::Rect, crossterm::event::KeyEvent)>,
     pub pane_areas: Vec<ratatui::layout::Rect>,
-    pub dashboard_panel_areas: Vec<ratatui::layout::Rect>,
+    pub dashboard_panel_areas: Vec<(DashPanel, ratatui::layout::Rect)>,
     pub insights_panel_areas: Vec<ratatui::layout::Rect>,
     pub session_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
     /// Active-frame row hit-test data. `(inner_rect, scroll, active_count)` so
@@ -829,9 +1158,10 @@ pub struct LayoutAreas {
     pub filter_popup_area_trigger: Option<ratatui::layout::Rect>,
     pub project_popup_area_trigger: Option<ratatui::layout::Rect>,
     pub pin_view_trigger: Option<ratatui::layout::Rect>,
-    pub help_trigger: Option<ratatui::layout::Rect>,
     pub filter_popup_area: Option<ratatui::layout::Rect>,
     pub project_popup_area: Option<ratatui::layout::Rect>,
+    /// The picker's list rows, below which its detail lines sit.
+    pub project_popup_list_area: Option<ratatui::layout::Rect>,
     pub search_results_area: Option<ratatui::layout::Rect>,
 }
 
@@ -884,9 +1214,13 @@ pub struct AppState {
         mpsc::Receiver<(
             Vec<crate::infrastructure::live_sessions::LiveSession>,
             Vec<crate::infrastructure::live_sessions::LiveSession>,
+            LiveCaches,
         )>,
     >,
     pub live_last_update: Option<std::time::Instant>,
+    /// Each Live row's prompt-cache tail by session id, keyed with the
+    /// transcript mtime it was read at so an unchanged file is not re-read.
+    pub live_cache: LiveCaches,
     /// Alive-session set from the prior run's final snapshot, frozen once
     /// at boot. Drives the Live tab's `⟳ restorable` marker: a paused
     /// session is restorable iff it was alive when ccsight last had a view
@@ -938,13 +1272,13 @@ pub struct AppState {
     pub loading: bool,
     pub error: Option<String>,
     pub cache_stats: Option<CacheStats>,
-    pub dashboard_panel: usize,
-    pub dashboard_scroll: [usize; 7],
+    pub dashboard_panel: DashPanel,
+    pub dashboard_scroll: PerPanel<usize>,
     /// Viewport (edge-triggered) for cursor-bearing dashboard popups
-    /// (panel 1 / Projects). Cursor-less panels keep both in
+    /// (Projects). Cursor-less panels keep both in
     /// `dashboard_scroll`. Vim `scrolloff` pattern; mirrors MCP server detail.
-    pub dashboard_viewport: [usize; 7],
-    /// Daily Activity detail popup (panel 5) view toggle: `false` = per-day
+    pub dashboard_viewport: PerPanel<usize>,
+    /// Daily Activity detail popup view toggle: `false` = per-day
     /// bars, `true` = ISO-week aggregation. Toggled
     /// by `w` inside the popup; persisted for the session so reopening keeps
     /// the chosen mode.
@@ -957,7 +1291,7 @@ pub struct AppState {
     /// 1=Skills, 2=Commands, 3=Subagents. Tools merges Built-in and MCP since
     /// both are tools the assistant calls; Subagents are dispatcher-tier meta-
     /// tools and shown last. Only meaningful when
-    /// `dashboard_panel == 3 && show_dashboard_detail`.
+    /// `dashboard_panel == crate::DashPanel::Ecosystem && show_dashboard_detail`.
     pub tools_detail_section: usize,
     /// MCP servers whose tool breakdown is currently expanded (shown inline below the
     /// server row) in the Tools detail Tools tab (MCP subsection). Retained while
@@ -1019,7 +1353,7 @@ pub struct AppState {
     /// Result of the most recent `spawn_clipboard_write`. The main loop
     /// polls this so a failure (no display server, no clipboard daemon)
     /// can overwrite the optimistic "Copied" toast with an error message.
-    pub clipboard_task: Option<mpsc::Receiver<Result<(), String>>>,
+    pub clipboard_task: Option<crate::handlers::tasks::ClipboardTask>,
     pub data_limit: usize,
     pub animation_frame: usize,
     pub retention_warning: Option<RetentionWarning>,
@@ -1035,9 +1369,18 @@ pub struct AppState {
     pub session_detail_recent: Option<Vec<(String, String)>>,
     pub session_detail_recent_task: Option<mpsc::Receiver<Vec<(String, String)>>>,
     pub session_detail_recent_for: Option<PathBuf>,
+    /// The detail's prompt-cache tail for a session the Live poll does not
+    /// cover, read once per transcript mtime rather than every frame.
+    pub session_detail_cache: Option<(
+        PathBuf,
+        Option<std::time::SystemTime>,
+        Option<crate::session_state::CacheTail>,
+    )>,
     pub insights_panel: usize,
     pub toast_message: Option<String>,
     pub toast_time: Option<std::time::Instant>,
+    /// Painted in the warning color and held longer than a confirmation.
+    pub toast_warning: bool,
     pub panes: Vec<ConversationPane>,
     pub active_pane_index: Option<usize>,
     pub session_list_hidden: bool,
@@ -1045,6 +1388,10 @@ pub struct AppState {
     pub period_filter: PeriodFilter,
     pub project_filter: Option<String>,
     pub project_list: Vec<(String, u64, NaiveDate)>,
+    /// The project picker's rows, folded on first open after a load.
+    pub project_rows: Option<Vec<ProjectRow>>,
+    /// The picker's order; kept across opens.
+    pub project_popup_sort: ProjectSort,
     /// Pre-computed disambiguated display labels keyed by full project_name.
     /// Built alongside `project_list` so render paths can append a `(parent)`
     /// suffix on basename collision without re-scanning `project_list` per call.
@@ -1065,16 +1412,16 @@ pub struct AppState {
     /// so currently-active projects sit at the top.
     pub dashboard_projects_sort: RankSort,
     /// Sort mode for the Dashboard Models panel + detail popup. Same toggle
-    /// semantics as `dashboard_projects_sort`, scoped to panel 2.
+    /// semantics as `dashboard_projects_sort`, scoped to the Models panel.
     pub dashboard_models_sort: RankSort,
     /// First model row the Models detail table shows. Apart from the cursor
-    /// (`dashboard_scroll[2]`): the view moves only when the cursor leaves it.
+    /// (`dashboard_scroll[crate::DashPanel::Models]`): the view moves only when the cursor leaves it.
     pub models_detail_offset: usize,
-    /// Sort mode for the Dashboard Ecosystem detail popup (panel 3) — all
+    /// Sort mode for the Dashboard Ecosystem detail popup — all
     /// tabs' item lists and the MCP server rows. `Recency` ranks by
     /// last-used (default); the magnitude variant ranks by call count.
     pub dashboard_ecosystem_sort: RankSort,
-    /// Sort mode for the Dashboard Languages panel + detail popup (panel 4).
+    /// Sort mode for the Dashboard Languages panel + detail popup.
     /// Same toggle semantics as the other rankable panels; `Recency` (default)
     /// ranks by the last day a file of that language/extension was touched.
     pub dashboard_languages_sort: RankSort,
@@ -1164,6 +1511,12 @@ impl AppState {
     pub fn toast(&mut self, msg: impl Into<String>) {
         self.toast_message = Some(msg.into());
         self.toast_time = Some(std::time::Instant::now());
+        self.toast_warning = false;
+    }
+
+    pub fn toast_warn(&mut self, msg: impl Into<String>) {
+        self.toast(msg);
+        self.toast_warning = true;
     }
 
     pub fn show_help(&self) -> bool {
@@ -1224,6 +1577,51 @@ impl AppState {
         if let ActivePopup::ProjectPopup { scroll: s, .. } = &mut self.active_popup {
             *s = scroll;
         }
+    }
+    pub(crate) fn project_popup_query(&self) -> &str {
+        match &self.active_popup {
+            ActivePopup::ProjectPopup { query, .. } => &query.text,
+            _ => "",
+        }
+    }
+    pub(crate) fn project_popup_query_mut(&mut self) -> Option<&mut TextInput> {
+        match &mut self.active_popup {
+            ActivePopup::ProjectPopup { query, .. } => Some(query),
+            _ => None,
+        }
+    }
+
+    /// The project picker's rows after its query and sort, as indexes into
+    /// `project_rows`. Draw, keys, clicks and the wheel all index this one
+    /// view, so a row number means the same project on each.
+    pub(crate) fn project_popup_view(&mut self) -> Vec<usize> {
+        if self.project_rows.is_none() {
+            self.project_rows = Some(build_project_rows(&self.original_daily_groups));
+        }
+        let query = self.project_popup_query().to_lowercase();
+        let rows = self.project_rows.as_deref().unwrap_or_default();
+        let mut view: Vec<usize> = (0..rows.len())
+            .filter(|&i| {
+                query.is_empty()
+                    || rows[i].name.to_lowercase().contains(&query)
+                    || self
+                        .project_label(&rows[i].name)
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .collect();
+        let sort = self.project_popup_sort;
+        view.sort_by(|&a, &b| {
+            let (a, b) = (&rows[a], &rows[b]);
+            let key = match sort {
+                ProjectSort::Recent => b.last.cmp(&a.last),
+                ProjectSort::Tokens => b.work_tokens.cmp(&a.work_tokens),
+                ProjectSort::Cost => b.cost.total_cmp(&a.cost),
+                ProjectSort::Sessions => b.sessions.cmp(&a.sessions),
+            };
+            key.then_with(|| a.name.cmp(&b.name))
+        });
+        view
     }
     pub(crate) fn summary_scroll(&self) -> usize {
         match &self.active_popup {
@@ -1439,34 +1837,24 @@ impl AppState {
         self.daily_costs.len()
     }
 
-    /// Days from the view's first active day through `today`, idle days
+    /// The view's last day: a past period ends before `today`, and averages
+    /// and trend windows that ran on to today would count days it excludes.
+    pub(crate) fn view_end(&self, today: chrono::NaiveDate) -> chrono::NaiveDate {
+        self.period_filter
+            .date_range()
+            .1
+            .map_or(today, |end| end.min(today))
+    }
+
+    /// Days from the view's first active day through its last, idle days
     /// included: the divisor every per-day average uses.
     pub(crate) fn calendar_days(&self, today: chrono::NaiveDate) -> usize {
+        let end = self.view_end(today);
         self.daily_groups
             .iter()
             .map(|g| g.date)
             .min()
-            .map_or(1, |first| (today - first).num_days().max(0) as usize + 1)
-    }
-
-    /// Project filter popup row order — follows the same sort mode as the
-    /// Projects panel so the two surfaces agree on rank. References point
-    /// into `project_list`; the caller indexes into the returned view.
-    pub(crate) fn project_list_sorted(&self) -> Vec<&(String, u64, chrono::NaiveDate)> {
-        let mut sorted: Vec<&(String, u64, chrono::NaiveDate)> = self.project_list.iter().collect();
-        match self.dashboard_projects_sort {
-            RankSort::Tokens => {
-                sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            }
-            RankSort::Recency => {
-                sorted.sort_by(|a, b| {
-                    b.2.cmp(&a.2)
-                        .then_with(|| b.1.cmp(&a.1))
-                        .then_with(|| a.0.cmp(&b.0))
-                });
-            }
-        }
-        sorted
+            .map_or(1, |first| (end - first).num_days().max(0) as usize + 1)
     }
 
     /// Sort a `(name, ProjectStats)` vec in place to match the Projects
@@ -1583,10 +1971,18 @@ impl AppState {
             }
             RankSort::Recency => {
                 let last_used = self.language_last_used();
-                let last_date_for = |name: &str| last_used.get(name).copied();
+                // An unknown extension's row reads `.ext`; its usage is keyed `ext`.
+                let last_date_for = |(name, _, unknown): &(String, usize, bool)| {
+                    let key = if *unknown {
+                        name.trim_start_matches('.')
+                    } else {
+                        name.as_str()
+                    };
+                    last_used.get(key).copied()
+                };
                 entries.sort_by(|a, b| {
-                    last_date_for(&b.0)
-                        .cmp(&last_date_for(&a.0))
+                    last_date_for(b)
+                        .cmp(&last_date_for(a))
                         .then_with(|| b.1.cmp(&a.1))
                         .then_with(|| a.0.cmp(&b.0))
                 });
@@ -1632,6 +2028,7 @@ impl AppState {
             live_has_snapshot_history,
             live_sessions_task: None,
             live_last_update: None,
+            live_cache: LiveCaches::new(),
             prior_run_alive,
             live_view_snapshot_offset: 0,
             live_past_sessions: Vec::new(),
@@ -1652,9 +2049,9 @@ impl AppState {
             loading: true,
             error: None,
             cache_stats: None,
-            dashboard_panel: 0,
-            dashboard_scroll: [0; 7],
-            dashboard_viewport: [0; 7],
+            dashboard_panel: DashPanel::Costs,
+            dashboard_scroll: PerPanel::default(),
+            dashboard_viewport: PerPanel::default(),
             activity_view_weekly: false,
             show_empty_days: false,
             tools_detail_section: 0,
@@ -1698,9 +2095,11 @@ impl AppState {
             session_detail_recent: None,
             session_detail_recent_task: None,
             session_detail_recent_for: None,
+            session_detail_cache: None,
             insights_panel: 0,
             toast_message: None,
             toast_time: None,
+            toast_warning: false,
             panes: Vec::new(),
             active_pane_index: None,
             session_list_hidden: false,
@@ -1708,6 +2107,8 @@ impl AppState {
             period_filter: PeriodFilter::All,
             project_filter: None,
             project_list: Vec::new(),
+            project_rows: None,
+            project_popup_sort: ProjectSort::default(),
             project_labels: std::collections::HashMap::new(),
             original_daily_groups: Vec::new(),
             verified_project_paths: std::collections::HashMap::new(),
@@ -1933,6 +2334,7 @@ impl AppState {
             .collect();
 
         self.project_list = list;
+        self.project_rows = None;
     }
 
     /// Display label for a project, disambiguated against other projects that
@@ -2277,5 +2679,25 @@ mod selection_tests {
         let mut next = vec!["d", "new", "b", "a"];
         hold_order(&mut next, &["a", "b", "c", "d"], |s| *s);
         assert_eq!(next, vec!["a", "b", "d", "new"]);
+    }
+}
+
+#[cfg(test)]
+mod dash_panel_tests {
+    use super::DashPanel;
+
+    // h / l walk every panel once in each direction and wrap at both ends.
+    #[test]
+    fn stepping_visits_every_panel_and_wraps() {
+        let mut forward = vec![DashPanel::Costs];
+        for _ in 1..DashPanel::ALL.len() {
+            forward.push(forward.last().unwrap().step(true));
+        }
+        assert_eq!(forward, DashPanel::ALL);
+        assert_eq!(DashPanel::Hourly.step(true), DashPanel::Costs);
+        assert_eq!(DashPanel::Costs.step(false), DashPanel::Hourly);
+        for p in DashPanel::ALL {
+            assert_eq!(p.step(true).step(false), p, "{p:?}");
+        }
     }
 }

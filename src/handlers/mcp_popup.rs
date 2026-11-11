@@ -109,13 +109,31 @@ fn mcp_cursor_row(state: &AppState, servers: &[String]) -> usize {
             return row;
         }
         row += row_span_of_server(state, server);
+        // The renderer's "── MCP servers ──" divider follows the Built-in group.
+        if server == BUILTIN_GROUP_NAME && i + 1 < servers.len() {
+            row += 1;
+        }
     }
     row
 }
 
+/// Whether the Tools tab shows its "Built-in N · MCP M" ratio line: only when
+/// both sides have calls. The renderer, the row count and the cursor all ask.
+pub(crate) fn tools_ratio_shown(state: &AppState) -> bool {
+    let (mut builtin, mut mcp) = (0usize, 0usize);
+    for (key, count) in &state.stats.tool_usage {
+        match classify_tool(key) {
+            ToolCategory::BuiltIn => builtin += count,
+            ToolCategory::Mcp { .. } => mcp += count,
+            _ => {}
+        }
+    }
+    builtin > 0 && mcp > 0
+}
+
 /// Pre-group header row count in Tools tab body — must mirror
-/// `draw_dashboard_detail_popup`'s active==0 branch (summary + optional
-/// stale legend). Coord-unity: `dashboard_scroll[3]` and
+/// `draw_dashboard_detail_popup`'s active==0 branch (summary, optional
+/// ratio line, optional stale legend). Coord-unity: `dashboard_scroll[crate::DashPanel::Ecosystem]` and
 /// `mcp_cursor_row(...) + mcp_pre_server_offset(...)` MUST share "row 0";
 /// drift causes off-by-N invisibility of the cursor.
 fn mcp_pre_server_offset(state: &AppState) -> usize {
@@ -129,28 +147,23 @@ fn mcp_pre_server_offset(state: &AppState) -> usize {
         .mcp_status
         .iter()
         .any(|s| s.is_underutilized(stale_at, 30));
-    1 + usize::from(any_stale)
+    1 + usize::from(tools_ratio_shown(state)) + usize::from(any_stale)
 }
 
-/// Clamp `dashboard_scroll[3]` so the MCP cursor stays in the visible
+/// Clamp `dashboard_scroll[crate::DashPanel::Ecosystem]` so the MCP cursor stays in the visible
 /// body slice (popup inner − 4 pinned header rows). Scroll and cursor
 /// share row-0 = summary; servers begin at `pre_server_offset`.
 pub(crate) fn adjust_mcp_scroll(state: &mut AppState, servers: &[String]) {
-    // Pinned header rows above the scrollable body: blank + Total + tab bar + separator.
     // The summary (and optional legend) lives in body[0..] and scrolls with the rest.
-    const HEADER_ROWS: usize = 4;
+    const HEADER_ROWS: usize = crate::ui::dashboard::ECOSYSTEM_HEADER_ROWS;
     let visible_body = state.layout.active_popup_area.map_or(20, |a| {
         (a.height as usize).saturating_sub(2 + HEADER_ROWS).max(1)
     });
     // mcp_cursor_row returns server-relative (server 0 = row 0); add the pre-server
     // offset (summary + optional legend) so body_cursor matches the rendered slice.
     let body_cursor = mcp_cursor_row(state, servers) + mcp_pre_server_offset(state);
-    let scroll = &mut state.dashboard_scroll[3];
-    if body_cursor < *scroll {
-        *scroll = body_cursor;
-    } else if body_cursor >= *scroll + visible_body {
-        *scroll = body_cursor + 1 - visible_body;
-    }
+    let scroll = &mut state.dashboard_scroll[crate::DashPanel::Ecosystem];
+    *scroll = crate::ui::follow_row(*scroll, body_cursor, 1, visible_body, false);
 }
 
 #[cfg(test)]
@@ -158,6 +171,37 @@ mod tests {
     use super::*;
     use crate::infrastructure::McpServerStatus;
     use chrono::{Duration, Utc};
+
+    // The MCP cursor stays inside the visible body: moving past either edge
+    // scrolls just far enough, moving within it leaves the scroll alone.
+    #[test]
+    fn the_mcp_scroll_keeps_the_cursor_in_the_visible_body() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        for i in 0..30 {
+            state
+                .stats
+                .tool_usage
+                .insert(format!("mcp__server{i:02}__do"), 1);
+        }
+        // Inner height 12 = 10 body rows; 4 of them are pinned headers.
+        state.layout.active_popup_area = Some(ratatui::layout::Rect::new(0, 0, 80, 12));
+        let servers = crate::collect_mcp_servers(&state);
+        let visible = 12 - 2 - 4;
+        let body =
+            |state: &AppState| mcp_cursor_row(state, &servers) + mcp_pre_server_offset(state);
+        let scroll = |state: &AppState| state.dashboard_scroll[crate::DashPanel::Ecosystem];
+
+        state.mcp_selected_server = 20;
+        adjust_mcp_scroll(&mut state, &servers);
+        assert_eq!(scroll(&state), body(&state) + 1 - visible, "bottom edge");
+        let held = scroll(&state);
+        state.mcp_selected_server = 19;
+        adjust_mcp_scroll(&mut state, &servers);
+        assert_eq!(scroll(&state), held, "inside the view: no scroll");
+        state.mcp_selected_server = 0;
+        adjust_mcp_scroll(&mut state, &servers);
+        assert_eq!(scroll(&state), body(&state), "top edge");
+    }
 
     fn make_state() -> AppState {
         crate::test_helpers::helpers::make_test_app_state(Vec::new())

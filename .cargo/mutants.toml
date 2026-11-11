@@ -1,0 +1,16 @@
+# Read by `cargo mutants`; run it through `scripts/mutants.sh`.
+profile = "mutants"
+
+exclude_re = [
+    # Mutants that cannot change behaviour, so no test can catch them.
+    # The returned attempt's own `iterations` is never read after the split.
+    "delete field iterations from struct crate::domain::Usage expression in billed_attempts",
+    # A fresh calculator holds the same tables as the global one.
+    "replace CostCalculator::global -> &'static CostCalculator",
+    # Colors change what is seen, but render tests compare text: a wrong
+    # shade cannot fail them, and a pixel check would cost more than it guards.
+    "theme::ramp_color",
+    "theme::primary_with_intensity",
+    "cost_color::cost_(total_)?style",
+    "tool_category_color",
+]

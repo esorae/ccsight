@@ -443,12 +443,10 @@ impl CcsightServer {
             _ => serde_json::json!(null),
         };
 
-        let cache_hit_rate = if total_input + total_cache_read > 0 {
-            (total_cache_read as f64 / (total_input + total_cache_read) as f64 * 1000.0).round()
-                / 10.0
-        } else {
-            0.0
-        };
+        let cache_hit_rate = stats
+            .total_tokens
+            .cache_hit_pct()
+            .map_or(0.0, |p| (p * 10.0).round() / 10.0);
 
         let total_tool_calls: usize = stats.tool_usage.values().sum();
         let mut top_tools: Vec<serde_json::Value> = stats

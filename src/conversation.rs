@@ -200,9 +200,17 @@ fn messages_from_entries(entries: Vec<LogEntry>) -> Vec<ConversationMessage> {
             // Claude Code's context-compaction recap and its own injected
             // notes arrive as `user` entries nobody typed; their own roles
             // keep them out of "You".
+            let injected = || {
+                blocks.iter().all(|b| match b {
+                    ConversationBlock::Text(t) => crate::text::looks_like_system_injection(t),
+                    _ => false,
+                })
+            };
             let role = match message.role {
                 _ if e.is_compact_summary => "recap".to_string(),
                 _ if e.is_meta => "meta".to_string(),
+                // A harness note sent with the user role is not the user's.
+                Role::User if injected() => "meta".to_string(),
                 Role::User => "user".to_string(),
                 Role::Assistant => "assistant".to_string(),
                 Role::Unknown => "unknown".to_string(),
@@ -880,11 +888,16 @@ mod recap_tests {
             r#"{"type":"user","timestamp":"2026-03-20T10:00:00Z","message":{"role":"user","content":"real question"}}"#,
             r#"{"type":"user","isCompactSummary":true,"timestamp":"2026-03-20T11:00:00Z","message":{"role":"user","content":"This session is being continued..."}}"#,
             r#"{"type":"user","isMeta":true,"timestamp":"2026-03-20T12:00:00Z","message":{"role":"user","content":"Continue from where you left off."}}"#,
+            r#"{"type":"user","timestamp":"2026-03-20T13:00:00Z","message":{"role":"user","content":"[Request interrupted by user]"}}"#,
         ];
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
         let messages = load_conversation(&path).unwrap();
         let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, ["user", "recap", "meta"]);
+        assert_eq!(
+            roles,
+            ["user", "recap", "meta", "meta"],
+            "a harness note is not You"
+        );
         let recent = recent_message_previews(&messages, 5);
         assert!(
             recent

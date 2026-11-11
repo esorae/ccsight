@@ -12,8 +12,8 @@ use chrono::NaiveDate;
 
 use super::theme;
 use super::{calc_scroll, cost_style_marked, cost_total_style, format_cost};
-use crate::AppState;
 use crate::aggregator::CostCalculator;
+use crate::{AppState, DashPanel};
 
 /// Border + title styles for a dashboard panel, keyed off focus. Single source
 /// for the seven panels' focused-color rule; the ◈/◇ marker stays per-panel
@@ -145,10 +145,15 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
         frame,
         heatmap_row[0],
         state,
-        state.dashboard_panel == 5,
-        state.dashboard_scroll[5],
+        state.dashboard_panel == DashPanel::Activity,
+        state.dashboard_scroll[DashPanel::Activity],
     );
-    draw_hourly_pattern(frame, heatmap_row[1], state, state.dashboard_panel == 6);
+    draw_hourly_pattern(
+        frame,
+        heatmap_row[1],
+        state,
+        state.dashboard_panel == DashPanel::Hourly,
+    );
 
     let bottom_rows = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(chunks[2]);
 
@@ -164,61 +169,69 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
 
     // Store panel areas for click detection
     state.layout.dashboard_panel_areas = vec![
-        top_row[0],     // 0: Recent Costs
-        top_row[1],     // 1: Top Projects
-        bottom_row[0],  // 2: Model Tokens
-        bottom_row[1],  // 3: Ecosystem
-        bottom_row[2],  // 4: Languages
-        heatmap_row[0], // 5: Heatmap
-        heatmap_row[1], // 6: Hourly Pattern
+        (DashPanel::Costs, top_row[0]),
+        (DashPanel::Projects, top_row[1]),
+        (DashPanel::Models, bottom_row[0]),
+        (DashPanel::Ecosystem, bottom_row[1]),
+        (DashPanel::Languages, bottom_row[2]),
+        (DashPanel::Activity, heatmap_row[0]),
+        (DashPanel::Hourly, heatmap_row[1]),
     ];
 
     draw_recent_costs(
         frame,
         top_row[0],
         state,
-        state.dashboard_panel == 0,
-        state.dashboard_scroll[0],
+        state.dashboard_panel == DashPanel::Costs,
+        state.dashboard_scroll[DashPanel::Costs],
     );
     draw_top_projects(
         frame,
         top_row[1],
         state,
-        state.dashboard_panel == 1,
-        state.dashboard_scroll[1],
+        state.dashboard_panel == DashPanel::Projects,
+        state.dashboard_scroll[DashPanel::Projects],
     );
     draw_model_tokens(
         frame,
         bottom_row[0],
         state,
-        state.dashboard_panel == 2,
-        state.dashboard_scroll[2],
+        state.dashboard_panel == DashPanel::Models,
+        state.dashboard_scroll[DashPanel::Models],
     );
-    draw_tool_usage(frame, bottom_row[1], state, state.dashboard_panel == 3);
+    draw_tool_usage(
+        frame,
+        bottom_row[1],
+        state,
+        state.dashboard_panel == DashPanel::Ecosystem,
+    );
     draw_languages(
         frame,
         bottom_row[2],
         state,
-        state.dashboard_panel == 4,
-        state.dashboard_scroll[4],
+        state.dashboard_panel == DashPanel::Languages,
+        state.dashboard_scroll[DashPanel::Languages],
     );
 
     // Footer: route through `help_bar` — keys/format live in one place.
     // Adding a global keybind still means listing it in each tab's bar,
     // but spacing/styling are centralised so sites can't drift.
-    let help_line = Paragraph::new(super::tab_help_bar(
-        state,
-        &[
-            ("?", "help"),
-            ("q", "quit"),
-            ("←→", "panel"),
-            ("↑↓", "scroll"),
-            ("Enter", "detail"),
-            ("/", "search"),
-            ("m", "pins"),
-        ],
-    ));
-    frame.render_widget(help_line, chunks[3]);
+    let mut pairs = vec![
+        ("?", "help"),
+        ("q", "quit"),
+        ("←→", "panel"),
+        ("↑↓", "scroll"),
+        ("Enter", "detail"),
+    ];
+    // Only the ranked panels reorder; the focused one's title shows its order.
+    if matches!(
+        state.dashboard_panel,
+        DashPanel::Projects | DashPanel::Models | DashPanel::Languages
+    ) {
+        pairs.push(("s", "sort"));
+    }
+    pairs.extend([("/", "search"), ("m", "pins")]);
+    super::draw_tab_help_bar(frame, state, chunks[3], &pairs);
 }
 
 /// Shown in place of the Overview cards when nothing was found. Two lines:
@@ -1187,7 +1200,7 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
 }
 
 /// Computes total line count of the Tools detail popup body (excluding headers).
-/// Used for scroll bounds to match actual rendered lines in `draw_dashboard_detail_popup` panel 3.
+/// Used for scroll bounds to match actual rendered lines in `draw_dashboard_detail_popup`'s Ecosystem panel.
 pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
     use crate::aggregator::{ToolCategory, classify_tool};
     use std::collections::HashSet;
@@ -1272,7 +1285,7 @@ pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
         // The Built-in vs MCP ratio line renders only when both subgroups
         // have nonzero calls. Counted here so the scrollbar reaches every
         // body line.
-        let has_ratio = builtin_calls > 0 && mcp_calls > 0;
+        let has_ratio = crate::handlers::mcp_popup::tools_ratio_shown(state);
         // The "── MCP servers ──" divider renders once, at the Built-in → first
         // MCP-server transition. Without it the scrollbar total is one short and
         // the last server row clips below the fold at max scroll.
@@ -1308,9 +1321,11 @@ fn language_rows(state: &AppState) -> Vec<(String, usize, bool)> {
         .filter(|(name, _)| !name.is_empty() && name.as_str() != "Other")
         .map(|(name, count)| (name.clone(), *count, false))
         .collect();
+    // An unknown extension reads as itself, dot first, in the panel and its
+    // detail alike, so it can't pass for a language name.
     for (ext, count) in &state.stats.extension_usage {
         if crate::aggregator::language::for_extension(ext) == "Other" {
-            entries.push((ext.clone(), *count, true));
+            entries.push((format!(".{ext}"), *count, true));
         }
     }
     state.sort_languages(&mut entries);
@@ -1454,6 +1469,9 @@ fn draw_recent_costs(
     frame.render_widget(table, area);
 }
 
+/// Rows the Ecosystem popup pins above its scrolled body: Total, the tab
+/// bar, a separator and the per-tab summary.
+pub(crate) const ECOSYSTEM_HEADER_ROWS: usize = 4;
 /// Number of leading rows that `activity_header_lines` adds above the
 /// scrollable daily/weekly breakdown. Used to shrink the body's
 /// `take(visible_height)` and the scroll-clamp `items_per_screen` so the
@@ -2216,7 +2234,7 @@ fn detail_panel_projects(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Li
     let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
     state.sort_projects(&mut projects);
     // `scroll` is the cursor (j/k moves it; Enter opens this row).
-    // The actual viewport offset lives in `dashboard_viewport[1]`
+    // The actual viewport offset lives in `dashboard_viewport[DashPanel::Projects]`
     // and only adjusts when the cursor leaves the visible window.
     let cursor = scroll;
     let selected_path = projects.get(cursor).map_or("", |(name, _)| name.as_str());
@@ -2306,7 +2324,7 @@ fn detail_panel_projects(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Li
 
     let items_visible = visible_height / 3;
     // Edge-triggered viewport: scroll only when cursor leaves view.
-    let prev_viewport = state.dashboard_viewport[1];
+    let prev_viewport = state.dashboard_viewport[DashPanel::Projects];
     let viewport = if cursor < prev_viewport {
         cursor
     } else if cursor >= prev_viewport + items_visible {
@@ -2314,7 +2332,7 @@ fn detail_panel_projects(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Li
     } else {
         prev_viewport
     };
-    state.dashboard_viewport[1] = viewport;
+    state.dashboard_viewport[DashPanel::Projects] = viewport;
 
     // Body lines start at popup_area.y + 1 (top border). The title
     // line lives on the border itself, not inside content.
@@ -2635,11 +2653,8 @@ fn detail_panel_models(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Line
     // The table scrolls under the grid; the view moves only when the cursor
     // leaves it, and the cursor row's figures sit fixed below the table.
     let rows = layout.rows;
-    let cursor = state.dashboard_scroll[2].min(models.len().saturating_sub(1));
-    let mut offset = state.models_detail_offset.min(cursor);
-    if cursor >= offset + rows {
-        offset = cursor + 1 - rows;
-    }
+    let cursor = state.dashboard_scroll[DashPanel::Models].min(models.len().saturating_sub(1));
+    let offset = super::follow_row(state.models_detail_offset, cursor, 1, rows, false);
     state.models_detail_offset = offset;
 
     let cols = model_columns(content_width);
@@ -2813,10 +2828,10 @@ fn model_table_line(
     selected: bool,
 ) -> Line<'static> {
     let ts = row.tokens;
-    let read_base = ts.input_tokens + ts.cache_read_tokens + ts.cache_creation_tokens;
+    let hit = ts.cache_hit_pct();
     // A share with nothing under it reads as a dash, not as zero.
     let empty = |c: ModelCol| match c {
-        ModelCol::CacheHit => read_base == 0,
+        ModelCol::CacheHit => hit.is_none(),
         ModelCol::Sessions | ModelCol::CostPerSession => row.sessions == 0,
         _ => false,
     };
@@ -2827,12 +2842,7 @@ fn model_table_line(
             ModelCol::TokenShare => crate::text::format_pct(row.work, total_tokens),
             ModelCol::Cost => super::format_cost_marked(row.cost, row.unknown, 0),
             ModelCol::CostShare => crate::text::format_pct_f64(row.cost, total_cost),
-            ModelCol::CacheHit => {
-                format!(
-                    "{:.1}%",
-                    ts.cache_read_tokens as f64 / read_base as f64 * 100.0
-                )
-            }
+            ModelCol::CacheHit => format!("{:.1}%", hit.unwrap_or(0.0)),
             ModelCol::Sessions => row.sessions.to_string(),
             ModelCol::CostPerSession => {
                 super::format_cost_marked(row.cost / row.sessions as f64, row.unknown, 2)
@@ -3386,7 +3396,7 @@ fn detail_panel_ecosystem(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<L
             ),
             Style::default().fg(theme::META),
         )]));
-        if total_calls > 0 && builtin_total > 0 && mcp_total > 0 {
+        if crate::handlers::mcp_popup::tools_ratio_shown(state) {
             // Route through format_pct so a genuinely-small non-zero share
             // gets the sub-one-percent indicator instead of rounding down to
             // an indistinguishable zero (lint #37's intent).
@@ -3771,7 +3781,7 @@ fn detail_panel_ecosystem(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<L
     // the summary inside the body so `dashboard_max_items` adds 1 there;
     // the non-MCP tabs pin it as a fixed header. Either way, the body
     // starts at line index 4.
-    let headers = 4;
+    let headers = ECOSYSTEM_HEADER_ROWS;
     let total_len = lines.len();
     if total_len > headers {
         let body_start = headers;
@@ -3832,16 +3842,15 @@ fn detail_panel_languages(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<L
     let bar_width = 15usize;
     let name_width = content_width.saturating_sub(40);
 
-    for (rank, (name, count, is_unknown)) in
-        entries.iter().enumerate().skip(scroll).take(visible_height)
-    {
+    // Every item's lines first: an item spans one line or several (its
+    // extension breakdown wraps), so the last page is found by line count.
+    let header_rows = lines.len();
+    let mut items: Vec<Vec<Line>> = Vec::with_capacity(entries.len());
+    for (rank, (name, count, is_unknown)) in entries.iter().enumerate() {
+        let mut lines: Vec<Line> = Vec::new();
         let count = *count;
         let is_known = !*is_unknown;
-        let display_name = if is_known {
-            name.clone()
-        } else {
-            format!(".{name}")
-        };
+        let display_name = name.clone();
         let ratio = count as f64 / max_count as f64;
         let filled = (ratio * bar_width as f64).round() as usize;
         let intensity = if is_known {
@@ -3931,7 +3940,19 @@ fn detail_panel_languages(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<L
                 )));
             }
         }
+        items.push(lines);
     }
+    // The last full page starts at the first item whose tail fits the body.
+    let body = visible_height.saturating_sub(header_rows);
+    let mut fill = 0usize;
+    let mut last_start = items.len();
+    while last_start > 0 && fill + items[last_start - 1].len() <= body {
+        last_start -= 1;
+        fill += items[last_start].len();
+    }
+    let scroll = scroll.min(last_start);
+    state.dashboard_scroll[DashPanel::Languages] = scroll;
+    lines.extend(items.into_iter().skip(scroll).flatten());
 
     if entries.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -4170,6 +4191,21 @@ fn detail_panel_hourly(state: &mut AppState, ctx: PanelCtx) -> (String, Vec<Line
     }
     (title, lines)
 }
+/// Rows a panel's list holds: the bound its keys, wheel and detail popup
+/// all scroll within.
+pub(crate) fn panel_item_count(state: &AppState, panel: DashPanel, today: NaiveDate) -> usize {
+    match panel {
+        DashPanel::Projects => state.stats.project_stats.len(),
+        DashPanel::Models => state.aggregated_model_tokens.len(),
+        DashPanel::Ecosystem => tool_usage_line_count(state),
+        DashPanel::Languages => language_rows(state).len(),
+        DashPanel::Activity if state.activity_view_weekly => weekly_activity(state).len(),
+        // Day rows plus month dividers, so the oldest day stays reachable.
+        DashPanel::Costs | DashPanel::Activity => active_days_body_line_count(state, today),
+        DashPanel::Hourly => 24,
+    }
+}
+
 pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Single time-reading site for this popup. Header builders (`activity_header_lines`,
     // `costs_header_lines`) stay time-pure and take `today` as a parameter so they
@@ -4190,57 +4226,29 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
     // is rendered onto the bottom border itself and does not consume an extra row.
     let visible_height = popup_height.saturating_sub(2) as usize;
 
-    let total_items = match state.dashboard_panel {
-        // Body = day rows + month dividers; count both so the footer and clamp
-        // don't leave the oldest day below the fold.
-        0 => active_days_body_line_count(state, today),
-        1 => state.stats.project_stats.len(),
-        2 => state.aggregated_model_tokens.len(),
-        3 => tool_usage_line_count(state),
-        4 => {
-            let known = state
-                .stats
-                .language_usage
-                .iter()
-                .filter(|(l, _)| l.as_str() != "Other")
-                .count();
-            let other = state
-                .stats
-                .extension_usage
-                .iter()
-                .filter(|(ext, _)| crate::aggregator::language::for_extension(ext) == "Other")
-                .count();
-            known + other
-        }
-        5 => {
-            if state.activity_view_weekly {
-                weekly_activity(state).len()
-            } else {
-                // Body = active-day rows + month dividers (zero-billable-token
-                // days are already excluded from `daily_costs`). Counting the
-                // dividers keeps the `1-N/M` indicator honest and the oldest
-                // day reachable.
-                active_days_body_line_count(state, today)
-            }
-        }
-        6 => 24,
-        _ => 0,
-    };
+    let panel_now = state.dashboard_panel;
+    let total_items = panel_item_count(state, panel_now, today);
     let items_per_screen = match state.dashboard_panel {
-        // Panel 0 reserves the top rows for the this-month/forecast/composition
-        // header; panel 5 likewise reserves rows for streak/dow header.
-        0 => visible_height.saturating_sub(COSTS_HEADER_ROWS),
-        1 => visible_height / 3,
+        // Costs reserves the top rows for its this-month/forecast/composition
+        // header; Activity likewise reserves rows for its streak/dow header.
+        DashPanel::Costs => visible_height.saturating_sub(COSTS_HEADER_ROWS),
+        DashPanel::Projects => visible_height / 3,
         // A row cursor: it may rest on the last model.
-        2 => 1,
-        4 => visible_height / 2, // Languages: main row + extensions line
-        5 => visible_height.saturating_sub(ACTIVITY_HEADER_ROWS),
-        _ => visible_height,
+        DashPanel::Models => 1,
+        DashPanel::Languages => visible_height / 2, // Languages: main row + extensions line
+        DashPanel::Activity => visible_height.saturating_sub(ACTIVITY_HEADER_ROWS),
+        DashPanel::Ecosystem => visible_height.saturating_sub(ECOSYSTEM_HEADER_ROWS),
+        DashPanel::Hourly => visible_height,
     };
 
-    // Clamp scroll so it can't park past the last full page (mirrors the
-    // `calc_scroll` rule on the compact panels).
-    let max_scroll = total_items.saturating_sub(items_per_screen);
+    // A cursor list (Projects, Models) may rest on its last row; a scrolled
+    // view can't park past its last full page (the compact panels' rule).
+    let cursor_list = matches!(panel_now, DashPanel::Projects | DashPanel::Models);
+    let max_scroll = if cursor_list {
+        total_items.saturating_sub(1)
+    } else {
+        total_items.saturating_sub(items_per_screen)
+    };
     let scroll = scroll.min(max_scroll);
     state.dashboard_scroll[state.dashboard_panel] = scroll;
 
@@ -4259,22 +4267,27 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         popup_area,
     };
     let (title, content) = match panel {
-        0 => detail_panel_costs(state, ctx),
-        1 => detail_panel_projects(state, ctx),
-        2 => detail_panel_models(state, ctx),
-        3 => detail_panel_ecosystem(state, ctx),
-        4 => detail_panel_languages(state, ctx),
-        5 if state.activity_view_weekly => detail_panel_activity_weekly(state, ctx),
-        5 => detail_panel_activity_daily(state, ctx),
-        6 => detail_panel_hourly(state, ctx),
-        _ => {
-            let title = " Unknown ".to_string();
-            let lines = vec![Line::from("  No detail view available")];
-            (title, lines)
+        DashPanel::Costs => detail_panel_costs(state, ctx),
+        DashPanel::Projects => detail_panel_projects(state, ctx),
+        DashPanel::Models => detail_panel_models(state, ctx),
+        DashPanel::Ecosystem => detail_panel_ecosystem(state, ctx),
+        DashPanel::Languages => detail_panel_languages(state, ctx),
+        DashPanel::Activity if state.activity_view_weekly => {
+            detail_panel_activity_weekly(state, ctx)
         }
+        DashPanel::Activity => detail_panel_activity_daily(state, ctx),
+        DashPanel::Hourly => detail_panel_hourly(state, ctx),
     };
 
-    let scroll_indicator = if panel == 2 {
+    // A panel that measures its own last page (Languages) may have pulled
+    // the scroll back while building its lines.
+    let scroll = state.dashboard_scroll[panel];
+    let (can_scroll_up, can_scroll_down) = if panel == DashPanel::Languages {
+        (scroll > 0, content.len() > visible_height)
+    } else {
+        (can_scroll_up, can_scroll_down)
+    };
+    let scroll_indicator = if panel == DashPanel::Models {
         let offset = state.models_detail_offset;
         let below = offset + models_layout(visible_height).rows < total_items;
         super::scroll_arrows(offset > 0, below, " ", " ")
@@ -4282,55 +4295,89 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         super::scroll_arrows(can_scroll_up, can_scroll_down, " ", " ")
     };
 
-    let position_info = if panel == 2 && total_items > 0 {
+    let position_info = if cursor_list && total_items > 0 {
         format!(" {}/{} ", scroll + 1, total_items)
     } else if total_items > 0 {
-        // Count items, not lines: Projects rows are 3 lines tall.
-        format!(
-            " {}-{}/{} ",
-            scroll + 1,
-            (scroll + items_per_screen).min(total_items),
+        // Count items, not lines. With nothing below, the page runs to the end
+        // however many lines its rows took.
+        let last = if can_scroll_down {
+            (scroll + items_per_screen).min(total_items)
+        } else {
             total_items
-        )
+        };
+        format!(" {}-{last}/{total_items} ", scroll + 1)
     } else {
         String::new()
     };
 
-    let popup =
-        Paragraph::new(content).block(super::popup_block(&title).title_bottom(Line::from(vec![
-            Span::styled(
-                if state.dashboard_panel == 3 && state.tools_detail_section == 0 {
-                    " ←→: section  ↑↓: nav  Enter: expand  o/c: all  s: sort  q: close "
-                } else if state.dashboard_panel == 3 {
-                    " ←→: section  ↑↓: scroll  s: sort  q: close "
-                } else if state.dashboard_panel == 5 {
-                    if state.activity_view_weekly {
-                        " ↑↓: scroll  w: daily  q: close "
-                    } else if state.show_empty_days {
-                        " ↑↓: scroll  w: weekly  z: hide gaps  q: close "
-                    } else {
-                        " ↑↓: scroll  w: weekly  z: all days  q: close "
-                    }
-                } else if state.dashboard_panel == 0 {
-                    if state.show_empty_days {
-                        " ↑↓: scroll  z: hide gaps  q: close "
-                    } else {
-                        " ↑↓: scroll  z: all days  q: close "
-                    }
-                } else if state.dashboard_panel == 1 {
-                    " ↑↓: select  Enter: open project  s: sort  q: close "
-                } else if state.dashboard_panel == 2 {
-                    " ↑↓: model  s: sort  q: close "
-                } else if state.dashboard_panel == 4 {
-                    " ↑↓: scroll  s: sort  q: close "
-                } else {
-                    " ↑↓: scroll  q: close "
-                },
-                Style::default().fg(theme::LABEL),
-            ),
-            Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
-            Span::styled(position_info, Style::default().fg(theme::META)),
-        ])));
+    let gaps = if state.show_empty_days {
+        "hide gaps"
+    } else {
+        "all days"
+    };
+    let pairs: Vec<(&str, &str)> = match state.dashboard_panel {
+        DashPanel::Ecosystem if state.tools_detail_section == 0 => vec![
+            ("←→", "section"),
+            ("↑↓", "nav"),
+            ("Enter", "expand"),
+            ("o/c", "all"),
+            ("s", "sort"),
+            ("q", "close"),
+        ],
+        DashPanel::Ecosystem => vec![
+            ("←→", "section"),
+            ("↑↓", "scroll"),
+            ("s", "sort"),
+            ("q", "close"),
+        ],
+        DashPanel::Activity if state.activity_view_weekly => {
+            vec![
+                ("←→", "panel"),
+                ("↑↓", "scroll"),
+                ("w", "daily"),
+                ("q", "close"),
+            ]
+        }
+        DashPanel::Activity => vec![
+            ("←→", "panel"),
+            ("↑↓", "scroll"),
+            ("w", "weekly"),
+            ("z", gaps),
+            ("q", "close"),
+        ],
+        DashPanel::Costs => vec![
+            ("←→", "panel"),
+            ("↑↓", "scroll"),
+            ("z", gaps),
+            ("q", "close"),
+        ],
+        DashPanel::Projects => vec![
+            ("←→", "panel"),
+            ("↑↓", "select"),
+            ("Enter", "open-project"),
+            ("s", "sort"),
+            ("q", "close"),
+        ],
+        DashPanel::Models => vec![
+            ("←→", "panel"),
+            ("↑↓", "model"),
+            ("s", "sort"),
+            ("q", "close"),
+        ],
+        DashPanel::Languages => vec![
+            ("←→", "panel"),
+            ("↑↓", "scroll"),
+            ("s", "sort"),
+            ("q", "close"),
+        ],
+        DashPanel::Hourly => vec![("←→", "panel"), ("↑↓", "scroll"), ("q", "close")],
+    };
+    let mut footer = super::popup_hints(&mut state.layout, popup_area, &pairs);
+    footer.spans.extend([
+        Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
+        Span::styled(position_info, Style::default().fg(theme::META)),
+    ]);
+    let popup = Paragraph::new(content).block(super::popup_block(&title).title_bottom(footer));
 
     frame.render_widget(popup, popup_area);
 }
@@ -4523,6 +4570,29 @@ mod tests {
             "{}",
             short.rows
         );
+    }
+
+    // An unknown extension reads `.ext` in the panel as in its detail, and the
+    // recent sort still finds when it was last used.
+    #[test]
+    fn an_unknown_extension_reads_with_its_dot_and_sorts_by_last_use() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let today = chrono::Local::now().date_naive();
+        let mut recent = make_session("p", None, None);
+        recent.day_extension_usage.insert("zzq".to_string(), 1);
+        let mut older = make_session("p", None, None);
+        older.file_path = std::path::PathBuf::from("/t/older.jsonl");
+        older.day_language_usage.insert("Rust".to_string(), 50);
+        let mut state = make_test_app_state(vec![
+            make_daily_group(today, vec![recent]),
+            make_daily_group(today - chrono::Duration::days(5), vec![older]),
+        ]);
+        state.stats.extension_usage.insert("zzq".to_string(), 1);
+        state.stats.language_usage.insert("Rust".to_string(), 50);
+        state.dashboard_languages_sort = crate::RankSort::Recency;
+        let rows = super::language_rows(&state);
+        assert_eq!(rows[0].0, ".zzq", "{rows:?}");
+        assert_eq!(rows[1].0, "Rust");
     }
 
     // A narrow popup drops the rightmost columns, keeping name and tokens.

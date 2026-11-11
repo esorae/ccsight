@@ -34,7 +34,8 @@ pub fn classify_tool(name: &str) -> ToolCategory {
         };
     }
     if let Some(rest) = name.strip_prefix("mcp__") {
-        let server_raw = rest.rsplit_once("__").map_or(rest, |(s, _)| s);
+        // The server ends at the first `__`: a tool name may hold `__` itself.
+        let server_raw = rest.split_once("__").map_or(rest, |(s, _)| s);
         let server = extract_server(server_raw);
         ToolCategory::Mcp { server }
     } else {
@@ -66,7 +67,7 @@ pub fn format_tool_short(name: &str) -> String {
     let Some(rest) = name.strip_prefix("mcp__") else {
         return name.to_string();
     };
-    let Some((server_raw, tool)) = rest.rsplit_once("__") else {
+    let Some((server_raw, tool)) = rest.split_once("__") else {
         return name.to_string();
     };
     let server = extract_server(server_raw);
@@ -117,6 +118,17 @@ pub fn plugin_server_key(plugin: &str, server: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_name_holding_double_underscores_keeps_its_server() {
+        // Built with format! so the literal does not read as one name.
+        let name = format!("mcp__{}__{}", "plugin_orgA_serverB", "t1___read");
+        assert_eq!(mcp_server_of(&name).as_deref(), Some("orgA/serverB"));
+        assert_eq!(format_tool_short(&name), "orgA/serverB:t1___read");
+        let nested = format!("mcp__{}__{}", "server1", "a__b");
+        assert_eq!(mcp_server_of(&nested).as_deref(), Some("server1"));
+    }
+
     use serde_json::json;
 
     #[test]

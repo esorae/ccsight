@@ -160,17 +160,7 @@ pub(crate) fn get_conv_session_file(state: &AppState, idx: usize) -> Option<std:
             .flat_map(DailyGroup::user_sessions)
             .nth(idx)
             .map(|s| s.file_path.clone()),
-        ConvListMode::Live => {
-            // Same active+paused order as the Live tab's list.
-            if idx < state.live_active.len() {
-                state.live_active[idx].jsonl_path.clone()
-            } else {
-                state
-                    .live_paused
-                    .get(idx - state.live_active.len())
-                    .and_then(|s| s.jsonl_path.clone())
-            }
-        }
+        ConvListMode::Live => crate::live_row(state, idx).and_then(|s| s.jsonl_path.clone()),
     }
 }
 
@@ -262,8 +252,8 @@ pub(crate) fn find_indexed_session_by_path(
 /// Open the Session Detail popup for the selected Live session. Live sessions
 /// can sit outside the active filter, so it looks up in `original_daily_groups`
 /// and stashes via `session_detail_override`. Returns false (and toasts) when
-/// the session isn't indexed yet. Shared by the `i` key and the `[i]` mouse
-/// zone so both behave identically.
+/// the session isn't indexed yet. Shared by the detail's keyboard and mouse
+/// entry points so both behave identically.
 pub(crate) fn open_live_session_detail(state: &mut AppState) -> bool {
     let live_info = crate::live_selected_session(state).map(|live| {
         let started = live

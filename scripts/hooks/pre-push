@@ -115,4 +115,40 @@ for attempt in 1 2 3; do
     echo "[pre-push] inconclusive (a session wrote mid-pass); retrying."
 done
 
+# Mutation testing stays manual (CLAUDE.md, Tests): a push only says how many
+# mutants its source changes carry, unless CCSIGHT_MUTANTS=1 runs them here and
+# a survivor stops the push. Last, since a run takes minutes.
+if git rev-parse --verify -q origin/main >/dev/null; then
+    mutants_diff=$(mktemp)
+    git diff origin/main HEAD -- 'src/**.rs' > "$mutants_diff"
+    if [ ! -s "$mutants_diff" ]; then
+        :
+    elif ! git diff --quiet HEAD -- src; then
+        # cargo-mutants builds the work tree, not the pushed commits.
+        if [ "${CCSIGHT_MUTANTS:-}" = "1" ]; then
+            rm -f "$mutants_diff"
+            echo "[pre-push] FAILED: src/ has uncommitted changes, so mutants would test code this push does not carry. Commit or stash them first."
+            exit 1
+        fi
+        echo "[pre-push] note: mutants not counted — src/ has uncommitted changes."
+    elif [ "${CCSIGHT_MUTANTS:-}" = "1" ]; then
+        echo "[pre-push] scripts/mutants.sh diff origin/main HEAD ..."
+        mutants_status=0
+        bash scripts/mutants.sh diff origin/main HEAD || mutants_status=$?
+        rm -f "$mutants_diff"
+        case "$mutants_status" in
+            0) ;;
+            2) echo "[pre-push] FAILED: a mutant survived — add a check, or list an equivalent one in .cargo/mutants.toml."; exit 1 ;;
+            3) echo "[pre-push] FAILED: a mutant timed out — see target/mutants/mutants.out/timeout.txt."; exit 1 ;;
+            *) echo "[pre-push] FAILED: the mutants run itself failed (status $mutants_status)."; exit 1 ;;
+        esac
+    elif command -v cargo-mutants >/dev/null 2>&1; then
+        count=$(cargo mutants --list --in-diff "$mutants_diff" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$count" -gt 0 ]; then
+            echo "[pre-push] note: $count mutants in this push not run (~$((count * 5 / 60 + 1)) min) — CCSIGHT_MUTANTS=1 git push runs them."
+        fi
+    fi
+    rm -f "$mutants_diff"
+fi
+
 echo "[pre-push] OK"

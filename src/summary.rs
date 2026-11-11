@@ -67,7 +67,6 @@ pub fn regenerate_day_summary(group: &DailyGroup) -> String {
 fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String {
     use crate::infrastructure::Cache;
     use std::collections::HashMap;
-    use std::process::Command;
 
     if use_cache
         && let Ok(cache) = Cache::load()
@@ -371,10 +370,7 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
         ---\n{context}\n---"
     );
 
-    let result = match Command::new("claude")
-        .args(["-p", &prompt, "--model", crate::SUMMARY_MODEL])
-        .output()
-    {
+    let result = match claude_print(&prompt).output() {
         Ok(output) => {
             if output.status.success() {
                 let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -510,7 +506,6 @@ fn generate_session_summary_internal(
     filter_date: Option<chrono::NaiveDate>,
 ) -> String {
     use crate::infrastructure::Cache;
-    use std::process::Command;
 
     let cache_key = summary_cache_key(session, filter_date);
 
@@ -593,10 +588,7 @@ fn generate_session_summary_internal(
         ---\n{context}\n---"
     );
 
-    let result = match Command::new("claude")
-        .args(["-p", &prompt, "--model", crate::SUMMARY_MODEL])
-        .output()
-    {
+    let result = match claude_print(&prompt).output() {
         Ok(output) => {
             if output.status.success() {
                 let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -730,6 +722,37 @@ fn build_title_context(
     context
 }
 
+/// `claude -p` cut off from the user's Claude Code setup: hooks, plugins,
+/// CLAUDE.md, skills and MCP servers reach the model as context it answers
+/// to instead of the prompt. A scratch directory keeps project files out too.
+fn claude_print(prompt: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("claude");
+    cmd.args(claude_print_args(prompt))
+        .current_dir(claude_print_dir());
+    cmd
+}
+
+/// Tests never create it: it sits under the real `~/.ccsight`.
+fn claude_print_dir() -> std::path::PathBuf {
+    crate::infrastructure::state_dir::generated_dir()
+        .ok()
+        .filter(|d| cfg!(test) || std::fs::create_dir_all(d).is_ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn claude_print_args(prompt: &str) -> Vec<&str> {
+    vec![
+        "-p",
+        prompt,
+        "--model",
+        crate::SUMMARY_MODEL,
+        // No user / project / local settings: their hooks and plugins inject text.
+        "--setting-sources=",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+    ]
+}
+
 /// Openings of the prompts ccsight hands `claude -p`, with the label its
 /// session shows. Those calls leave transcripts like any session; matching a
 /// session's first prompt against these names it as ccsight's own work.
@@ -767,8 +790,6 @@ fn title_prompt(context: &str) -> String {
 pub(crate) fn regenerate_jsonl_title(
     session: &crate::aggregator::SessionInfo,
 ) -> Result<String, String> {
-    use std::process::Command;
-
     let (user_requests, _, _) = extract_session_details(&session.file_path);
 
     if user_requests.is_empty() {
@@ -790,8 +811,7 @@ pub(crate) fn regenerate_jsonl_title(
     use std::thread;
     use std::time::{Duration, Instant};
 
-    let mut child = Command::new("claude")
-        .args(["-p", &prompt, "--model", crate::SUMMARY_MODEL])
+    let mut child = claude_print(&prompt)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -866,6 +886,29 @@ pub(crate) fn update_jsonl_custom_title(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The model sees the prompt alone: no settings source (hooks, plugins,
+    /// CLAUDE.md), no skills, no MCP servers, and no project directory.
+    #[test]
+    fn claude_print_runs_without_the_users_setup() {
+        let args = claude_print_args("PROMPT");
+        assert_eq!(&args[..2], ["-p", "PROMPT"]);
+        for flag in [
+            "--setting-sources=",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+        ] {
+            assert!(args.contains(&flag), "missing {flag}");
+        }
+        let cmd = claude_print("PROMPT");
+        let dir = crate::infrastructure::state_dir::generated_dir().unwrap();
+        assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
+        assert!(
+            crate::aggregator::format_project_path(&dir.to_string_lossy())
+                .ends_with(".ccsight/generated"),
+            "the project row names ccsight"
+        );
+    }
     use std::io::Write;
     use std::path::PathBuf;
 

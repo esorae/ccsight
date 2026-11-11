@@ -63,6 +63,16 @@ pub struct SessionInfo {
     pub is_continued: bool,
 }
 
+/// The label of one of ccsight's own `claude -p` calls, from the session's
+/// first prompt; `None` for the user's own work.
+pub(crate) fn generated_label(first_prompt: Option<&str>) -> Option<&'static str> {
+    let first = first_prompt?.trim_start();
+    crate::summary::GENERATED_PROMPTS
+        .iter()
+        .find(|(opening, _)| first.starts_with(opening))
+        .map(|(_, kind)| *kind)
+}
+
 impl SessionInfo {
     /// Minutes from this day's first entry to its last.
     pub fn day_duration_mins(&self) -> i64 {
@@ -88,14 +98,11 @@ impl SessionInfo {
     /// Label for one of ccsight's own `claude -p` calls (title / summary
     /// generation); `None` for the user's own work.
     pub fn ccsight_generated(&self) -> Option<&'static str> {
-        let first = self
-            .first_user_message
-            .as_deref()
-            .or(self.summary.as_deref())?;
-        crate::summary::GENERATED_PROMPTS
-            .iter()
-            .find(|(opening, _)| first.trim_start().starts_with(opening))
-            .map(|(_, kind)| *kind)
+        generated_label(
+            self.first_user_message
+                .as_deref()
+                .or(self.summary.as_deref()),
+        )
     }
 
     /// The single representative line for a session, highest priority first:
@@ -116,6 +123,31 @@ impl SessionInfo {
         self.day_tokens_by_model
             .iter()
             .any(|(model, tokens)| calculator.is_unpriced(model, tokens))
+    }
+
+    /// The model a row for this day names. The session's last model when the
+    /// day used it (a mid-day `/model` switch shows), else the day's heaviest:
+    /// a day's row names only a model that day ran.
+    pub fn day_model(&self) -> Option<&str> {
+        let used_today = |m: &str| {
+            self.day_tokens_by_model
+                .get(m)
+                .is_some_and(|t| t.work_tokens() > 0)
+        };
+        match self.model.as_deref() {
+            Some(m) if used_today(m) || self.day_tokens_by_model.is_empty() => Some(m),
+            last => self
+                .day_tokens_by_model
+                .iter()
+                .filter(|(_, t)| t.work_tokens() > 0)
+                .max_by(|a, b| {
+                    a.1.work_tokens()
+                        .cmp(&b.1.work_tokens())
+                        .then_with(|| b.0.cmp(a.0))
+                })
+                .map(|(m, _)| m.as_str())
+                .or(last),
+        }
     }
 
     /// Per-day cost summed over `day_tokens_by_model`. Single source so
@@ -430,6 +462,16 @@ impl DailyGrouper {
             .is_subagent
             .then(|| subagent_parent_path(file, cached.session_id.as_deref()))
             .flatten();
+        // ccsight's own `claude -p` calls follow the subagent rule with no
+        // parent: their spend counts, but they are not the user's sessions.
+        let is_subagent = cached.is_subagent
+            || generated_label(
+                cached
+                    .first_user_message
+                    .as_deref()
+                    .or(cached.summary.as_deref()),
+            )
+            .is_some();
 
         cached
             .daily_stats
@@ -472,7 +514,7 @@ impl DailyGrouper {
                         last_user_message: cached.last_user_message.clone(),
                         first_user_message: cached.first_user_message.clone(),
                         model: cached.model.clone(),
-                        is_subagent: cached.is_subagent,
+                        is_subagent,
                         parent_path: parent_path.clone(),
                         is_continued: date != session_start_date,
                     },
@@ -1002,6 +1044,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_day_row_names_a_model_that_day_ran() {
+        use crate::test_helpers::helpers::make_session_with_tokens;
+        // The session ended on Sonnet, but this day only ran Opus.
+        let mut day = make_session_with_tokens("p", 100, 10, "claude-opus-5-5");
+        day.model = Some("claude-sonnet-5-5".into());
+        assert_eq!(day.day_model(), Some("claude-opus-5-5"));
+        // The day that ran the last model keeps it, even when it is lighter.
+        let heavy = day.day_tokens_by_model["claude-opus-5-5"].clone();
+        let mut light = heavy.clone();
+        light.input_tokens = 1;
+        day.day_tokens_by_model
+            .insert("claude-sonnet-5-5".into(), light);
+        assert_eq!(day.day_model(), Some("claude-sonnet-5-5"));
+        // No per-model split: fall back to the session's model.
+        day.day_tokens_by_model.clear();
+        assert_eq!(day.day_model(), Some("claude-sonnet-5-5"));
+    }
     use crate::infrastructure::CachedTokenStats;
 
     // One session-day slice with a distinct path/model and an explicit
@@ -1548,6 +1609,28 @@ mod tests {
         assert_eq!(session.day_output_tokens, 500);
         assert!(!session.is_subagent);
         assert!(!session.is_continued);
+    }
+
+    /// ccsight's own `claude -p` call is spend, not a session: it leaves the
+    /// session count and the lists, its tokens stay in the totals.
+    #[test]
+    fn a_ccsight_generated_transcript_counts_as_spend_not_as_a_session() {
+        let mut daily_stats = HashMap::new();
+        daily_stats.insert("2026-02-25".to_string(), make_cached_daily(1000, 500)); // lint-ok: date-literal
+        let mut cached = make_cached_file_stats(daily_stats);
+        cached.first_user_message = Some(format!("{} …", crate::summary::GENERATED_PROMPTS[0].0));
+        let sessions =
+            DailyGrouper::build_sessions_from_cache(Path::new("/tmp/gen.jsonl"), &cached);
+        let (date, session) = sessions[0].clone();
+        assert!(session.is_subagent && session.parent_path.is_none());
+        let group = DailyGroup {
+            date,
+            sessions: vec![session],
+        };
+        assert_eq!(group.user_sessions().count(), 0);
+        let stats = crate::aggregator::Stats::from_groups(&[group]);
+        assert_eq!(stats.total_sessions_count, 0);
+        assert_eq!(stats.total_tokens.work_tokens(), 1500);
     }
 
     #[test]

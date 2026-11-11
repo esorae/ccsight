@@ -259,10 +259,50 @@ fn live_row_keys(state: &AppState) -> Vec<String> {
         .collect()
 }
 
+/// Prompt-cache tails for the Live rows. A transcript whose mtime has not moved
+/// keeps its previous tail: the read scans up to the file's last few hundred KB.
+fn live_cache_tails(
+    active: &[infrastructure::live_sessions::LiveSession],
+    paused: &[infrastructure::live_sessions::LiveSession],
+    mut prev: crate::state::LiveCaches,
+) -> crate::state::LiveCaches {
+    let mut out = crate::state::LiveCaches::new();
+    for s in active.iter().chain(paused) {
+        let Some(path) = s.jsonl_path.as_deref() else {
+            continue;
+        };
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let tail = match prev.remove(&s.session_id) {
+            Some((at, tail)) if at.is_some() && at == mtime => Some(tail),
+            _ => crate::session_state::read_cache_tail(path),
+        };
+        if let Some(tail) = tail {
+            out.insert(s.session_id.clone(), (mtime, tail));
+        }
+    }
+    out
+}
+
 fn poll_live_sessions_task(state: &mut AppState) {
     if let Some(ref rx) = state.live_sessions_task {
         match rx.try_recv() {
-            Ok((active, paused)) => {
+            Ok((mut active, mut paused, caches)) => {
+                state.live_cache = caches;
+                // ccsight's own `claude -p` calls are not sessions to return to.
+                let generated: std::collections::HashSet<&std::path::Path> = state
+                    .original_daily_groups
+                    .iter()
+                    .flat_map(|g| &g.sessions)
+                    .filter(|s| s.ccsight_generated().is_some())
+                    .map(|s| s.file_path.as_path())
+                    .collect();
+                let own = |s: &infrastructure::live_sessions::LiveSession| {
+                    s.jsonl_path
+                        .as_deref()
+                        .is_some_and(|p| generated.contains(p))
+                };
+                active.retain(|s| !own(s));
+                paused.retain(|s| !own(s));
                 // A live pid's cwd is a fresh resume witness: after an
                 // in-session relocation the transcript's early cwds no longer
                 // slug-match the storage dir, but the process cwd does.
@@ -293,6 +333,7 @@ fn poll_live_sessions_task(state: &mut AppState) {
                 // clusters on bulk touches. Re-sort here, where the aggregation
                 // is available, by the real last-activity the age column shows.
                 crate::ui::sort_paused_by_recency(state);
+                crate::ui::sort_active_by_recency(state);
                 if state
                     .last_input_at
                     .is_some_and(|t| t.elapsed() < crate::state::LIVE_ORDER_HOLD)
@@ -357,21 +398,25 @@ fn poll_summary_task(state: &mut AppState) {
 }
 
 fn poll_clipboard_task(state: &mut AppState) {
-    if let Some(ref clip_rx) = state.clipboard_task {
-        match clip_rx.try_recv() {
-            Ok(Ok(())) => {
-                state.clipboard_task = None;
+    let Some(task) = state.clipboard_task.take() else {
+        return;
+    };
+    match task.rx.try_recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+            // Written between frames on this thread, so it never splits one.
+            // Sent, the "Copied" toast stays: it names what was copied.
+            use std::io::Write;
+            let mut out = io::stdout();
+            let sent = out
+                .write_all(handlers::tasks::osc52(&task.text).as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok();
+            if !sent {
+                state.toast("Clipboard unavailable");
             }
-            Ok(Err(e)) => {
-                state.clipboard_task = None;
-                state.toast(format!("Clipboard error: {e}"));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                state.clipboard_task = None;
-                state.toast("Clipboard write failed (thread panicked)".to_string());
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
         }
+        Err(mpsc::TryRecvError::Empty) => state.clipboard_task = Some(task),
     }
 }
 
@@ -841,7 +886,8 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             if let Some(oldest) = state.daily_groups.iter().map(|g| g.date).min() {
                 let days_from_oldest = (today - oldest).num_days().max(0) as usize;
                 let max_scroll = days_from_oldest / 7;
-                state.dashboard_scroll[5] = state.dashboard_scroll[5].min(max_scroll);
+                state.dashboard_scroll[crate::DashPanel::Activity] =
+                    state.dashboard_scroll[crate::DashPanel::Activity].min(max_scroll);
             }
         }
 
@@ -878,8 +924,9 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             state.animation_frame = state.animation_frame.wrapping_add(1);
         }
 
+        let toast_secs = if state.toast_warning { 5 } else { 2 };
         if let Some(toast_time) = state.toast_time
-            && toast_time.elapsed() > std::time::Duration::from_secs(2)
+            && toast_time.elapsed() > std::time::Duration::from_secs(toast_secs)
         {
             state.toast_message = None;
             state.toast_time = None;
@@ -906,6 +953,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                 // clone it into the thread rather than recomputing, since
                 // `save_if_changed` below rewrites the latest snapshot.
                 let prior_alive = state.prior_run_alive.clone();
+                let prev_caches = state.live_cache.clone();
                 thread::spawn(move || {
                     let active = infrastructure::live_sessions::discover_live();
                     let active_ids: std::collections::HashSet<String> =
@@ -942,7 +990,8 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     snapshot.save();
                     infrastructure::live_snapshots::LiveSnapshot::prune();
 
-                    let _ = tx.send((active, paused));
+                    let caches = live_cache_tails(&active, &paused, prev_caches);
+                    let _ = tx.send((active, paused, caches));
                 });
                 state.live_sessions_task = Some(rx);
             }
@@ -1041,6 +1090,16 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         state.text_selection = None;
                         state.selecting = false;
                         state.mouse_down_pos = Some((mouse.column, mouse.row));
+
+                        // A hint presses its key; it is not a click on what lies below.
+                        if let Some(key) = ui::hint_at(&state.layout, mouse.column, mouse.row) {
+                            state.last_click_time = None;
+                            if dispatch_key(&mut state, key) {
+                                break 'main;
+                            }
+                            state.needs_draw = true;
+                            continue;
+                        }
 
                         let now = std::time::Instant::now();
                         let is_double_click = state.last_click_time.is_some_and(|t| {
@@ -1205,70 +1264,10 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         apply_text_input_side_effects(&mut state, kind);
                     }
                 }
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    use crossterm::event::KeyModifiers;
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        if state.ctrl_c_pressed {
-                            break 'main;
-                        }
-                        state.ctrl_c_pressed = true;
-                        state.toast("Press again to quit".to_string());
-                        state.needs_draw = true;
-                        continue;
-                    }
-                    if key.code != KeyCode::Char('q') {
-                        state.ctrl_c_pressed = false;
-                    }
-
-                    if state.show_help() {
-                        handlers::keyboard::handle_help_key(&mut state, key);
-                    } else if state.show_project_detail() {
-                        handlers::keyboard::handle_project_detail_key(&mut state, key);
-                    } else if state.show_filter_popup() {
-                        handlers::keyboard::handle_filter_popup_key(&mut state, key);
-                    } else if state.show_title_edit() {
-                        handlers::keyboard::handle_title_edit_key(&mut state, key);
-                    } else if state.show_project_popup() {
-                        handlers::keyboard::handle_project_popup_key(&mut state, key);
-                    } else if state.show_summary() {
-                        handlers::keyboard::handle_summary_popup_key(&mut state, key);
-                    } else if state.show_detail() {
-                        // Detail popup wins over conv-view dispatch so its
-                        // footer keys (r/R/s/S, ↑↓, i) reach the popup
-                        // handler. Conv handler's Esc/Space duplicates live
-                        // in handle_session_detail_key, so nothing is lost.
-                        handlers::keyboard::handle_session_detail_key(&mut state, key);
-                    } else if state.show_conversation {
-                        handlers::keyboard::handle_conversation_key(
-                            &mut state,
-                            key,
-                            preview_conversation_in_pane,
-                            open_conversation_in_pane,
-                            get_conv_session_file,
-                            get_conv_session_count,
-                        );
-                    } else if state.search_mode {
-                        handlers::keyboard::handle_search_mode_key(
-                            &mut state,
-                            key,
-                            start_content_search,
-                            open_conversation_in_pane,
-                        );
-                    } else if state.show_dashboard_detail() {
-                        handlers::keyboard::handle_dashboard_detail_key(&mut state, key);
-                    } else if state.show_insights_detail() {
-                        handlers::keyboard::handle_insights_detail_key(&mut state, key);
-                    } else if state.show_day_activity() {
-                        handlers::keyboard::handle_day_activity_key(&mut state, key);
-                    } else if handlers::keyboard::handle_default_key(
-                        &mut state,
-                        key,
-                        preview_conversation_in_pane,
-                    ) {
-                        break 'main;
-                    }
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press && dispatch_key(&mut state, key) =>
+                {
+                    break 'main;
                 }
                 _ => {}
             }
@@ -1276,6 +1275,70 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// One key press, routed to whichever surface owns the keyboard. Returns
+/// `true` when it confirms quit. Clicking a footer hint arrives here too, so a
+/// hint does exactly what its key does.
+pub(crate) fn dispatch_key(state: &mut AppState, key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::KeyModifiers;
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.ctrl_c_pressed {
+            return true;
+        }
+        state.ctrl_c_pressed = true;
+        state.toast("Press again to quit".to_string());
+        state.needs_draw = true;
+        return false;
+    }
+    if key.code != KeyCode::Char('q') {
+        state.ctrl_c_pressed = false;
+    }
+
+    if state.show_help() {
+        handlers::keyboard::handle_help_key(state, key);
+    } else if state.show_project_detail() {
+        handlers::keyboard::handle_project_detail_key(state, key);
+    } else if state.show_filter_popup() {
+        handlers::keyboard::handle_filter_popup_key(state, key);
+    } else if state.show_title_edit() {
+        handlers::keyboard::handle_title_edit_key(state, key);
+    } else if state.show_project_popup() {
+        handlers::keyboard::handle_project_popup_key(state, key);
+    } else if state.show_summary() {
+        handlers::keyboard::handle_summary_popup_key(state, key);
+    } else if state.show_detail() {
+        // Detail popup wins over conv-view dispatch so its
+        // footer keys (r/R/s/S, ↑↓, i) reach the popup
+        // handler. Conv handler's Esc/Space duplicates live
+        // in handle_session_detail_key, so nothing is lost.
+        handlers::keyboard::handle_session_detail_key(state, key);
+    } else if state.show_conversation {
+        handlers::keyboard::handle_conversation_key(
+            state,
+            key,
+            preview_conversation_in_pane,
+            open_conversation_in_pane,
+            get_conv_session_file,
+            get_conv_session_count,
+        );
+    } else if state.search_mode {
+        handlers::keyboard::handle_search_mode_key(
+            state,
+            key,
+            start_content_search,
+            open_conversation_in_pane,
+        );
+    } else if state.show_dashboard_detail() {
+        handlers::keyboard::handle_dashboard_detail_key(state, key);
+    } else if state.show_insights_detail() {
+        handlers::keyboard::handle_insights_detail_key(state, key);
+    } else if state.show_day_activity() {
+        handlers::keyboard::handle_day_activity_key(state, key);
+    } else if handlers::keyboard::handle_default_key(state, key, preview_conversation_in_pane) {
+        return true;
+    }
+    false
 }
 
 /// Closes whichever popup overlay is currently showing. Adding a new
@@ -1515,7 +1578,15 @@ pub(crate) fn step_live_selection(state: &mut AppState, up: bool) {
 pub(crate) fn live_selected_session(
     state: &AppState,
 ) -> Option<&infrastructure::live_sessions::LiveSession> {
-    let idx = state.live_selected;
+    live_row(state, state.live_selected)
+}
+
+/// Row `idx` of the Live view on screen — the past snapshot's rows when one is
+/// shown. The Live tab and the conversation view's Live list share this index.
+pub(crate) fn live_row(
+    state: &AppState,
+    idx: usize,
+) -> Option<&infrastructure::live_sessions::LiveSession> {
     if state.live_view_snapshot_offset > 0 {
         return state.live_past_sessions.get(idx);
     }
@@ -1527,46 +1598,11 @@ pub(crate) fn live_selected_session(
 }
 
 pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
-    match state.dashboard_panel {
-        // Body = day rows + month dividers; the j/G key bounds must match the
-        // popup's line-based scroll model so the oldest day is reachable.
-        0 => crate::ui::dashboard::active_days_body_line_count(
-            state,
-            chrono::Local::now().date_naive(),
-        ),
-        1 => state.stats.project_stats.len(),
-        2 => state.aggregated_model_tokens.len(),
-        3 => crate::ui::dashboard::tool_usage_line_count(state),
-        4 => {
-            let known = state
-                .stats
-                .language_usage
-                .iter()
-                .filter(|(l, _)| l.as_str() != "Other")
-                .count();
-            let other = state
-                .stats
-                .extension_usage
-                .iter()
-                .filter(|(ext, _)| crate::aggregator::language::for_extension(ext) == "Other")
-                .count();
-            known + other
-        }
-        5 => {
-            if state.activity_view_weekly {
-                crate::ui::dashboard::weekly_activity(state).len()
-            } else {
-                // Daily view renders active-day rows + month dividers, not every
-                // calendar group — match the popup's line-based total.
-                crate::ui::dashboard::active_days_body_line_count(
-                    state,
-                    chrono::Local::now().date_naive(),
-                )
-            }
-        }
-        6 => 24,
-        _ => 0,
-    }
+    crate::ui::dashboard::panel_item_count(
+        state,
+        state.dashboard_panel,
+        chrono::Local::now().date_naive(),
+    )
 }
 
 fn load_data(limit: usize) -> anyhow::Result<LoadedData> {

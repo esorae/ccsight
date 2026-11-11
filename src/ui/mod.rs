@@ -385,21 +385,36 @@ pub(crate) fn format_cost_marked(cost: f64, unpriced: bool, precision: usize) ->
     }
 }
 
-/// Bottom bar for a tab. Key dispatch is exclusive, so while a blocking popup
-/// is open none of the tab's keys reach a handler — listing them contradicts
-/// the popup's own footer. `Esc` is the one key every blocking popup accepts;
-/// the rest belong on that popup's bottom border.
-pub(crate) fn tab_help_bar(state: &AppState, pairs: &[(&str, &str)]) -> Line<'static> {
+/// Bottom bar for a tab. A blocking popup owns every key, so its bar shows
+/// only `Esc`. Hints that do not fit `width` drop from the right, so a narrow
+/// terminal never cuts one mid-word; the first two always stay.
+pub(crate) fn tab_help_bar(state: &AppState, width: u16, pairs: &[(&str, &str)]) -> Line<'static> {
     // Search mode lives outside `ActivePopup`, so the blocking check below
     // cannot see it — yet every printable key goes into the query, which makes
     // a tab's own bar the most misleading thing on screen.
     if state.search_mode {
-        return help_bar(&[("Enter", "open"), ("↑↓", "results"), ("Esc", "back")]);
+        return help_bar(&[("Enter", "open"), ("↑↓", "results"), ("Esc", "close")]);
     }
     if crate::has_blocking_popup(state) {
         return help_bar(&[("Esc", "close")]);
     }
-    help_bar(pairs)
+    let mut keep = pairs.len();
+    while keep > 2 && help_bar(&pairs[..keep]).width() > usize::from(width) {
+        keep -= 1;
+    }
+    help_bar(&pairs[..keep])
+}
+
+/// Draw a tab's bottom bar into `rect` and make each hint on it clickable.
+pub(crate) fn draw_tab_help_bar(
+    frame: &mut Frame,
+    state: &mut AppState,
+    rect: Rect,
+    pairs: &[(&str, &str)],
+) {
+    let line = tab_help_bar(state, rect.width, pairs);
+    record_hint_areas(&mut state.layout, rect, &line);
+    frame.render_widget(Paragraph::new(line), rect);
 }
 
 /// Bottom help bar from `(key, action)` pairs, in the documented format:
@@ -424,6 +439,131 @@ pub(crate) fn help_bar(pairs: &[(&str, &str)]) -> Line<'static> {
         spans.push(Span::styled(action_txt, Style::default().fg(theme::LABEL)));
     }
     Line::from(spans)
+}
+
+/// Popup bottom-border hints: `key: action`, two spaces apart, padded by a
+/// space at each end. Built as alternating key / action spans, the shape
+/// [`record_hint_areas`] measures, so every hint is clickable.
+pub(crate) fn popup_footer(pairs: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(pairs.len() * 2);
+    for (i, (key, action)) in pairs.iter().enumerate() {
+        let lead = if i == 0 { " " } else { "  " };
+        let tail = if i + 1 == pairs.len() { " " } else { "" };
+        spans.push(Span::styled(
+            format!("{lead}{key}"),
+            Style::default().fg(theme::PRIMARY),
+        ));
+        spans.push(Span::styled(
+            format!(": {action}{tail}"),
+            Style::default().fg(theme::LABEL),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// [`popup_footer`] for the bottom border of `popup`, its hints made
+/// clickable. Spans appended after it (a scroll indicator) are not hints.
+pub(crate) fn popup_hints(
+    layout: &mut crate::LayoutAreas,
+    popup: Rect,
+    pairs: &[(&str, &str)],
+) -> Line<'static> {
+    let line = popup_footer(pairs);
+    record_hint_areas(layout, bottom_border(popup), &line);
+    line
+}
+
+/// The row a block's `title_bottom` is drawn on, inside the corners.
+pub(crate) fn bottom_border(r: Rect) -> Rect {
+    Rect::new(
+        r.x + 1,
+        r.y + r.height.saturating_sub(1),
+        r.width.saturating_sub(2),
+        1,
+    )
+}
+
+/// The keys a hint label stands for. A paired label (`←→`, `H/L`, `o/c`)
+/// yields both, its left half pressing the first; a range (`1-4`) or an
+/// unknown label yields none and stays unclickable.
+pub(crate) fn hint_keys(label: &str) -> Vec<crossterm::event::KeyEvent> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let one = |s: &str| -> Option<KeyEvent> {
+        let code = match s {
+            "Enter" => KeyCode::Enter,
+            "Esc" => KeyCode::Esc,
+            "Space" | "Sp" => KeyCode::Char(' '),
+            "Tab" => KeyCode::Tab,
+            "⇧Tab" | "S-Tab" => KeyCode::BackTab,
+            "⇧Enter" => return Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            "←" => KeyCode::Left,
+            "→" => KeyCode::Right,
+            "↑" => KeyCode::Up,
+            "↓" => KeyCode::Down,
+            "PgUp" => KeyCode::PageUp,
+            "PgDn" => KeyCode::PageDown,
+            _ if s.starts_with('^') && s.chars().count() == 2 => {
+                let c = s.chars().nth(1)?.to_ascii_lowercase();
+                return Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+            }
+            _ if s.chars().count() == 1 => KeyCode::Char(s.chars().next()?),
+            _ => return None,
+        };
+        Some(KeyEvent::from(code))
+    };
+    let parts: Vec<&str> = match label {
+        "/" => vec!["/"],
+        "←→" => vec!["←", "→"],
+        "↑↓" => vec!["↑", "↓"],
+        _ => label.split('/').collect(),
+    };
+    let keys: Vec<KeyEvent> = parts.iter().filter_map(|p| one(p)).collect();
+    if keys.len() == parts.len() {
+        keys
+    } else {
+        Vec::new()
+    }
+}
+
+/// Record a click area per hint of `line`, drawn left-aligned at `rect`.
+/// `line` alternates key and action spans (`help_bar` / `popup_footer`); a
+/// hint the rect clips is left out, as it is not fully on screen.
+pub(crate) fn record_hint_areas(layout: &mut crate::LayoutAreas, rect: Rect, line: &Line) {
+    let mut x = rect.x;
+    for pair in line.spans.chunks(2) {
+        let [key, action] = pair else { break };
+        let w = (key.width() + action.width()) as u16;
+        if x + w > rect.x + rect.width {
+            break;
+        }
+        let keys = hint_keys(key.content.trim());
+        let part = w / (keys.len().max(1) as u16);
+        for (i, k) in keys.iter().enumerate() {
+            let start = x + part * i as u16;
+            let width = if i + 1 == keys.len() {
+                x + w - start
+            } else {
+                part
+            };
+            layout
+                .hint_areas
+                .push((Rect::new(start, rect.y, width, 1), *k));
+        }
+        x += w;
+    }
+}
+
+/// The key of the hint under `(col, row)`, if any.
+pub(crate) fn hint_at(
+    layout: &crate::LayoutAreas,
+    col: u16,
+    row: u16,
+) -> Option<crossterm::event::KeyEvent> {
+    layout
+        .hint_areas
+        .iter()
+        .find(|(r, _)| r.contains(ratatui::layout::Position::new(col, row)))
+        .map(|(_, k)| *k)
 }
 
 /// Standard overlay-popup frame: themed border + bold themed title
@@ -467,6 +607,29 @@ pub(crate) fn calc_scroll(
     let visible = area_height.saturating_sub(header) as usize;
     let max_scroll = item_count.saturating_sub(visible);
     (visible, max_scroll, scroll.min(max_scroll))
+}
+
+/// The first line to show so a cursor row (`top`, `height` lines) stays whole
+/// in a `visible`-line view, moving `scroll` only when the row leaves it — a
+/// list cursor's Vim `scrolloff`. With `at_head`, a first row that fits under
+/// the content above it shows that content too.
+pub(crate) fn follow_row(
+    scroll: usize,
+    top: usize,
+    height: usize,
+    visible: usize,
+    at_head: bool,
+) -> usize {
+    let bottom = top + height;
+    if at_head && bottom <= visible {
+        0
+    } else if top < scroll {
+        top
+    } else if bottom > scroll + visible {
+        bottom.saturating_sub(visible)
+    } else {
+        scroll
+    }
 }
 
 pub fn model_color(model: &str) -> Color {
@@ -555,17 +718,6 @@ fn turns_text(prompts: u64, assistant: u64, user_role: u64) -> String {
     format!(
         "you:{prompts}  AI:{assistant}  tool/system:{}",
         user_role.saturating_sub(prompts)
-    )
-}
-
-/// `line` recoloured subdued — for a row kept for completeness that should
-/// not compete with the rows around it, yet stays readable.
-fn subdued_line(line: Line<'_>) -> Line<'_> {
-    Line::from(
-        line.spans
-            .into_iter()
-            .map(|sp| sp.style(Style::default().fg(theme::SUBDUED)))
-            .collect::<Vec<_>>(),
     )
 }
 
@@ -941,11 +1093,20 @@ fn first_match_from_day(
 
 /// Post-edit refresh shared by every pane-search text mutation (typing,
 /// Backspace, paste): consume the selection, recompute matches, restart at
-/// the first one, and arm the jump. One path so the sites can't drift.
+/// the first one from where the search began (wrapping), and arm the jump.
+/// One path so the sites can't drift.
 pub fn on_pane_search_edit(pane: &mut ConversationPane) {
     pane.search_select_all = false;
     update_pane_search_matches(pane);
-    pane.search_current = 0;
+    let row = pane
+        .search_saved_scroll
+        .map_or(pane.selected_message, |(_, row)| row);
+    let origin = pane.message_lines.get(row).map_or(0, |&(_, m)| m);
+    pane.search_current = pane
+        .search_matches
+        .iter()
+        .position(|&(m, _)| m >= origin)
+        .unwrap_or(0);
     pane.pending_search_scroll = !pane.search_matches.is_empty();
 }
 
@@ -1111,6 +1272,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     state.layout.mcp_server_row_areas.clear();
     state.layout.project_detail_row_areas.clear();
     state.layout.cursor_row_areas.clear();
+    state.layout.hint_areas.clear();
 
     let show_warning =
         state.retention_warning.is_some() && !state.retention_warning_dismissed && !state.loading;
@@ -1481,7 +1643,6 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         state.layout.filter_popup_area_trigger = None;
         state.layout.project_popup_area_trigger = None;
         state.layout.pin_view_trigger = None;
-        state.layout.help_trigger = None;
 
         let conv_layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
         let conv_area = conv_layout[0];
@@ -1571,27 +1732,30 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             Some(false) => pairs.push(("c", "compact")),
             None => pairs.push(("Enter", "open")),
         }
-        pairs.extend([("/", "search"), ("i", "info"), ("s", "summary")]);
-        // `y` copies the focused message; with no pane focused (list view) it's
-        // a no-op, so omit it there rather than advertise a dead key.
+        // `/` searches the focused pane; the list has no search of its own.
         if active_compact.is_some() {
-            pairs.push(("y", "copy"));
-            // Only reachable with a pane focused, and Esc no longer removes
-            // panes, so this is the sole hint for dropping one.
-            pairs.push(("X", "close-pane"));
+            pairs.push(("/", "search"));
+        }
+        pairs.extend([("i", "info"), ("s", "summary")]);
+        if active_compact.is_some() {
+            // `X` is the sole hint for dropping a pane: Esc keeps panes.
+            pairs.extend([("y", "copy"), ("X", "close-pane")]);
+        } else {
+            // On the list `y` / `t` act on the cursor's session, as on Daily.
+            pairs.extend([("y", "copy-resume"), ("t", "title")]);
         }
         // Day stepping only moves the Day list; Live / Pinned lists ignore it.
         if state.conv_list_mode == crate::ConvListMode::Day {
             pairs.push(("H/L", "day"));
         }
-        // Drop least-essential hints (rightmost first) until the bar fits, so a
-        // narrow terminal trims gracefully instead of raw-cutting mid-hint. The
-        // first two (Esc/back, ↑↓/msg) are always kept; `?` shows the full list.
-        while pairs.len() > 2 && help_bar(&pairs).width() > help_area.width as usize {
-            pairs.pop();
-        }
-        let help_line = Paragraph::new(tab_help_bar(state, &pairs));
-        frame.render_widget(help_line, help_area);
+        pairs.extend([
+            ("C", "new-pane"),
+            ("m", "pins"),
+            ("Q", "close-all"),
+            ("?", "help"),
+        ]);
+        // Least-essential hints sit rightmost: they drop first on a narrow bar.
+        draw_tab_help_bar(frame, state, help_area, &pairs);
 
         if state.show_detail() {
             draw_detail_popup(frame, area, state);
@@ -1678,6 +1842,9 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     // Scoping it to a single tab would hide most warnings from users who
     // stay in the other views.
     if let Some(ref msg) = state.toast_message {
+        // Callers lead with what matters, so an over-wide message keeps its
+        // head and ends in `…` instead of losing its tail to the screen edge.
+        let msg = crate::text::truncate_with_ellipsis(msg, area.width.saturating_sub(4) as usize);
         // `+ 2` is the one space padded on each side below. A wider rect paints
         // the badge background over whatever is beside it — usually a panel
         // border, which then reads as part of the message.
@@ -1693,8 +1860,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             width: toast_width,
             height: 1,
         };
-        let toast = Paragraph::new(format!(" {msg} "))
-            .style(Style::default().fg(theme::TEXT_DARK).bg(theme::SUCCESS));
+        let bg = if state.toast_warning {
+            theme::WARNING
+        } else {
+            theme::SUCCESS
+        };
+        let toast =
+            Paragraph::new(format!(" {msg} ")).style(Style::default().fg(theme::TEXT_DARK).bg(bg));
         frame.render_widget(toast, toast_area);
     }
 }
@@ -1719,7 +1891,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     if !state.loading {
         let session_count = state.stats.total_sessions_count;
         spans.push(Span::styled(
-            format!("  ·  {session_count} sessions"),
+            format!("  ·  {}", crate::text::count_noun(session_count, "session")),
             Style::default().fg(dim),
         ));
     }
@@ -1828,16 +2000,118 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
     };
     // Order: Dashboard (landing / overview) → Live (current activity) →
     // Daily (today drill-down) → Insights (deep analysis).
-    let tabs_data = [
+    // A past period's latest day is not today: the badge says which day.
+    let day = latest_group
+        .map(|g| g.date)
+        .filter(|d| *d != chrono::Local::now().date_naive())
+        .map_or_else(String::new, |d| format!("{} · ", d.format("%m-%d")));
+    let full_tabs = [
         (Tab::Dashboard, "1", "Dashboard".to_string()),
         (Tab::Live, "2", live_label),
-        (Tab::Daily, "3", format!("Daily ({today_sessions})")),
+        (Tab::Daily, "3", format!("Daily ({day}{today_sessions})")),
         (
             Tab::Insights,
             "4",
-            format!("Insights ({})", crate::format_number(today_tokens)),
+            format!("Insights ({day}{})", crate::format_number(today_tokens)),
         ),
     ];
+    let compact_tabs = [
+        (Tab::Dashboard, "1", "Dashboard".to_string()),
+        (Tab::Live, "2", "Live".to_string()),
+        (Tab::Daily, "3", "Daily".to_string()),
+        (Tab::Insights, "4", "Insights".to_string()),
+    ];
+    // The narrowest bar abbreviates the tabs it is not on; the current one
+    // keeps its name.
+    let tiny_tabs = compact_tabs.clone().map(|(tab, key, label)| {
+        let short = match tab {
+            _ if tab == state.tab => label,
+            Tab::Dashboard => "Dash".to_string(),
+            Tab::Daily => "Day".to_string(),
+            Tab::Insights => "Ins".to_string(),
+            Tab::Live => label,
+        };
+        (tab, key, short)
+    });
+    let width = |s: &str| unicode_width::UnicodeWidthStr::width(s);
+    let tabs_width = |tabs: &[(Tab, &str, String)]| -> usize {
+        1 + tabs
+            .iter()
+            .map(|(tab, key, label)| {
+                if state.tab == *tab {
+                    width(label) + 2
+                } else {
+                    key.len() + width(label) + 2
+                }
+            })
+            .sum::<usize>()
+            + 2 * tabs.len().saturating_sub(1)
+    };
+
+    // The chip keeps the `f:` / `p:` prefix while a filter is on: it replaces
+    // the hint in the same slot, and losing the key exactly when the user
+    // wants to change or clear the filter is the worst moment for it.
+    let filtered = state.period_filter != crate::PeriodFilter::All;
+    // A custom range has no name worth its slot: its short form is its dates.
+    let filter_short = match state.period_filter {
+        crate::PeriodFilter::Custom(start, Some(end)) if start == end => {
+            format!(" f:{} ", start.format("%m-%d"))
+        }
+        crate::PeriodFilter::Custom(start, end) => format!(
+            " f:{}–{} ",
+            start.format("%m-%d"),
+            end.map_or_else(|| "now".to_string(), |e| e.format("%m-%d").to_string())
+        ),
+        _ if filtered => format!(" f:{} ", state.period_filter.label()),
+        _ => " f:Filter ".to_string(),
+    };
+    let range = state.period_filter.date_range_label();
+    let filter_full = if filtered && !range.is_empty() {
+        format!(" f:{} {range} ", state.period_filter.label())
+    } else {
+        filter_short.clone()
+    };
+    let project_name = state
+        .project_filter
+        .as_ref()
+        .map(|p| state.project_label(p));
+    let project_full = project_name
+        .as_ref()
+        .map_or_else(|| " p:Project ".to_string(), |n| format!(" p:{n} "));
+    let project_short = project_name.as_ref().map_or_else(
+        || project_full.clone(),
+        |n| format!(" p:{} ", crate::text::truncate_with_ellipsis(n, 12)),
+    );
+    // A pin whose transcript is gone opens nothing; it is not counted.
+    let pin_count = state
+        .pins
+        .entries()
+        .iter()
+        .filter(|e| e.path.exists())
+        .count();
+    let pin_full = if pin_count > 0 {
+        format!(" *{pin_count} ")
+    } else {
+        String::new()
+    };
+    // A narrow bar sheds in this order, so an active filter always shows:
+    // tab counts, the filter's dates, the pin count, the project's tail.
+    let fits = |tabs: &[(Tab, &str, String)], chips: &[&str]| {
+        tabs_width(tabs) + chips.iter().map(|c| width(c)).sum::<usize>() + 2 <= area.width as usize
+    };
+    let (tabs_data, filter_label, project_label, pin_label) = [
+        (&full_tabs, &filter_full, &project_full, &pin_full),
+        (&compact_tabs, &filter_full, &project_full, &pin_full),
+        (&compact_tabs, &filter_short, &project_full, &pin_full),
+        (&compact_tabs, &filter_short, &project_full, &String::new()),
+        (&compact_tabs, &filter_short, &project_short, &String::new()),
+        (&tiny_tabs, &filter_short, &project_short, &String::new()),
+    ]
+    .into_iter()
+    .find(|(tabs, f, p, pin)| fits(&tabs[..], &[f.as_str(), p.as_str(), pin.as_str()]))
+    .map_or((&tiny_tabs, None, None, None), |(tabs, f, p, pin)| {
+        (tabs, Some(f.clone()), Some(p.clone()), Some(pin.clone()))
+    });
 
     // Clear and rebuild tab areas
     state.layout.tab_areas.clear();
@@ -1884,86 +2158,50 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
         }
     }
 
-    // The chip keeps the `f:` prefix while a filter is on: it replaces the
-    // `f:Filter` hint in the same slot, and losing the key exactly when the
-    // user wants to change or clear the filter is the worst moment for it.
-    let filter_label = if state.period_filter != crate::PeriodFilter::All {
-        let range = state.period_filter.date_range_label();
-        if range.is_empty() {
-            format!(" f:{} ", state.period_filter.label())
-        } else {
-            format!(" f:{} {} ", state.period_filter.label(), range)
-        }
-    } else {
-        " f:Filter ".to_string()
-    };
-    let filter_width = unicode_width::UnicodeWidthStr::width(filter_label.as_str()) as u16;
-
-    let project_label = if let Some(ref project) = state.project_filter {
-        let short = state.project_label(project);
-        format!(" {short} ")
-    } else {
-        " p:Project ".to_string()
-    };
-    let project_width = unicode_width::UnicodeWidthStr::width(project_label.as_str()) as u16;
-
-    let pin_count = state.pins.entries().len();
-    let pin_label = if pin_count > 0 {
-        format!(" *{pin_count} ")
-    } else {
-        String::new()
-    };
-    let pin_width = unicode_width::UnicodeWidthStr::width(pin_label.as_str()) as u16;
-    let help_label = " ? ";
-    let help_width = 3u16;
-
-    let buttons_width = filter_width + project_width + pin_width + help_width + 1;
-    if area.width > buttons_width + current_x - area.x {
-        let right_x = area.x + area.width - buttons_width;
-        let gap = (right_x - current_x) as usize;
-
-        let filter_area = Rect::new(right_x, area.y, filter_width, 1);
-        state.layout.filter_popup_area_trigger = Some(filter_area);
-        let filter_style = if state.period_filter != crate::PeriodFilter::All {
-            Style::default()
-                .fg(theme::TEXT_DARK)
-                .bg(theme::PRIMARY)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::LABEL)
-        };
+    if let (Some(filter_label), Some(project_label), Some(pin_label)) =
+        (filter_label, project_label, pin_label)
+    {
+        let filter_width = width(&filter_label) as u16;
+        let project_width = width(&project_label) as u16;
+        let pin_width = width(&pin_label) as u16;
+        let right_x = area.x + area.width - (filter_width + project_width + pin_width + 1);
+        let gap = right_x.saturating_sub(current_x) as usize;
+        state.layout.filter_popup_area_trigger = Some(Rect::new(right_x, area.y, filter_width, 1));
+        let active = Style::default()
+            .fg(theme::TEXT_DARK)
+            .bg(theme::PRIMARY)
+            .add_modifier(Modifier::BOLD);
+        let idle = Style::default().fg(theme::LABEL);
         all_spans.push(Span::raw(" ".repeat(gap)));
-        all_spans.push(Span::styled(filter_label, filter_style));
-
-        let project_area = Rect::new(right_x + filter_width, area.y, project_width, 1);
-        state.layout.project_popup_area_trigger = Some(project_area);
-        let project_style = if state.project_filter.is_some() {
-            Style::default()
-                .fg(theme::TEXT_DARK)
-                .bg(theme::PRIMARY)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::LABEL)
-        };
-        all_spans.push(Span::styled(project_label, project_style));
-
-        if pin_count > 0 {
-            let pin_area = Rect::new(right_x + filter_width + project_width, area.y, pin_width, 1);
-            state.layout.pin_view_trigger = Some(pin_area);
+        all_spans.push(Span::styled(
+            filter_label,
+            if filtered { active } else { idle },
+        ));
+        state.layout.project_popup_area_trigger =
+            Some(Rect::new(right_x + filter_width, area.y, project_width, 1));
+        all_spans.push(Span::styled(
+            project_label,
+            if state.project_filter.is_some() {
+                active
+            } else {
+                idle
+            },
+        ));
+        if pin_width > 0 {
+            state.layout.pin_view_trigger = Some(Rect::new(
+                right_x + filter_width + project_width,
+                area.y,
+                pin_width,
+                1,
+            ));
             all_spans.push(Span::styled(pin_label, Style::default().fg(theme::WARNING)));
         } else {
             state.layout.pin_view_trigger = None;
         }
-
-        let help_x = right_x + filter_width + project_width + pin_width;
-        let help_area = Rect::new(help_x, area.y, help_width, 1);
-        state.layout.help_trigger = Some(help_area);
-        all_spans.push(Span::styled(help_label, Style::default().fg(theme::LABEL)));
     } else {
         state.layout.filter_popup_area_trigger = None;
         state.layout.project_popup_area_trigger = None;
         state.layout.pin_view_trigger = None;
-        state.layout.help_trigger = None;
     }
 
     let tab_line = Paragraph::new(Line::from(all_spans));
@@ -2170,17 +2408,13 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // ---- Active frame scroll (cursor-following only while selection here) ----
     if state.live_selected < active_count {
         let first = 1 + state.live_selected * row_height;
-        let last = first + row_height - 1;
-        let scroll = state.live_scroll;
-        state.live_scroll = if state.live_selected == 0 {
-            0
-        } else if first < scroll {
-            first
-        } else if last >= scroll + active_snap_h {
-            last + 1 - active_snap_h
-        } else {
-            scroll
-        };
+        state.live_scroll = follow_row(
+            state.live_scroll,
+            first,
+            row_height,
+            active_snap_h,
+            state.live_selected == 0,
+        );
     }
     let active_total = active_lines.len();
     state.live_scroll = state
@@ -2194,17 +2428,13 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if state.live_selected >= active_count {
         let pidx = state.live_selected - active_count;
         let first = 1 + pidx * row_height;
-        let last = first + row_height - 1;
-        let scroll = state.live_paused_scroll;
-        state.live_paused_scroll = if pidx == 0 {
-            0
-        } else if first < scroll {
-            first
-        } else if last >= scroll + paused_snap_h {
-            last + 1 - paused_snap_h
-        } else {
-            scroll
-        };
+        state.live_paused_scroll = follow_row(
+            state.live_paused_scroll,
+            first,
+            row_height,
+            paused_snap_h,
+            pidx == 0,
+        );
     }
     let paused_total = paused_lines.len();
     state.live_paused_scroll = state
@@ -2281,15 +2511,18 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
     state.layout.live_paused_list_area =
         (paused_area.height > 0).then_some((paused_inner, state.live_paused_scroll));
 
-    // Vocab matches Daily's session-list footer (:session for ↑↓, :view for
-    // Enter, :info for i) so the same keys read the same way across tabs.
-    let help_line = tab_help_bar(
+    // Vocab matches Daily's session-list footer (:session for ↑↓, :info for
+    // Enter) so the same keys read the same way across tabs.
+    draw_tab_help_bar(
+        frame,
         state,
+        chunks[1],
         &[
             ("?", "help"),
             ("q", "quit"),
             ("↑↓", "session"),
             ("Enter", "info"),
+            ("s", "summary"),
             ("Space", "pin"),
             ("y", "copy-resume"),
             ("t", "title"),
@@ -2299,7 +2532,6 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ("m", "pins"),
         ],
     );
-    frame.render_widget(ratatui::widgets::Paragraph::new(help_line), chunks[1]);
 }
 
 /// Past view: a single section listing the frozen alive set from one
@@ -2444,20 +2676,16 @@ fn draw_live_past(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Auto-scroll: single section, 3 lines per row, header on line 0.
     let row_height = 3usize;
     let selected_first_line = 1 + state.live_selected * row_height;
-    let selected_last_line = selected_first_line + row_height - 1;
     let visible_h = (chunks[0].height as usize)
         .saturating_sub(2)
         .max(row_height);
-    let scroll = state.live_scroll;
-    state.live_scroll = if state.live_selected == 0 {
-        0
-    } else if selected_first_line < scroll {
-        selected_first_line
-    } else if selected_last_line >= scroll + visible_h {
-        selected_last_line + 1 - visible_h
-    } else {
-        scroll
-    };
+    state.live_scroll = follow_row(
+        state.live_scroll,
+        selected_first_line,
+        row_height,
+        visible_h,
+        state.live_selected == 0,
+    );
 
     let total_lines = lines.len();
     // Clamp to content like `draw_live`: stepping to a snapshot with fewer
@@ -2502,22 +2730,58 @@ fn draw_live_past(frame: &mut Frame, area: Rect, state: &mut AppState) {
     state.layout.live_list_area = Some((inner_rect, state.live_scroll, past_visible.len()));
     state.layout.live_paused_list_area = None;
 
-    let help_line = tab_help_bar(
+    draw_tab_help_bar(
+        frame,
         state,
+        chunks[1],
         &[
             ("?", "help"),
             ("q", "quit"),
             ("↑↓", "session"),
             ("Enter", "info"),
+            ("s", "summary"),
             ("Space", "pin"),
             ("y", "copy-resume"),
             ("t", "title"),
             ("←→", "snapshot"),
             ("T", "now"),
             ("/", "search"),
+            ("m", "pins"),
         ],
     );
-    frame.render_widget(ratatui::widgets::Paragraph::new(help_line), chunks[1]);
+}
+
+/// What resuming the row would find in the prompt cache: `●` warm with
+/// minutes left, `↻` cold with the API-rate cost of rewriting it.
+fn live_cache_span(
+    cache: Option<&(
+        Option<std::time::SystemTime>,
+        crate::session_state::CacheTail,
+    )>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Span<'static>> {
+    use crate::session_state::{CacheState, cache_state};
+    let (text, color) = match cache_state(&cache?.1, now) {
+        CacheState::Unknown => ("?".to_string(), theme::FAINT),
+        CacheState::Warm { secs_left } => (format!("●{}m", (secs_left + 59) / 60), theme::SUCCESS),
+        // A decimal only below ten dollars, where it still changes the reading.
+        CacheState::Cold {
+            rebuild_usd: Some(usd),
+        } => (
+            if usd < 10.0 {
+                format!("↻${usd:.1}")
+            } else {
+                format!("↻${usd:.0}")
+            },
+            if usd >= 1.0 {
+                theme::WARNING
+            } else {
+                theme::META
+            },
+        ),
+        CacheState::Cold { rebuild_usd: None } => ("↻$?".to_string(), theme::META),
+    };
+    Some(Span::styled(format!(" {text}"), Style::default().fg(color)))
 }
 
 /// Compact "start → last" range string for a Live row. Today-only ranges
@@ -2581,6 +2845,27 @@ pub(crate) fn live_session_last_activity(
         .or(s.jsonl_mtime)
         .or(s.started_at)
         .unwrap_or(now)
+}
+
+/// Re-order `live_active` by the tier its glyph shows (busy, today, older),
+/// then by that same last activity: discovery orders by the transcript's
+/// mtime, which a subagent or an attachment touches without a turn.
+pub(crate) fn sort_active_by_recency(state: &mut AppState) {
+    let now = chrono::Utc::now();
+    let mut active = std::mem::take(&mut state.live_active);
+    // One transcript lookup per row, not per comparison.
+    active.sort_by_cached_key(|s| {
+        let last = live_session_last_activity(state, s, now);
+        let tier: u8 = if s.status.as_deref() == Some("busy") {
+            0
+        } else if crate::infrastructure::live_sessions::is_today(last, now) {
+            1
+        } else {
+            2
+        };
+        (tier, std::cmp::Reverse(last), s.session_id.clone())
+    });
+    state.live_active = active;
 }
 
 /// Re-order `live_paused` by real recency. The discovery sort key
@@ -2681,14 +2966,8 @@ fn render_live_row<'a>(
     // as-of-then age to show.
     let age = if snapshot_at.is_some_and(|t| last > t) {
         "continued".to_string()
-    } else if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
     } else {
-        format!("{}d ago", secs / 86400)
+        relative_age(secs)
     };
 
     let cwd_str = s.cwd.to_string_lossy().to_string();
@@ -2796,16 +3075,14 @@ fn render_live_row<'a>(
     let range_start = session_meta
         .map(|m| m.session_first_timestamp)
         .or(s.started_at);
-    if let Some(start) = range_start {
-        // A frozen row's range ends where the snapshot saw it, not at the
-        // transcript's newest entry.
+    // A frozen row's range ends where the snapshot saw it, not at the
+    // transcript's newest entry. Placed below, once the row's width is known.
+    let range_span = range_start.map(|start| {
         let range_end = snapshot_at.map_or(last, |t| last.min(t));
         let range = format_session_range(start, range_end, age_ref);
-        line1_spans.push(Span::styled(
-            format!("{range}  "),
-            Style::default().fg(theme::TIME),
-        ));
-    }
+        Span::styled(format!("{range}  "), Style::default().fg(theme::TIME))
+    });
+    let range_at = line1_spans.len();
     line1_spans.push(Span::styled(
         project_label.clone(),
         Style::default().fg(theme::WARM),
@@ -2816,22 +3093,36 @@ fn render_live_row<'a>(
             Style::default().fg(theme::BRANCH),
         ));
     }
+    // `Σ`: a Live row totals every day of the session, unlike a Daily row.
     line1_spans.push(Span::styled(
-        format!("  {tokens_str}"),
+        format!("  Σ{tokens_str}"),
         Style::default().fg(theme::PRIMARY),
     ));
     line1_spans.push(Span::styled(
         format!(" {cost_str}"),
         cost_style_marked(session_cost, session_unpriced),
     ));
-    // Model badge is the lowest-priority trailing element — drop it
-    // entirely on rows too tight to hold it.
-    let pre_model_width: usize = spans_width(&line1_spans);
-    if let Some(ms) = model_short {
-        let badge = format!(" [{ms}]");
-        let badge_w = unicode_width::UnicodeWidthStr::width(badge.as_str());
-        if pre_model_width + badge_w <= row_inner_width {
-            line1_spans.push(Span::styled(badge, Style::default().fg(model_clr)));
+    let model_span =
+        model_short.map(|ms| Span::styled(format!(" [{ms}]"), Style::default().fg(model_clr)));
+    // A frozen snapshot row says nothing about the cache now: today's view only.
+    let cache_span = past_diff
+        .is_none()
+        .then(|| live_cache_span(state.live_cache.get(&s.session_id), now))
+        .flatten();
+    // On a tight row the range gives way first (the age already says when),
+    // then the model, then the cache mark.
+    let tail_w = [&model_span, &cache_span]
+        .iter()
+        .map(|s| s.as_ref().map_or(0, Span::width))
+        .sum::<usize>();
+    if let Some(range) = range_span
+        && spans_width(&line1_spans) + range.width() + tail_w <= row_inner_width
+    {
+        line1_spans.insert(range_at, range);
+    }
+    for span in [model_span, cache_span].into_iter().flatten() {
+        if spans_width(&line1_spans) + span.width() <= row_inner_width {
+            line1_spans.push(span);
         }
     }
     // The session_id column takes whatever width is left after its two-space
@@ -3497,11 +3788,10 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             let session_unpriced = s.has_unpriced_model(session_calculator) || subagents.unpriced;
             let cost_str = format_cost_marked(session_cost, session_unpriced, 0);
 
-            let model_short = s.model.as_ref().map_or_else(
-                || "?".to_string(),
-                |m| crate::aggregator::normalize_model_name(m),
-            );
-            let model_clr = s.model.as_ref().map_or(theme::LABEL, |m| model_color(m));
+            let model_short = s
+                .day_model()
+                .map_or_else(|| "?".to_string(), crate::aggregator::normalize_model_name);
+            let model_clr = s.day_model().map_or(theme::LABEL, model_color);
 
             let is_selected = sessions_focused && i == state.selected_session;
             let is_updating = state.updating_session == Some((state.selected_day, i));
@@ -3584,13 +3874,6 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 ]
             };
             let line2 = Line::from(line2_spans);
-            // ccsight's own generation calls stay listed but set back, so the
-            // user's own sessions read first.
-            let (line1, line2) = if s.ccsight_generated().is_some() {
-                (subdued_line(line1), subdued_line(line2))
-            } else {
-                (line1, line2)
-            };
 
             let has_summary = s.summary.is_some();
             let item = ListItem::new(vec![line1, line2]);
@@ -3669,30 +3952,43 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     state.layout.session_list_area = Some((sessions_chunk, scroll_offset, item_height as usize));
 
-    let help_line = Paragraph::new(tab_help_bar(
-        state,
-        &[
-            ("?", "help"),
-            ("q", "quit"),
-            ("←→", "day"),
-            ("↑↓", "session"),
-            (
-                "Enter",
-                match state.daily_panel {
-                    crate::state::DailyPanel::Breakdown => "breakdown",
-                    crate::state::DailyPanel::Activity => "activity",
-                    crate::state::DailyPanel::Sessions => "info",
-                },
-            ),
+    let on_sessions = state.daily_panel == crate::state::DailyPanel::Sessions;
+    let mut pairs = vec![
+        ("?", "help"),
+        ("q", "quit"),
+        ("←→", "day"),
+        ("↑↓", if on_sessions { "session" } else { "panel" }),
+        (
+            "Enter",
+            match state.daily_panel {
+                crate::state::DailyPanel::Breakdown => "breakdown",
+                crate::state::DailyPanel::Activity => "activity",
+                crate::state::DailyPanel::Sessions => "info",
+            },
+        ),
+    ];
+    // The session keys wait for the session list (they toast otherwise), so
+    // the bar lists them only while it has focus.
+    if on_sessions {
+        pairs.extend([
             ("s", "summary"),
             ("S", "day-summary"),
+            ("y", "copy-resume"),
             ("t", "title"),
-            ("/", "search"),
-            ("Space", "pin"),
-            ("m", "pins"),
-        ],
-    ));
-    frame.render_widget(help_line, help_chunk);
+        ]);
+    } else {
+        pairs.push(("S", "day-summary"));
+    }
+    pairs.extend([("/", "search")]);
+    if on_sessions {
+        pairs.push(("Space", "pin"));
+    }
+    pairs.push(("m", "pins"));
+    if on_sessions {
+        pairs.push(("C", "new-pane"));
+    }
+    pairs.push(("T", "today"));
+    draw_tab_help_bar(frame, state, help_chunk, &pairs);
 
     if let Some((items, models_start, tools_start)) = breakdown_popup_data {
         // The whole frame, as every detail popup is centred in.
@@ -3853,21 +4149,32 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
             };
             let active_count = state.live_active.len();
             let paused_count = state.live_paused.len();
-            let mut rows: Vec<SessionDisplay> = state
-                .live_active
-                .iter()
-                .map(|s| collect_one(s, true))
-                .collect();
-            rows.extend(state.live_paused.iter().map(|s| collect_one(s, false)));
-            // Show active + paused split explicitly so the conv-pane count
-            // doesn't read as a single number that disagrees with the Live tab
-            // header (which counts active only).
-            let title = if paused_count > 0 {
-                format!(" Live ({active_count} + {paused_count}) ")
+            if state.live_view_snapshot_offset > 0 {
+                // Rows mirror the Live tab's snapshot: `live_row` indexes it.
+                let rows: Vec<SessionDisplay> = state
+                    .live_past_sessions
+                    .iter()
+                    .map(|s| collect_one(s, false))
+                    .collect();
+                let title = format!(" Live snapshot ({}) ", rows.len());
+                (rows, title)
             } else {
-                format!(" Live ({active_count}) ")
-            };
-            (rows, title)
+                let mut rows: Vec<SessionDisplay> = state
+                    .live_active
+                    .iter()
+                    .map(|s| collect_one(s, true))
+                    .collect();
+                rows.extend(state.live_paused.iter().map(|s| collect_one(s, false)));
+                // Show active + paused split explicitly so the conv-pane count
+                // doesn't read as a single number that disagrees with the Live tab
+                // header (which counts active only).
+                let title = if paused_count > 0 {
+                    format!(" Live ({active_count} + {paused_count}) ")
+                } else {
+                    format!(" Live ({active_count}) ")
+                };
+                (rows, title)
+            }
         }
         crate::ConvListMode::Day => {
             if state.daily_groups.is_empty() {
@@ -4031,8 +4338,9 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
             .title(Span::styled(title, Style::default().fg(theme::PRIMARY)))
-            .title_bottom(help_line),
+            .title_bottom(help_line.clone()),
     );
+    record_hint_areas(&mut state.layout, bottom_border(area), &help_line);
 
     let mut list_state =
         ratatui::widgets::ListState::default().with_selected(Some(state.selected_session));
@@ -4204,8 +4512,7 @@ fn draw_conversation_pane(
                 })
                 .unwrap_or_default();
             let model = s
-                .model
-                .as_ref()
+                .day_model()
                 .map(|m| format!(" [{}]", crate::aggregator::normalize_model_name(m)))
                 .unwrap_or_default();
             let start = s.day_first_timestamp.with_timezone(&chrono::Local);
@@ -5467,7 +5774,10 @@ fn render_compact_lines(
     expanded: &std::collections::HashSet<usize>,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>, Vec<bool>) {
     use crate::text::wrap_text_with_continuation;
-    let inner = width.saturating_sub(1) as usize;
+    // The pane draws each line behind a 2-column cursor gutter and beside its
+    // scrollbar, as `render_conversation_lines` budgets: a wider line is cut
+    // off at the edge, `…` and all.
+    let inner = width.saturating_sub(3) as usize;
     // Minimal hang-indent for an expanded message's body: enough to set it off
     // from the header row without burning width aligning under the content
     // column (the full alignment wastes ~10 cols, cramping long markdown/code).
@@ -5695,11 +6005,10 @@ fn draw_summary(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // `t` (resume title) only applies to a session summary; a day summary has no
     // single .jsonl to title, so it's omitted from the day-summary footer.
     let is_session = matches!(state.summary_type, Some(SummaryType::Session(_)));
-    let actions = if is_session {
-        "q: close  ↑↓: scroll  r: regenerate  t: write title"
-    } else {
-        "q: close  ↑↓: scroll  r: regenerate"
-    };
+    let mut actions = vec![("q", "close"), ("↑↓", "scroll"), ("r", "regenerate")];
+    if is_session {
+        actions.push(("t", "write-title"));
+    }
     let title = if state.generating_summary {
         format!(" Generating: {target_info} ")
     } else if target_info.is_empty() {
@@ -5718,10 +6027,7 @@ fn draw_summary(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ))
         .border_style(Style::default().fg(theme::PRIMARY));
     if !state.generating_summary {
-        block = block.title_bottom(Span::styled(
-            format!(" {actions} "),
-            Style::default().fg(theme::LABEL),
-        ));
+        block = block.title_bottom(popup_hints(&mut state.layout, area, &actions));
     }
 
     let inner = block.inner(area);
@@ -6098,7 +6404,7 @@ fn draw_session_detail(
     frame: &mut Frame,
     area: Rect,
     session: &crate::aggregator::SessionInfo,
-    footer: &str,
+    footer: Line<'static>,
     is_pinned: bool,
     scroll: usize,
     project_labels: &std::collections::HashMap<String, String>,
@@ -6114,6 +6420,7 @@ fn draw_session_detail(
     // Verified `claude -r` cd target (`AppState::resume_dir`); `None` renders
     // an honest "unknown" line instead of a guessed path.
     resume_dir: Option<&std::path::Path>,
+    cache: Option<&crate::session_state::CacheTail>,
 ) -> Rect {
     use ratatui::widgets::Clear;
 
@@ -6402,6 +6709,9 @@ fn draw_session_detail(
             Style::default().fg(theme::LABEL),
         )]));
     }
+    if let Some(tail) = cache {
+        lines.push(detail_cache_line(tail, chrono::Utc::now(), label_style));
+    }
     lines.push(Line::from(""));
 
     let multi_day = cumulative.days > 1;
@@ -6619,10 +6929,7 @@ fn draw_session_detail(
         }
     }
 
-    let block = popup_block(" Session Detail ").title_bottom(Line::from(Span::styled(
-        footer,
-        Style::default().fg(theme::LABEL),
-    )));
+    let block = popup_block(" Session Detail ").title_bottom(footer);
 
     // Clamp scroll to keep at least one line of body content visible. Inner height excludes
     // the top + bottom borders.
@@ -6645,11 +6952,22 @@ fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // independent of the active period/project filter).
     let cumulative = compute_session_cumulative(&session.file_path, &state.original_daily_groups);
     let live_extra = state.session_detail_live_extra.clone();
+    let cache = detail_cache_tail(state, &session.file_path);
+    let footer = popup_footer(&[
+        ("Enter", "open"),
+        ("Space", "pin"),
+        ("y", "copy-resume"),
+        ("s", "summary"),
+        ("t", "title"),
+        ("C", "new-pane"),
+        ("↑↓", "scroll"),
+        ("i/Esc", "close"),
+    ]);
     let popup_area = draw_session_detail(
         frame,
         area,
         &session,
-        " Enter: open  Space: pin  y: copy resume  s: summary  t: title  C: new pane  ↑↓: scroll  i/Esc: close ",
+        footer.clone(),
         pinned,
         state.session_detail_scroll,
         &state.project_labels,
@@ -6659,8 +6977,77 @@ fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         live_extra.as_ref(),
         state.session_detail_recent.as_deref(),
         state.resume_dir(&session.file_path).as_deref(),
+        cache.as_ref(),
     );
+    record_hint_areas(&mut state.layout, bottom_border(popup_area), &footer);
     state.layout.active_popup_area = Some(popup_area);
+}
+
+/// The Live poll's tail when it has one, else a read memoized on the
+/// transcript's mtime: the detail redraws every frame.
+fn detail_cache_tail(
+    state: &mut AppState,
+    path: &std::path::Path,
+) -> Option<crate::session_state::CacheTail> {
+    let id = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if let Some((_, tail)) = state.live_cache.get(id) {
+        return Some(tail.clone());
+    }
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    match &state.session_detail_cache {
+        Some((p, m, tail)) if p == path && *m == mtime => tail.clone(),
+        _ => {
+            let tail = crate::session_state::read_cache_tail(path);
+            state.session_detail_cache = Some((path.to_path_buf(), mtime, tail.clone()));
+            tail
+        }
+    }
+}
+
+/// `Cache` row: how long the prompt cache stays warm, or what resuming costs
+/// to rewrite it — the Live column's marks, spelled out.
+fn detail_cache_line(
+    tail: &crate::session_state::CacheTail,
+    now: chrono::DateTime<chrono::Utc>,
+    label_style: Style,
+) -> Line<'static> {
+    use crate::session_state::{CacheState, cache_state};
+    let tokens = crate::format_number(tail.tokens);
+    let (mark, color, rest) = match cache_state(tail, now) {
+        CacheState::Warm { secs_left } => {
+            let ttl = if tail.ttl_secs == Some(300) {
+                "5m"
+            } else {
+                "1h"
+            };
+            (
+                format!("●{}m left", (secs_left + 59) / 60),
+                theme::SUCCESS,
+                format!(" · {tokens} cached ({ttl} TTL)"),
+            )
+        }
+        CacheState::Cold { rebuild_usd } => (
+            "↻ expired".to_string(),
+            theme::WARNING,
+            match rebuild_usd {
+                Some(usd) => format!(" · resuming rewrites {tokens} ≈ ${usd:.2} (API rates)"),
+                None => format!(" · resuming rewrites {tokens}"),
+            },
+        ),
+        CacheState::Unknown => (
+            "? TTL unknown".to_string(),
+            theme::FAINT,
+            format!(" · {tokens} cached"),
+        ),
+    };
+    Line::from(vec![
+        Span::styled("  Cache     ", label_style),
+        Span::styled(mark, Style::default().fg(color)),
+        Span::styled(rest, label_style),
+    ])
 }
 
 // The canonical per-session lifetime aggregate lives in the aggregator (single
@@ -6949,26 +7336,24 @@ fn draw_day_activity_popup(frame: &mut Frame, area: Rect, state: &mut AppState) 
     let visible = usize::from(popup_area.height.saturating_sub(2));
     let max_scroll = lines.len().saturating_sub(visible);
     let mut scroll = state.day_activity_scroll().min(max_scroll);
-    let cursor_line = first_row_line + cursor;
     if !rows.is_empty() {
-        // The first row shows the chart above it too, when both fit.
-        if cursor == 0 && cursor_line < visible {
-            scroll = 0;
-        } else if cursor_line < scroll {
-            scroll = cursor_line;
-        } else if cursor_line >= scroll + visible {
-            scroll = cursor_line + 1 - visible;
-        }
+        scroll = follow_row(scroll, first_row_line + cursor, 1, visible, cursor == 0);
     }
     state.set_day_activity_scroll(scroll);
     let row_lines: Vec<(usize, usize)> = (0..rows.len()).map(|i| (first_row_line + i, 1)).collect();
     record_cursor_rows(state, popup_area, &row_lines, scroll);
     let popup = Paragraph::new(lines).scroll((scroll as u16, 0)).block(
         popup_block(&format!(" Activity · {} ", group.date.format("%Y-%m-%d"))).title_bottom(
-            Line::from(Span::styled(
-                " ←→: day  ↑↓: session  Enter: info  Esc: close ",
-                Style::default().fg(theme::LABEL),
-            )),
+            popup_hints(
+                &mut state.layout,
+                popup_area,
+                &[
+                    ("←→", "day"),
+                    ("↑↓", "session"),
+                    ("Enter", "info"),
+                    ("Esc", "close"),
+                ],
+            ),
         ),
     );
     frame.render_widget(popup, popup_area);
@@ -7065,13 +7450,18 @@ fn draw_breakdown_detail_popup(
     let scroll_indicator = scroll_arrows(can_scroll_up, can_scroll_down, " ", " ");
 
     let popup = Paragraph::new(lines).block(
-        popup_block(&format!(" Breakdown ({total_items}) ")).title_bottom(Line::from(vec![
-            Span::styled(
-                " ←→: day  ↑↓: scroll  Enter/Esc: close ",
-                Style::default().fg(theme::LABEL),
-            ),
-            Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
-        ])),
+        popup_block(&format!(" Breakdown ({total_items}) ")).title_bottom({
+            let mut footer = popup_hints(
+                &mut state.layout,
+                popup_area,
+                &[("←→", "day"), ("↑↓", "scroll"), ("Enter/Esc", "close")],
+            );
+            footer.spans.push(Span::styled(
+                scroll_indicator,
+                Style::default().fg(theme::WARNING),
+            ));
+            footer
+        }),
     );
 
     frame.render_widget(popup, popup_area);
@@ -7165,23 +7555,44 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         ));
         lines.push(Line::from(spans));
         if state.filter_input_error() {
+            let why = crate::PeriodFilter::check_custom(
+                &filter_input.text,
+                chrono::Local::now().date_naive(),
+            )
+            .err()
+            .unwrap_or("Invalid period");
             lines.push(Line::from(Span::styled(
-                "   ⚠ Invalid format. Esc: back to presets",
+                format!("   ⚠ {why}"),
                 Style::default().fg(theme::ERROR),
             )));
         }
     }
 
     let footer = if state.filter_input_mode() {
-        " YYYY · YYYY-MM · YYYY-MM-DD · YYYY-MM-DD..YYYY-MM-DD "
+        let mut footer = popup_hints(
+            &mut state.layout,
+            popup_area,
+            &[("Enter", "apply"), ("Esc", "cancel")],
+        );
+        footer.spans.push(Span::styled(
+            "· YYYY · YYYY-MM · YYYY-MM-DD · YYYY-MM-DD..YYYY-MM-DD ",
+            Style::default().fg(theme::LABEL),
+        ));
+        footer
     } else {
-        " ↑↓: nav  Enter: apply  0-9: type a date  Esc: close "
+        popup_hints(
+            &mut state.layout,
+            popup_area,
+            &[
+                ("↑↓", "nav"),
+                ("Enter", "apply"),
+                ("0-9", "type-a-date"),
+                ("Esc", "close"),
+            ],
+        )
     };
 
-    let popup = Paragraph::new(lines).block(
-        popup_block(" Filter Period ")
-            .title_bottom(Line::from(footer).style(Style::default().fg(theme::LABEL))),
-    );
+    let popup = Paragraph::new(lines).block(popup_block(" Filter Period ").title_bottom(footer));
 
     frame.render_widget(popup, popup_area);
 }
@@ -7208,114 +7619,251 @@ fn draw_title_edit_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppSt
     ));
     let lines = vec![Line::from(input_spans)];
 
-    let popup = Paragraph::new(lines).block(
-        popup_block(" Edit session title ").title_bottom(
-            Line::from(" Enter: save  ·  ^R: AI generate  ·  Esc: cancel ")
-                .style(Style::default().fg(theme::LABEL)),
+    let popup = Paragraph::new(lines).block(popup_block(" Edit session title ").title_bottom(
+        popup_hints(
+            &mut state.layout,
+            popup_area,
+            &[("Enter", "save"), ("^R", "AI-generate"), ("Esc", "cancel")],
         ),
-    );
+    ));
     frame.render_widget(popup, popup_area);
 }
 
 fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState) {
     use ratatui::widgets::Clear;
 
-    let total = state.project_list.len() + 1;
-    let max_visible: usize = 20;
-    let visible = total.min(max_visible);
-    let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = (visible as u16 + 3)
-        .min(area.height.saturating_sub(4))
-        .min(23);
-
+    let view = state.project_popup_view();
+    let total = view.len() + 1;
+    // The list, then a rule and two lines about the row under the cursor.
+    const DETAIL_ROWS: u16 = 3;
+    let popup_width = 100u16.min(area.width.saturating_sub(4));
+    let popup_height = (total.min(20) as u16 + DETAIL_ROWS + 2).min(area.height.saturating_sub(4));
     let popup_area = centered(area, popup_width, popup_height);
-
     state.layout.project_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
-    // Inner content rows = popup_height - 2 (top + bottom border). `title_bottom`
-    // is rendered onto the bottom border line and does not consume an extra row.
-    let inner_height = popup_height.saturating_sub(2) as usize;
-    let sel = state.project_popup_selected();
-    let mut scroll_val = state.project_popup_scroll();
-    if sel < scroll_val {
-        scroll_val = sel;
-    } else if inner_height > 0 && sel >= scroll_val + inner_height {
-        scroll_val = sel + 1 - inner_height;
+    let inner_width = popup_width.saturating_sub(2) as usize;
+    let list_rows = popup_height.saturating_sub(2 + DETAIL_ROWS) as usize;
+    let sel = state.project_popup_selected().min(total - 1);
+    let mut scroll = state.project_popup_scroll();
+    if sel < scroll {
+        scroll = sel;
+    } else if list_rows > 0 && sel >= scroll + list_rows {
+        scroll = sel + 1 - list_rows;
     }
-    state.set_project_popup_scroll(scroll_val);
+    state.set_project_popup_scroll(scroll);
+    state.layout.project_popup_list_area = Some(Rect::new(
+        popup_area.x + 1,
+        popup_area.y + 1,
+        inner_width as u16,
+        list_rows as u16,
+    ));
 
-    // Row order follows the Projects panel sort mode. `project_list_sorted`
-    // is the single source of truth so panel and popup agree on rank.
-    let sorted = state.project_list_sorted();
-
+    let rows = state.project_rows.as_deref().unwrap_or_default();
+    let today = chrono::Local::now().date_naive();
+    let now = chrono::Utc::now();
+    let cols = ProjectColumns::fit(inner_width);
     let mut lines: Vec<Line> = Vec::new();
-    for i in scroll_val..(scroll_val + inner_height).min(total) {
-        let is_selected = i == sel;
-        if i == 0 {
-            let is_current = state.project_filter.is_none();
-            let marker = if is_current { "\u{25cf}" } else { " " };
-            let text = format!(" {marker} All");
-            let style = if is_selected {
-                Style::default()
-                    .fg(theme::TEXT_BRIGHT)
-                    .bg(theme::SELECTED_BG)
-                    .add_modifier(Modifier::BOLD)
-            } else if is_current {
-                Style::default().fg(theme::PRIMARY)
-            } else {
-                Style::default().fg(theme::PROJECT)
-            };
-            lines.push(Line::from(Span::styled(text, style)));
-        } else if let Some((name, tokens, last_date)) = sorted.get(i - 1).copied() {
-            let is_current = state.project_filter.as_ref() == Some(name);
-            let marker = if is_current { "\u{25cf}" } else { " " };
-            let short_owned = state.project_label(name);
-            let short = short_owned.as_str();
-            let token_str = crate::format_number(*tokens);
-            let date_str = last_date.format("%Y-%m-%d").to_string();
-            let suffix = format!("{token_str}  {date_str}");
-            let inner_width = popup_width.saturating_sub(2) as usize;
-            let prefix_len = 3 + 2; // " X " marker + "  " separator before suffix
-            let max_name_len = inner_width.saturating_sub(prefix_len + suffix.len());
-            let short_width = unicode_width::UnicodeWidthStr::width(short);
-            let display_name: String = if short_width > max_name_len {
-                truncate_with_ellipsis(short, max_name_len)
-            } else {
-                short.to_string()
-            };
-            let display_name_width = unicode_width::UnicodeWidthStr::width(display_name.as_str());
-            let pad = max_name_len.saturating_sub(display_name_width);
-            let text = format!(
-                " {} {}{:pad$}  {}",
-                marker,
-                display_name,
-                "",
-                suffix,
-                pad = pad
-            );
-            let style = if is_selected {
-                Style::default()
-                    .fg(theme::TEXT_BRIGHT)
-                    .bg(theme::SELECTED_BG)
-                    .add_modifier(Modifier::BOLD)
-            } else if is_current {
-                Style::default().fg(theme::PRIMARY)
-            } else {
-                Style::default().fg(theme::PROJECT)
-            };
-            lines.push(Line::from(Span::styled(text, style)));
+    for i in scroll..(scroll + list_rows).min(total) {
+        let row = i.checked_sub(1).map(|v| &rows[view[v]]);
+        let is_current = match row {
+            None => state.project_filter.is_none(),
+            Some(r) => state.project_filter.as_deref() == Some(r.name.as_str()),
+        };
+        let style = if i == sel {
+            Style::default()
+                .fg(theme::TEXT_BRIGHT)
+                .bg(theme::SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(theme::PRIMARY)
+        } else {
+            Style::default().fg(theme::PROJECT)
+        };
+        let marker = if is_current { "●" } else { " " };
+        let line = match row {
+            // "All" clears the filter whatever the query, so it totals every row.
+            None => cols.row(
+                &format!(" {marker} All"),
+                None,
+                rows.iter().map(|r| r.sessions).sum(),
+                rows.iter().map(|r| r.cost).sum(),
+                rows.iter().any(|r| r.unpriced),
+                rows.iter().map(|r| r.work_tokens).sum(),
+                None,
+            ),
+            Some(r) => cols.row(
+                &format!(" {marker} {}", state.project_label(&r.name)),
+                Some(&dashboard::render_spark_line(
+                    today,
+                    ProjectColumns::SPARK,
+                    |d| r.daily_work_tokens.get(&d).copied().unwrap_or(0) as f64,
+                )),
+                r.sessions,
+                r.cost,
+                r.unpriced,
+                r.work_tokens,
+                Some(relative_age((now - r.last).num_seconds())),
+            ),
+        };
+        lines.push(Line::from(Span::styled(line, style)));
+    }
+    if view.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   No project matches",
+            Style::default().fg(theme::PLACEHOLDER),
+        )));
+    }
+    while lines.len() < list_rows {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "─".repeat(inner_width),
+        Style::default().fg(theme::BORDER),
+    )));
+    let detail = sel
+        .checked_sub(1)
+        .and_then(|i| view.get(i))
+        .map(|&v| &rows[v]);
+    lines.extend(project_detail_lines(detail, inner_width));
+
+    let query = state.project_popup_query();
+    let title = if query.is_empty() {
+        format!(
+            " Filter Project · {} · type to find ",
+            state.project_popup_sort.label()
+        )
+    } else {
+        format!(
+            " Filter Project · {} · find: {query}▏ ",
+            state.project_popup_sort.label()
+        )
+    };
+    let footer = popup_hints(
+        &mut state.layout,
+        popup_area,
+        &[
+            ("↑↓", "nav"),
+            ("Enter", "apply"),
+            ("Tab", "sort"),
+            ("Esc", "close"),
+        ],
+    );
+    let popup = Paragraph::new(lines).block(popup_block(&title).title_bottom(footer));
+    frame.render_widget(popup, popup_area);
+}
+
+/// The picker's columns after the name, each kept only while the name still
+/// has room: activity goes first, then sessions, then cost.
+struct ProjectColumns {
+    spark: bool,
+    sessions: bool,
+    cost: bool,
+    width: usize,
+}
+
+impl ProjectColumns {
+    const SPARK: usize = 14;
+    const NAME_MIN: usize = 18;
+    /// `tokens` and the age, the columns every width keeps.
+    const BASE: usize = 7 + 10;
+
+    fn fit(width: usize) -> Self {
+        let room = |extra: usize| width >= Self::NAME_MIN + Self::BASE + extra;
+        let cost = room(9);
+        let sessions = cost && room(9 + 8);
+        let spark = sessions && room(9 + 8 + Self::SPARK + 2);
+        Self {
+            spark,
+            sessions,
+            cost,
+            width,
         }
     }
 
-    let footer = " ↑↓: nav  Enter: apply  Esc: close ";
+    fn row(
+        &self,
+        name: &str,
+        spark: Option<&str>,
+        sessions: usize,
+        cost: f64,
+        unpriced: bool,
+        tokens: u64,
+        age: Option<String>,
+    ) -> String {
+        let mut tail = String::new();
+        if self.spark {
+            tail.push_str(&format!("  {:<w$}", spark.unwrap_or(""), w = Self::SPARK));
+        }
+        if self.sessions {
+            tail.push_str(&format!("{:>8}", format!("{sessions} ses")));
+        }
+        if self.cost {
+            tail.push_str(&format!("{:>9}", format_cost_marked(cost, unpriced, 0)));
+        }
+        tail.push_str(&format!("{:>7}", crate::format_number(tokens)));
+        tail.push_str(&format!("{:>10}", age.unwrap_or_default()));
+        let name_w = self
+            .width
+            .saturating_sub(unicode_width::UnicodeWidthStr::width(tail.as_str()));
+        format!("{}{tail}", crate::text::fit_width(name, name_w))
+    }
+}
 
-    let popup = Paragraph::new(lines).block(
-        popup_block(" Filter Project ")
-            .title_bottom(Line::from(footer).style(Style::default().fg(theme::LABEL))),
+/// Two lines on the row under the cursor: where and when, then what it ran on.
+fn project_detail_lines(
+    row: Option<&crate::state::ProjectRow>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let label = Style::default().fg(theme::LABEL);
+    let Some(r) = row else {
+        return vec![
+            Line::from(Span::styled(" Every project, unfiltered", label)),
+            Line::from(""),
+        ];
+    };
+    let path = crate::text::truncate_with_ellipsis(&r.name, width.saturating_sub(40));
+    let last = r.last.with_timezone(&chrono::Local).date_naive();
+    let first_line = format!(
+        " {path} · {} → {} · {}",
+        r.first.format("%Y-%m-%d"),
+        last.format("%Y-%m-%d"),
+        crate::text::count_noun(r.sessions, "session")
     );
+    let model = r
+        .top_model
+        .as_ref()
+        .map(|(m, share)| format!("mostly {m} ({:.0}%)", share * 100.0));
+    let mut second = vec![model.unwrap_or_default()];
+    if r.branches > 0 {
+        second.push(format!(
+            "{} branch{}",
+            r.branches,
+            if r.branches == 1 { "" } else { "es" }
+        ));
+    }
+    second.push(format!(
+        "{} work tokens",
+        crate::format_number(r.work_tokens)
+    ));
+    vec![
+        Line::from(Span::styled(first_line, Style::default().fg(theme::VALUE))),
+        Line::from(Span::styled(format!(" {}", second.join(" · ")), label)),
+    ]
+}
 
-    frame.render_widget(popup, popup_area);
+/// `just now`, `12m ago`, `3h ago`, `5d ago`: the Live list's age vocabulary.
+fn relative_age(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 /// A project's session rows, newest day first (ties keep the data's order):
@@ -7338,7 +7886,7 @@ pub(crate) fn project_session_rows<'a>(
 /// Per-project drilldown popup. Aggregates data for the single project
 /// identified by `state.project_detail_path`: total tokens / cost / sessions,
 /// 30-day trend sparklines, model + tool composition, and the most recent
-/// sessions. Opened from the Projects detail popup (panel 1) via Enter.
+/// sessions. Opened from the Projects detail popup via Enter.
 fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
     use ratatui::widgets::Clear;
 
@@ -7582,7 +8130,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     // Recent sessions. Column header matches the row layout below so a
     // reader doesn't have to decode each row's positional meaning.
     content.push(Line::from(Span::styled(
-        " Recent sessions — newest first",
+        " Recent session-days — newest first",
         Style::default().fg(theme::PRIMARY).bold(),
     )));
     content.push(Line::from(vec![Span::styled(
@@ -7608,10 +8156,9 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         let tokens = session.work_tokens() + subagents.work_tokens;
         let cost = session.cost(calculator) + subagents.cost;
         let unpriced = session.has_unpriced_model(calculator) || subagents.unpriced;
-        let model_short = session.model.as_ref().map_or_else(
-            || "?".to_string(),
-            |m| crate::aggregator::normalize_model_name(m),
-        );
+        let model_short = session
+            .day_model()
+            .map_or_else(|| "?".to_string(), crate::aggregator::normalize_model_name);
         let branch_short = session
             .git_branch
             .as_ref()
@@ -7685,17 +8232,15 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
 
     let visible_height = popup_height.saturating_sub(2) as usize;
     let max_scroll = content.len().saturating_sub(visible_height);
-    // The view follows the cursor's two-line row; the first row shows the
-    // project's figures above it as well, when both fit.
-    let mut scroll = state.project_detail_scroll();
-    if cursor == 0 && cursor_line + 2 <= visible_height {
-        scroll = 0;
-    } else if cursor_line < scroll {
-        scroll = cursor_line;
-    } else if cursor_line + 2 > scroll + visible_height {
-        scroll = (cursor_line + 2).saturating_sub(visible_height);
-    }
-    let scroll = scroll.min(max_scroll);
+    // The cursor's row is two lines tall.
+    let scroll = follow_row(
+        state.project_detail_scroll(),
+        cursor_line,
+        2,
+        visible_height,
+        cursor == 0,
+    )
+    .min(max_scroll);
     state.set_project_detail_scroll(scroll);
     state.set_project_detail_cursor(cursor);
     let row_lines: Vec<(usize, usize)> = row_starts
@@ -7725,7 +8270,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         ""
     };
     let project_total = state.stats.project_stats.len();
-    let project_pos = state.dashboard_scroll[1] + 1;
+    let project_pos = state.dashboard_scroll[crate::DashPanel::Projects] + 1;
     let position_chip = if project_total > 0 {
         format!(" [{project_pos}/{project_total} {label}] ")
     } else {
@@ -7733,14 +8278,16 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     };
 
     let title = format!(" Project · {label} ");
-    let block = popup_block(&title).title_bottom(Line::from(vec![
-        Span::styled(
-            " ↑↓: session  Enter: info  q/Esc: back ",
-            Style::default().fg(theme::LABEL),
-        ),
+    let mut footer = popup_hints(
+        &mut state.layout,
+        popup_area,
+        &[("↑↓", "session"), ("Enter", "info"), ("q/Esc", "back")],
+    );
+    footer.spans.extend([
         Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
         Span::styled(position_chip, Style::default().fg(theme::PRIMARY)),
-    ]));
+    ]);
+    let block = popup_block(&title).title_bottom(footer);
     let paragraph = ratatui::widgets::Paragraph::new(content)
         .scroll((scroll as u16, 0))
         .block(block);
@@ -7776,7 +8323,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("                J / K in the pin list reorders the focused entry"),
         Line::from("  ?             Show this help"),
         Line::from("  q             Quit (press twice to confirm)"),
-        Line::from("  Popups        d/u page · g/G top/end scroll everywhere"),
+        Line::from("  Popups        d/u page · g/G top/end in every scrolling popup"),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Dashboard ", Style::default().fg(theme::HEADER).bold()),
@@ -7812,6 +8359,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("                in details: Enter opens the conversation"),
         Line::from("  Space         Pin / unpin (same as Daily)"),
         Line::from("  y             Copy `cd ... && claude -r UUID` to clipboard"),
+        Line::from("  s             Session summary (AI)"),
         Line::from("  ←/→ h/l       Time-travel: step back/forward through frozen snapshots"),
         Line::from("  t             Edit session title"),
         Line::from("  T             Jump back to the live now view"),
@@ -7820,6 +8368,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  Glyphs        🟢 busy · ◉ today · ○ older"),
         Line::from("                ⏸ paused · ⟳ alive in prior run"),
         Line::from("                past snapshot: ● still live now · · ended since"),
+        Line::from("  Cache         ●Nm warm N more min · ↻$ rewrite cost, API rates"),
+        Line::from("  Σ             Tokens and cost over every day of the session"),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Daily ", Style::default().fg(theme::HEADER).bold()),
@@ -7834,6 +8384,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("                in details: Enter opens the conversation"),
         Line::from("  ⇧Enter / C    Open conversation in a new pane"),
         Line::from("  Space         Pin / unpin session"),
+        Line::from("  y             Copy `cd ... && claude -r UUID` to clipboard"),
         Line::from("  s / S         Session / Day summary (AI)"),
         Line::from("                in popup: r regenerate · t write resume title"),
         Line::from("  Glyphs        · started this day · » continued from an earlier day"),
@@ -7856,7 +8407,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  d/u           Scroll page (20 lines)"),
         Line::from("  i             Session details"),
         Line::from("  s             Session summary (AI)"),
-        Line::from("  y             Copy message to clipboard"),
+        Line::from("  y             Copy message (pane) · resume command (list)"),
+        Line::from("  Space / t     (list) Pin / unpin · edit title"),
         Line::from("  /             Search in conversation (reopen restores the last query)"),
         Line::from("  Enter/\u{21e7}Enter  Next / previous match \u{b7} Esc ends the search"),
         Line::from("  n/N           Jump to next / previous message"),
@@ -7914,10 +8466,11 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
             " Help [↑↓: scroll] ",
             Style::default().fg(theme::PRIMARY).bold(),
         ))
-        .title_bottom(Line::from(Span::styled(
-            " ↑↓: scroll  ?/q/Esc: close ",
-            Style::default().fg(theme::LABEL),
-        )));
+        .title_bottom(popup_hints(
+            &mut state.layout,
+            popup_area,
+            &[("↑↓", "scroll"), ("?/q/Esc", "close")],
+        ));
     let inner = block.inner(popup_area);
     let total_lines = content.len() as u16;
     let max_scroll = total_lines.saturating_sub(inner.height);
@@ -7971,12 +8524,12 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
     } else if state.search_index.is_none() && state.index_build_task.is_some() {
         " Search [Indexing...] ".to_string()
     } else if state.search_input.text.is_empty() {
-        " Search (Esc: cancel, Enter: select) ".to_string()
+        " Search (Enter: open, Esc: close) ".to_string()
     } else {
         // Results are deduped to one row per session inside the search
         // pipeline, so the headline is a straight session count.
         let hits = state.search_results.len();
-        let headline = format!(" Search · {hits} sessions ");
+        let headline = format!(" Search · {} ", crate::text::count_noun(hits, "session"));
         title_spans.push(Span::styled(
             headline.clone(),
             Style::default().fg(theme::PRIMARY).bold(),
@@ -8012,6 +8565,32 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         }
         if let Some(b) = &parsed_filters.branch {
             push_chip(format!("branch:{b}"));
+        }
+        // The view's own filters narrow the search too; name them, in the
+        // chips' quieter form, so a short result list explains itself.
+        let mut view = Vec::new();
+        if state.period_filter != crate::PeriodFilter::All {
+            view.push(format!("f:{}", state.period_filter.label()));
+        }
+        if let Some(p) = &state.project_filter {
+            view.push(format!("p:{}", state.project_label(p)));
+        }
+        if !view.is_empty() {
+            title_spans.push(Span::styled(
+                format!("in {} ", view.join(" ")),
+                Style::default().fg(theme::LABEL),
+            ));
+        }
+        // An unrecognised `filter:` value falls back to a text search, which
+        // finds nothing; say so, with the values that work.
+        if let Some(bad) = free_text
+            .split_whitespace()
+            .find(|t| t.starts_with("filter:"))
+        {
+            title_spans.push(Span::styled(
+                format!("⚠ {bad}? try today·week·month·date:YYYY-MM-DD·live·paused·busy "),
+                Style::default().fg(theme::WARNING),
+            ));
         }
         headline
     };
@@ -8049,10 +8628,16 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
     let results_block = Block::default()
         .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
         .border_style(Style::default().fg(theme::PRIMARY))
-        .title_bottom(Line::from(Span::styled(
-            " ↑↓: results  ↑(empty): history  Enter: open  Esc: close ",
-            Style::default().fg(theme::LABEL),
-        )));
+        .title_bottom({
+            let footer = popup_footer(&[
+                ("↑↓", "results"),
+                ("↑(empty)", "history"),
+                ("Enter", "open"),
+                ("Esc", "close"),
+            ]);
+            record_hint_areas(&mut state.layout, bottom_border(inner[1]), &footer);
+            footer
+        });
 
     if state.search_results.is_empty() {
         let no_results = if state.search_input.text.is_empty() {
@@ -8310,10 +8895,175 @@ mod tests {
     }
 
     #[test]
+    fn an_over_wide_toast_keeps_its_head_and_ends_in_an_ellipsis() {
+        let mut state = create_test_state();
+        state.toast(format!("⚠ Head stays {}", "x".repeat(200)));
+        let text = render_to_text(&mut state, 60, 20);
+        let row = text
+            .lines()
+            .find(|l| l.contains("⚠ Head stays"))
+            .unwrap_or_else(|| panic!("toast missing:\n{text}"));
+        assert!(row.contains("x…"), "{row:?}");
+    }
+
+    #[test]
+    fn a_hint_label_presses_the_keys_it_names() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let k = KeyEvent::from;
+        for (label, want) in [
+            ("s", vec![k(KeyCode::Char('s'))]),
+            ("/", vec![k(KeyCode::Char('/'))]),
+            ("Enter", vec![k(KeyCode::Enter)]),
+            ("Space", vec![k(KeyCode::Char(' '))]),
+            ("Sp", vec![k(KeyCode::Char(' '))]),
+            ("S-Tab", vec![k(KeyCode::BackTab)]),
+            ("←→", vec![k(KeyCode::Left), k(KeyCode::Right)]),
+            ("↑↓", vec![k(KeyCode::Up), k(KeyCode::Down)]),
+            ("H/L", vec![k(KeyCode::Char('H')), k(KeyCode::Char('L'))]),
+            ("i/Esc", vec![k(KeyCode::Char('i')), k(KeyCode::Esc)]),
+            (
+                "^R",
+                vec![KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)],
+            ),
+            // A range or prose is not one key: it stays unclickable.
+            ("1-4", vec![]),
+            ("0-9", vec![]),
+            ("↑(empty)", vec![]),
+        ] {
+            assert_eq!(hint_keys(label), want, "{label}");
+        }
+    }
+
+    #[test]
+    fn hint_areas_cover_each_whole_hint_and_split_a_paired_one() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut layout = crate::LayoutAreas::default();
+        // " ?:help ←→:day m:pins" — `m:pins` overflows the 15-wide rect.
+        let line = help_bar(&[("?", "help"), ("←→", "day"), ("m", "pins")]);
+        record_hint_areas(&mut layout, Rect::new(10, 3, 15, 1), &line);
+        let got: Vec<(u16, u16, KeyEvent)> = layout
+            .hint_areas
+            .iter()
+            .map(|(r, k)| (r.x, r.width, *k))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (10, 8, KeyEvent::from(KeyCode::Char('?'))),
+                (18, 3, KeyEvent::from(KeyCode::Left)),
+                (21, 4, KeyEvent::from(KeyCode::Right)),
+            ]
+        );
+        assert_eq!(
+            hint_at(&layout, 12, 3),
+            Some(KeyEvent::from(KeyCode::Char('?')))
+        );
+        assert_eq!(hint_at(&layout, 12, 4), None);
+    }
+
+    /// Clicking a drawn hint presses its key: the column comes from the
+    /// rendered text, so the recorded area and the pixels must agree.
+    fn click_hint(state: &mut crate::AppState, text: &str, hint: &str) -> bool {
+        let Some((row, line)) = text.lines().enumerate().find(|(_, l)| l.contains(hint)) else {
+            panic!("hint {hint:?} not drawn:\n{text}");
+        };
+        let byte = line.find(hint).unwrap();
+        let col = unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16;
+        let Some(key) = hint_at(&state.layout, col, row as u16) else {
+            return false;
+        };
+        crate::dispatch_key(state, key);
+        true
+    }
+
+    #[test]
+    fn clicking_a_popup_hint_does_what_its_key_does() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = crate::DashPanel::Projects;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        let before = state.dashboard_projects_sort;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(
+            click_hint(&mut state, &text, "s: sort"),
+            "sort hint not clickable"
+        );
+        assert_ne!(state.dashboard_projects_sort, before);
+
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Daily;
+        state.selected_day = state.daily_groups.len() - 1;
+        state.selected_session = 0;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(
+            click_hint(&mut state, &text, "t: title"),
+            "title hint not clickable"
+        );
+        assert!(
+            state.show_title_edit(),
+            "the title editor opens as `t` does"
+        );
+    }
+
+    #[test]
+    fn clicking_a_tab_footer_hint_does_what_its_key_does() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Dashboard;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(click_hint(&mut state, &text, "?:help"));
+        assert!(state.show_help());
+    }
+
+    #[test]
+    fn a_narrow_tab_footer_drops_whole_hints_from_the_right() {
+        let state = create_test_state();
+        let pairs = [
+            ("?", "help"),
+            ("q", "quit"),
+            ("←→", "day"),
+            ("Space", "pin"),
+        ];
+        let text = |w| -> String {
+            tab_help_bar(&state, w, &pairs)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert_eq!(text(u16::MAX), " ?:help q:quit ←→:day Space:pin");
+        assert_eq!(text(24), " ?:help q:quit ←→:day");
+        // The first two stay even when they alone overflow.
+        assert_eq!(text(3), " ?:help q:quit");
+    }
+
+    #[test]
+    fn every_tab_footer_fits_a_narrow_terminal() {
+        for (name, tab) in [
+            ("Dashboard", crate::Tab::Dashboard),
+            ("Live", crate::Tab::Live),
+            ("Daily", crate::Tab::Daily),
+            ("Insights", crate::Tab::Insights),
+        ] {
+            let mut state = create_test_state();
+            state.tab = tab;
+            let text = render_to_text(&mut state, 60, 20);
+            let footer = text.lines().last().unwrap_or_default().trim_end();
+            assert!(footer.starts_with(" ?:help"), "{name}: {footer:?}");
+            // Ends on a whole `key:action`, never a cut word.
+            let last = footer.rsplit(' ').next().unwrap_or_default();
+            assert!(
+                last.contains(':') && !last.ends_with(':'),
+                "{name} footer cut mid-hint: {footer:?}"
+            );
+        }
+    }
+
+    #[test]
     fn search_mode_replaces_the_tab_bar_with_the_search_keys() {
         let mut state = create_test_state();
         let pairs = [("q", "quit"), ("←→", "panel")];
-        let normal: String = tab_help_bar(&state, &pairs)
+        let normal: String = tab_help_bar(&state, u16::MAX, &pairs)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -8321,7 +9071,7 @@ mod tests {
         assert!(normal.contains("q:quit"));
 
         state.search_mode = true;
-        let searching: String = tab_help_bar(&state, &pairs)
+        let searching: String = tab_help_bar(&state, u16::MAX, &pairs)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -8329,7 +9079,7 @@ mod tests {
         // Every printable key goes into the query, so none of the tab's own
         // keys may be advertised.
         assert!(!searching.contains("q:quit"), "got {searching:?}");
-        assert!(searching.contains("Esc:back"), "got {searching:?}");
+        assert!(searching.contains("Esc:close"), "got {searching:?}");
     }
 
     // While the index is still being built an empty result list is not an
@@ -8378,7 +9128,7 @@ mod tests {
         let mut state = make_test_app_state(vec![make_daily_group(today, vec![user, sub])]);
         state.loading = false;
         state.daily_costs = vec![(today, 100.0)];
-        state.dashboard_panel = 0;
+        state.dashboard_panel = crate::DashPanel::Costs;
         state.active_popup = crate::ActivePopup::DashboardDetail;
         let text = render_to_text(&mut state, 140, 45);
         let line = text
@@ -8425,7 +9175,7 @@ mod tests {
         state
             .models_without_pricing
             .insert("claude-future-x".to_string());
-        state.dashboard_panel = 0;
+        state.dashboard_panel = crate::DashPanel::Costs;
         state.active_popup = crate::ActivePopup::DashboardDetail;
         let text = render_to_text(&mut state, 140, 45);
         let line = text
@@ -9047,6 +9797,7 @@ mod tests {
             crate::ActivePopup::ProjectPopup {
                 selected: 0,
                 scroll: 0,
+                query: crate::state::TextInput::default(),
             },
             crate::ActivePopup::TitleEdit {
                 input: crate::TextInput::default(),
@@ -9221,6 +9972,26 @@ mod tests {
             "occurrence counter in the bar: {text}"
         );
         assert!(text.contains("Esc: close"), "key hints in the bar: {text}");
+    }
+
+    /// A compact row fits the pane after its cursor gutter and scrollbar, so a
+    /// long CJK summary ends on its `…` instead of being cut at the edge.
+    #[test]
+    fn a_compact_row_leaves_room_for_the_gutter_and_scrollbar() {
+        let long = "日本語の長いメッセージがペインの幅を超えて続く場合の表示確認用".repeat(4);
+        let messages = vec![conv_msg("assistant", vec![ConversationBlock::Text(long)])];
+        for width in [40u16, 81] {
+            let (lines, _, _) =
+                render_compact_lines(&messages, width, &std::collections::HashSet::new());
+            let row = &lines[0];
+            assert!(
+                row.width() + 3 <= width as usize,
+                "width {width}: {}",
+                row.width()
+            );
+            let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.ends_with('…'), "{text}");
+        }
     }
 
     #[test]
@@ -9946,7 +10717,7 @@ mod tests {
             },
         ] {
             state.active_popup = popup;
-            let bar = tab_help_bar(&state, &pairs);
+            let bar = tab_help_bar(&state, u16::MAX, &pairs);
             let text: String = bar.spans.iter().map(|s| s.content.to_string()).collect();
             assert!(
                 bar.spans.len() < full && text.contains("Esc"),
@@ -9959,11 +10730,12 @@ mod tests {
             ActivePopup::ProjectPopup {
                 selected: 0,
                 scroll: 0,
+                query: crate::state::TextInput::default(),
             },
         ] {
             state.active_popup = popup;
             assert_eq!(
-                tab_help_bar(&state, &pairs).spans.len(),
+                tab_help_bar(&state, u16::MAX, &pairs).spans.len(),
                 full,
                 "non-blocking popup collapsed the tab bar"
             );
@@ -10149,7 +10921,7 @@ mod tests {
             ),
             (
                 crate::Tab::Daily,
-                " ?:help q:quit ←→:day ↑↓:session Enter:info s:summary S:day-summary t:title /:search Space:pin m:pins",
+                " ?:help q:quit ←→:day ↑↓:session Enter:info s:summary S:day-summary y:copy-resume t:title /:search Space:pin m:pins",
             ),
             (
                 crate::Tab::Insights,
@@ -10373,12 +11145,6 @@ mod tests {
         use ratatui::layout::Rect;
         let mut state = create_test_state();
         state.show_conversation = true;
-        state.layout.help_trigger = Some(Rect {
-            x: 1,
-            y: 1,
-            width: 3,
-            height: 1,
-        });
         state.layout.filter_popup_area_trigger = Some(Rect {
             x: 1,
             y: 1,
@@ -10398,10 +11164,6 @@ mod tests {
             height: 1,
         });
         let _ = render_to_text(&mut state, 140, 45);
-        assert!(
-            state.layout.help_trigger.is_none(),
-            "help_trigger must clear"
-        );
         assert!(state.layout.filter_popup_area_trigger.is_none());
         assert!(state.layout.project_popup_area_trigger.is_none());
         assert!(state.layout.pin_view_trigger.is_none());
@@ -10442,7 +11204,7 @@ mod tests {
         // rule) and never render the literal "Other" row.
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
-        state.dashboard_panel = 4;
+        state.dashboard_panel = crate::DashPanel::Languages;
         let text = render_to_text(&mut state, 140, 45);
         assert!(
             !text.contains(" Other "),
@@ -10616,20 +11378,20 @@ mod tests {
         state.active_popup = crate::ActivePopup::DashboardDetail;
 
         let panel_markers = [
-            (0, "Daily Costs"),
-            (1, "close"), // Projects: dynamic title, verify popup footer
-            (2, "Model Tokens"),
-            (3, "Ecosystem"),
-            (4, "Languages"),
-            (5, "Daily Activity"),
-            (6, "Hourly Average"),
+            (crate::DashPanel::Costs, "Daily Costs"),
+            (crate::DashPanel::Projects, "close"), // dynamic title: check the footer
+            (crate::DashPanel::Models, "Model Tokens"),
+            (crate::DashPanel::Ecosystem, "Ecosystem"),
+            (crate::DashPanel::Languages, "Languages"),
+            (crate::DashPanel::Activity, "Daily Activity"),
+            (crate::DashPanel::Hourly, "Hourly Average"),
         ];
         for (panel, expected) in panel_markers {
             state.dashboard_panel = panel;
             let text = render_to_text(&mut state, 120, 35);
             assert!(
                 text.contains(expected),
-                "dashboard detail panel {panel} should contain '{expected}', got:\n{text}"
+                "dashboard detail panel {panel:?} should contain '{expected}', got:\n{text}"
             );
         }
     }
@@ -10659,7 +11421,7 @@ mod tests {
             .insert("command:my-cmd".to_string(), 1);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
 
         let text = render_to_text(&mut state, 140, 35);
         assert!(
@@ -10699,7 +11461,7 @@ mod tests {
             .insert("skill:my-skill".to_string(), 3);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
 
         // Render populates `tools_detail_tab_areas` as a side effect.
         let text = render_to_text(&mut state, 140, 35);
@@ -10749,7 +11511,7 @@ mod tests {
         }
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
         state.dashboard_ecosystem_sort = crate::state::RankSort::Recency;
         // Render each section (0=Tools,1=Skills,2=Commands,3=Subagents) — none
         // may panic. (render_to_text panics propagate and fail the test.)
@@ -10828,10 +11590,10 @@ mod tests {
             "40 day rows + at least one month divider"
         );
         state.tab = crate::Tab::Dashboard;
-        state.dashboard_panel = 0;
+        state.dashboard_panel = crate::DashPanel::Costs;
         state.active_popup = crate::ActivePopup::DashboardDetail;
         // Past the end — the popup clamps to the last full line-based page.
-        state.dashboard_scroll[0] = 9999;
+        state.dashboard_scroll[crate::DashPanel::Costs] = 9999;
         let text = render_to_text(&mut state, 140, 35);
         assert!(
             text.contains(&oldest.to_string()),
@@ -10867,7 +11629,7 @@ mod tests {
         }];
         state.configured_resources = Default::default();
         state.tab = crate::Tab::Dashboard;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
         state.active_popup = crate::ActivePopup::DashboardDetail;
         state.tools_detail_section = 0;
         let text = render_to_text(&mut state, 140, 45);
@@ -10999,7 +11761,7 @@ mod tests {
             .insert("Opus 5.5".to_string(), tokens);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2;
+        state.dashboard_panel = crate::DashPanel::Models;
         let text = render_to_text(&mut state, 140, 45);
         let billed = text.lines().find(|l| l.contains("billed as")).unwrap();
         assert!(billed.contains("fast mode $8.00"), "{billed}");
@@ -11038,8 +11800,8 @@ mod tests {
         }
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2;
-        state.dashboard_scroll[2] = 15;
+        state.dashboard_panel = crate::DashPanel::Models;
+        state.dashboard_scroll[crate::DashPanel::Models] = 15;
         for h in [18, 24, 30] {
             let text = render_to_text(&mut state, 140, h);
             assert!(text.contains("cache hit"), "{h}: no table header:\n{text}");
@@ -11059,7 +11821,7 @@ mod tests {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2;
+        state.dashboard_panel = crate::DashPanel::Models;
         let text = render_to_text(&mut state, 140, 45);
         let daily = text.lines().find(|l| l.contains("  daily ")).unwrap();
         let today = chrono::Local::now()
@@ -11084,7 +11846,7 @@ mod tests {
         }
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2;
+        state.dashboard_panel = crate::DashPanel::Models;
         render_to_text(&mut state, 140, 45);
         let (_, area) = state
             .layout
@@ -11094,10 +11856,31 @@ mod tests {
             .copied()
             .unwrap();
         crate::handlers::mouse::handle_mouse_click(&mut state, area.x + 1, area.y);
-        assert_eq!(state.dashboard_scroll[2], 2);
+        assert_eq!(state.dashboard_scroll[crate::DashPanel::Models], 2);
         assert!(
             state.show_dashboard_detail(),
             "the click stays in the popup"
+        );
+    }
+
+    // The view moves only when the cursor row leaves it, and then just far
+    // enough to show the row whole; a first row brings the content above it
+    // back only when both fit.
+    #[test]
+    fn follow_row_moves_the_view_only_when_the_row_leaves_it() {
+        assert_eq!(follow_row(5, 7, 1, 10, false), 5, "in view: stays");
+        assert_eq!(follow_row(5, 3, 1, 10, false), 3, "above: row at the top");
+        assert_eq!(
+            follow_row(5, 15, 2, 10, false),
+            7,
+            "below: row at the bottom"
+        );
+        assert_eq!(follow_row(5, 14, 2, 10, false), 6, "half out: whole row in");
+        assert_eq!(follow_row(5, 8, 2, 10, true), 0, "a first row that fits");
+        assert_eq!(
+            follow_row(0, 12, 2, 10, true),
+            4,
+            "a first row below the fold"
         );
     }
 
@@ -11170,7 +11953,7 @@ mod tests {
             .insert("mcp__server1__tool".to_string(), 4);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
 
         state.dashboard_ecosystem_sort = crate::state::RankSort::Recency;
         let text = render_to_text(&mut state, 140, 35);
@@ -11204,13 +11987,13 @@ mod tests {
         }
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
         state.tools_detail_section = 0; // Tools tab (Built-in + MCP)
-        state.dashboard_scroll[3] = 4; // force a scrolled viewport
+        state.dashboard_scroll[crate::DashPanel::Ecosystem] = 4; // force a scrolled viewport
 
         let buffer = render_buffer(&mut state, 140, 24);
         assert!(
-            state.dashboard_scroll[3] > 0,
+            state.dashboard_scroll[crate::DashPanel::Ecosystem] > 0,
             "the body must actually be scrolled to exercise the offset"
         );
         assert!(
@@ -11240,7 +12023,7 @@ mod tests {
             .insert("skill:my-skill".to_string(), 3);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
 
         // Active = 0 (Tools): body should show the synthetic Built-in group row
         // (collapsed by default — individual tool names appear only when expanded).
@@ -11293,9 +12076,9 @@ mod tests {
         }
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
         state.tools_detail_section = 1;
-        state.dashboard_scroll[3] = 0;
+        state.dashboard_scroll[crate::DashPanel::Ecosystem] = 0;
         let text_top = render_to_text(&mut state, 140, 24);
         assert!(
             text_top.contains("1. my-skill00"),
@@ -11303,11 +12086,11 @@ mod tests {
         );
         // Scroll past the first 2 rows — row 1 / row 2 must drop off,
         // row 3 must remain.
-        state.dashboard_scroll[3] = 2;
+        state.dashboard_scroll[crate::DashPanel::Ecosystem] = 2;
         let text_scrolled = render_to_text(&mut state, 140, 24);
         assert!(
             !text_scrolled.contains("1. my-skill00"),
-            "row 1 must scroll off with dashboard_scroll[3]=2. Got:\n{text_scrolled}"
+            "row 1 must scroll off with dashboard_scroll[crate::DashPanel::Ecosystem]=2. Got:\n{text_scrolled}"
         );
         assert!(
             text_scrolled.contains("3. my-skill02"),
@@ -11323,7 +12106,7 @@ mod tests {
         state.stats.tool_usage.insert("Bash".to_string(), 5);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
         state.tools_detail_section = 2; // Subagents (empty)
 
         let text = render_to_text(&mut state, 140, 35);
@@ -11511,7 +12294,7 @@ mod tests {
             .insert("mcp__server1__action2".to_string(), 2);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
         state.tools_detail_section = 0;
         assert!(state.mcp_expanded_servers.is_empty());
 
@@ -11558,7 +12341,7 @@ mod tests {
             .insert("mcp__server1__action2".to_string(), 2);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
         state.tools_detail_section = 0;
         state.mcp_expanded_servers.insert("server1".to_string());
 
@@ -11612,7 +12395,7 @@ mod tests {
             .insert("orgA/serverB".to_string(), 1);
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 3;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
         state.tools_detail_section = 0; // Tools tab (Built-in + MCP merged)
 
         let text = render_to_text(&mut state, 140, 35);
@@ -11784,7 +12567,7 @@ mod tests {
         state.dashboard_models_sort = crate::RankSort::Recency;
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2;
+        state.dashboard_panel = crate::DashPanel::Models;
         let text = render_to_text(&mut state, 140, 45);
         let table: Vec<&str> = text
             .lines()
@@ -11826,7 +12609,7 @@ mod tests {
         state.dashboard_projects_sort = crate::RankSort::Recency;
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 1;
+        state.dashboard_panel = crate::DashPanel::Projects;
         let text = render_to_text(&mut state, 140, 45);
         let full = "█".repeat(12);
         let full_bars = text.lines().filter(|l| l.contains(&full)).count();
@@ -11843,7 +12626,7 @@ mod tests {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2;
+        state.dashboard_panel = crate::DashPanel::Models;
         let unknown_model = "claude-future-x".to_string();
         let tokens = crate::aggregator::stats::TokenStats {
             input_tokens: 1000,
@@ -11867,7 +12650,8 @@ mod tests {
             .map(|(n, t)| (n.clone(), t.work_tokens(), ()))
             .collect();
         state.sort_models(&mut models);
-        state.dashboard_scroll[2] = models.iter().position(|m| m.0 == unknown_model).unwrap();
+        state.dashboard_scroll[crate::DashPanel::Models] =
+            models.iter().position(|m| m.0 == unknown_model).unwrap();
         let text = render_to_text(&mut state, 140, 35);
         // Both money columns flag the gap, $/ses included.
         assert!(
@@ -11883,7 +12667,7 @@ mod tests {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 1;
+        state.dashboard_panel = crate::DashPanel::Projects;
         state.stats.project_stats.clear();
         let names = ["/work/dev/foo", "/other/area/foo"];
         let labels = ["foo (dev)", "foo (area)"];
@@ -12041,7 +12825,7 @@ mod tests {
             .into_iter()
             .collect();
         state.tab = crate::Tab::Dashboard;
-        state.dashboard_panel = 4;
+        state.dashboard_panel = crate::DashPanel::Languages;
         let panel = render_to_text(&mut state, 140, 45);
         state.active_popup = crate::ActivePopup::DashboardDetail;
         let popup = render_to_text(&mut state, 140, 45);
@@ -12221,7 +13005,7 @@ mod tests {
         }
         state.dashboard_models_sort = crate::RankSort::Tokens;
         state.tab = crate::Tab::Dashboard;
-        state.dashboard_panel = 2;
+        state.dashboard_panel = crate::DashPanel::Models;
         state.active_popup = crate::ActivePopup::DashboardDetail;
         let label = crate::ui::insights::short_month(
             &chrono::Local::now()
@@ -12230,7 +13014,7 @@ mod tests {
                 .to_string(),
         );
         let total = state.aggregated_model_tokens.len();
-        state.dashboard_scroll[2] = total - 1;
+        state.dashboard_scroll[crate::DashPanel::Models] = total - 1;
         let text = render_to_text(&mut state, 140, 45);
         assert!(text.contains(&label), "the grid stays:\n{text}");
         assert!(text.contains(&format!("{total}/{total}")), "{text}");
@@ -12247,10 +13031,10 @@ mod tests {
     fn the_projects_drill_in_is_hinted_and_full_size() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
-        state.dashboard_panel = 1;
+        state.dashboard_panel = crate::DashPanel::Projects;
         state.active_popup = crate::ActivePopup::DashboardDetail;
         let list = render_to_text(&mut state, 140, 45);
-        assert!(list.contains("Enter: open project"), "{list}");
+        assert!(list.contains("Enter: open-project"), "{list}");
         state.active_popup = crate::ActivePopup::ProjectDetail {
             path: "~/proj".to_string(),
             scroll: 0,
@@ -12431,7 +13215,7 @@ mod tests {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 1; // Projects
+        state.dashboard_panel = crate::DashPanel::Projects; // Projects
 
         let text = render_to_text(&mut state, 140, 35);
         // Must contain " ses" (space prefix) — never " 357s" raw form.
@@ -12671,7 +13455,7 @@ mod tests {
         // Main view uses "6.00K/day tokens" (no extra spaces)
         assert!(
             text.contains("Cache Hit Rate"),
-            "detail popup panel 0 should be visible"
+            "the Costs detail popup should be visible"
         );
         assert!(
             text.contains("/day"),
@@ -12823,7 +13607,7 @@ mod tests {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2;
+        state.dashboard_panel = crate::DashPanel::Models;
         state.models_without_pricing.insert("Sonnet 4".to_string());
         if let Some(t) = state.aggregated_model_tokens.get_mut("Sonnet 4") {
             t.non_standard_speed = true;
@@ -12840,7 +13624,7 @@ mod tests {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
         state.active_popup = crate::ActivePopup::DashboardDetail;
-        state.dashboard_panel = 2;
+        state.dashboard_panel = crate::DashPanel::Models;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
             text.contains("cache hit"),
@@ -13014,6 +13798,7 @@ mod tests {
         state.active_popup = crate::ActivePopup::ProjectPopup {
             selected: 1,
             scroll: 0,
+            query: crate::state::TextInput::default(),
         };
         let text = render_to_text(&mut state, 120, 35);
         assert!(
@@ -13021,9 +13806,199 @@ mod tests {
             "Project popup should show title, got:\n{text}"
         );
         assert!(
-            text.contains("app-a"),
+            text.contains("test-project"),
             "Project popup should show project name, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn a_narrow_project_picker_drops_activity_before_the_name_squeezes() {
+        let wide = ProjectColumns::fit(98);
+        assert!(wide.spark && wide.sessions && wide.cost);
+        let narrow = ProjectColumns::fit(50);
+        assert!(!narrow.spark, "activity goes first");
+        assert!(narrow.cost);
+        let row = narrow.row(
+            " ● name",
+            Some("··"),
+            3,
+            1.5,
+            false,
+            1200,
+            Some("2d ago".into()),
+        );
+        assert_eq!(unicode_width::UnicodeWidthStr::width(row.as_str()), 50);
+        assert!(row.ends_with("2d ago"), "{row}");
+    }
+
+    /// Scrolled to its end, the Languages popup's last page is full: one-line
+    /// rows are counted as one line, so nothing blank trails the last row.
+    #[test]
+    fn the_languages_popup_ends_on_its_last_row() {
+        let mut state = create_test_state();
+        state.stats.language_usage.clear();
+        state.stats.extension_usage.clear();
+        for i in 0..60usize {
+            state
+                .stats
+                .extension_usage
+                .insert(format!("zz{i:02}"), 100 - i);
+        }
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = crate::DashPanel::Languages;
+        state.dashboard_languages_sort = crate::state::RankSort::Tokens;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_scroll[crate::DashPanel::Languages] = usize::MAX;
+        let text = render_to_text(&mut state, 140, 45);
+        let rows: Vec<&str> = text.lines().collect();
+        let bottom = rows
+            .iter()
+            .rposition(|l| l.contains("└ ←→: panel"))
+            .unwrap_or_else(|| panic!("no popup:\n{text}"));
+        assert!(rows[bottom - 1].contains(".zz59"), "blank tail:\n{text}");
+        assert!(rows[bottom].contains("/60 "), "{}", rows[bottom]);
+        assert!(
+            rows[bottom].contains("-60/60"),
+            "the range runs to the end: {}",
+            rows[bottom]
+        );
+    }
+
+    /// The Projects cursor rests on the last project, which the popup draws;
+    /// a page-based clamp would stop it a screen short of the end.
+    #[test]
+    fn the_projects_cursor_reaches_the_last_project() {
+        let mut state = create_test_state();
+        for i in 0..30u64 {
+            state.stats.project_stats.insert(
+                format!("~/proj/p{i:02}"),
+                crate::aggregator::ProjectStats {
+                    sessions: 1,
+                    tokens: 1000 - i,
+                    work_tokens: 1000 - i,
+                },
+            );
+        }
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = crate::DashPanel::Projects;
+        state.dashboard_projects_sort = crate::state::RankSort::Tokens;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        let total = state.stats.project_stats.len();
+        state.dashboard_scroll[crate::DashPanel::Projects] = usize::MAX;
+        let text = render_to_text(&mut state, 140, 45);
+        assert_eq!(
+            state.dashboard_scroll[crate::DashPanel::Projects],
+            total - 1
+        );
+        assert!(text.contains("p29"), "last project not drawn:\n{text}");
+        assert!(text.contains(&format!("{total}/{total}")), "{text}");
+    }
+
+    /// ↓ walks the Tools cursor to the last server and keeps it on screen: the
+    /// cursor counts the ratio line and the MCP divider the body draws.
+    #[test]
+    fn the_tools_cursor_brings_the_last_server_into_view() {
+        let mut state = create_test_state();
+        state.stats.tool_usage.insert("Read".into(), 500);
+        for i in 0..40 {
+            state
+                .stats
+                .tool_usage
+                .insert(format!("mcp__server{i:02}__do"), 100 - i);
+        }
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
+        state.tools_detail_section = 0;
+        state.dashboard_ecosystem_sort = crate::state::RankSort::Tokens;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        let mut text = render_to_text(&mut state, 140, 30);
+        for _ in 0..60 {
+            crate::handlers::keyboard::handle_dashboard_detail_key(
+                &mut state,
+                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Down),
+            );
+            text = render_to_text(&mut state, 140, 30);
+        }
+        assert!(text.contains("server39"), "last server hidden:\n{text}");
+    }
+
+    #[test]
+    fn the_ecosystem_popup_scrolls_to_its_last_entry() {
+        let mut state = create_test_state();
+        for i in 0..80 {
+            state
+                .stats
+                .tool_usage
+                .insert(format!("skill:my-skill{i:02}"), 100 - i);
+        }
+        state.tab = crate::Tab::Dashboard;
+        state.dashboard_panel = crate::DashPanel::Ecosystem;
+        state.tools_detail_section = 1;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
+        state.dashboard_scroll[crate::DashPanel::Ecosystem] = usize::MAX;
+        let text = render_to_text(&mut state, 140, 45);
+        // Fewest calls sorts last; it must be on screen once scrolled to the end.
+        assert!(
+            text.contains("my-skill79"),
+            "last skill unreachable:\n{text}"
+        );
+    }
+
+    /// A narrow bar sheds tab counts and the filter's dates first, so an
+    /// active filter still shows: losing it hides why every number shrank.
+    #[test]
+    fn an_active_filter_stays_on_a_narrow_tab_bar() {
+        let mut state = create_test_state();
+        state.period_filter = crate::PeriodFilter::Last7d;
+        state.project_filter = Some("~/projects/app-a".to_string());
+        for w in [140, 80, 60] {
+            let text = render_to_text(&mut state, w, 24);
+            let bar = text.lines().nth(1).unwrap_or_default();
+            assert!(bar.contains("f:7d"), "width {w}: {bar}");
+            assert!(bar.contains("p:app-a"), "width {w}: {bar}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_search_filter_says_which_values_work() {
+        let mut state = create_test_state();
+        state.search_mode = true;
+        state.search_input.set("filter:yesterday".into());
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("⚠ filter:yesterday? try today"), "{text}");
+    }
+
+    #[test]
+    fn a_past_days_tab_badge_names_its_day() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(); // lint-ok: date-literal
+        let mut state = make_test_app_state(vec![make_daily_group(
+            day,
+            vec![make_session("p", None, None)],
+        )]);
+        state.loading = false;
+        let text = render_to_text(&mut state, 140, 30);
+        assert!(text.contains("Daily (01-02 · 1)"), "{text}");
+    }
+
+    #[test]
+    fn the_search_title_names_the_view_filters_that_narrow_it() {
+        let mut state = create_test_state();
+        state.period_filter = crate::PeriodFilter::Last7d;
+        state.search_mode = true;
+        state.search_input.set("anything".into());
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(text.contains("in f:7d"), "{text}");
+    }
+
+    #[test]
+    fn a_narrow_bar_names_a_custom_range_by_its_dates() {
+        let mut state = create_test_state();
+        let d = |m, day| chrono::NaiveDate::from_ymd_opt(2026, m, day).unwrap(); // lint-ok: date-literal
+        state.period_filter = crate::PeriodFilter::Custom(d(9, 1), Some(d(9, 30)));
+        let text = render_to_text(&mut state, 80, 24);
+        let bar = text.lines().nth(1).unwrap_or_default();
+        assert!(bar.contains("f:09-01–09-30"), "{bar}");
     }
 
     #[test]
@@ -13320,6 +14295,120 @@ mod tests {
             text.contains("⟳"),
             "snapshot-recovered glyph missing: {text}"
         );
+    }
+
+    #[test]
+    fn the_session_detail_spells_out_the_prompt_cache_state() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Daily;
+        state.selected_day = state.daily_groups.len() - 1;
+        state.selected_session = 0;
+        state.active_popup = crate::ActivePopup::Detail { back: None };
+        let path = crate::handlers::pane::detail_session(&state)
+            .map(|s| s.file_path)
+            .unwrap();
+        let id = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let now = chrono::Utc::now();
+        let mut detail = |secs_ago: i64| {
+            let tail = crate::session_state::CacheTail {
+                at: now - chrono::Duration::seconds(secs_ago),
+                tokens: 1_200_000,
+                ttl_secs: Some(3600),
+                model: Some("claude-opus-5-5".into()),
+            };
+            state.live_cache.insert(id.clone(), (None, tail));
+            render_to_text(&mut state, 140, 45)
+        };
+        let warm = detail(630);
+        assert!(
+            warm.contains("Cache     ●50m left · 1.20M cached (1h TTL)"),
+            "{warm}"
+        );
+        let cold = detail(7200);
+        assert!(
+            cold.contains("↻ expired · resuming rewrites 1.20M ≈ $"),
+            "{cold}"
+        );
+    }
+
+    /// On a tight row the date range gives way before the totals; the totals
+    /// carry `Σ`, as they span every day of the session.
+    #[test]
+    fn a_tight_live_row_drops_its_range_before_its_totals() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Live;
+        let mut row_a = live_session_fixture("row-a", "/tmp", None, 0);
+        row_a.started_at = Some(chrono::Utc::now() - chrono::Duration::days(3));
+        state.live_active = vec![row_a];
+        let row = |state: &mut crate::AppState, w| {
+            render_to_text(state, w, 30)
+                .lines()
+                .find(|l| l.contains('Σ'))
+                .unwrap_or_else(|| panic!("no totals at width {w}"))
+                .to_string()
+        };
+        assert!(
+            row(&mut state, 140).contains('–'),
+            "a wide row keeps its range"
+        );
+        let tight = row(&mut state, 48);
+        assert!(!tight.contains('–'), "{tight}");
+        assert!(tight.contains('$'), "the cost stays: {tight}");
+    }
+
+    /// The active list orders by the activity its glyph and age show, not by
+    /// the transcript's mtime, which a subagent touches without a turn.
+    #[test]
+    fn active_live_rows_order_by_their_shown_activity() {
+        let mut state = create_test_state();
+        let now = chrono::Utc::now();
+        let row = |id: &str, last_secs: i64, mtime_secs: i64| {
+            let mut s = live_session_fixture(id, "/tmp", None, 0);
+            s.jsonl_path = None;
+            s.updated_at = Some(now - chrono::Duration::seconds(last_secs));
+            s.jsonl_mtime = Some(now - chrono::Duration::seconds(mtime_secs));
+            s
+        };
+        state.live_active = vec![row("touched", 600, 1), row("worked", 60, 900)];
+        sort_active_by_recency(&mut state);
+        let ids: Vec<&str> = state
+            .live_active
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["worked", "touched"]);
+    }
+
+    #[test]
+    fn a_live_row_shows_whether_its_prompt_cache_is_still_warm() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Live;
+        state.live_active = vec![live_session_fixture("cached", "/tmp", None, 0)];
+        let now = chrono::Utc::now();
+        let row = |state: &mut crate::AppState, secs_ago: i64, ttl| {
+            state.live_cache.insert(
+                "cached".into(),
+                (
+                    None,
+                    crate::session_state::CacheTail {
+                        at: now - chrono::Duration::seconds(secs_ago),
+                        tokens: 1_000_000,
+                        ttl_secs: ttl,
+                        model: Some("claude-opus-5-5".into()),
+                    },
+                ),
+            );
+            render_to_text(state, 140, 45)
+        };
+        // 30s spare so the ceil-to-minute stays put while the frame draws.
+        assert!(row(&mut state, 630, Some(3600)).contains("●50m"));
+        let p = crate::aggregator::CostCalculator::global()
+            .get_pricing(Some("claude-opus-5-5"))
+            .unwrap();
+        let usd = p.cache_write_1h_cost_per_mtok - p.cache_read_cost_per_mtok;
+        let cold = row(&mut state, 7200, Some(3600));
+        assert!(cold.contains(&format!("↻${usd:.1}")), "{cold}");
+        assert!(row(&mut state, 10, None).contains(" ? "));
     }
 
     #[test]
@@ -13924,6 +15013,34 @@ mod tests {
         );
     }
 
+    // Back-to-back matches both light up, and no span is empty: an empty
+    // span is a wasted cell at best and a stray style at worst.
+    #[test]
+    fn adjacent_matches_both_highlight_with_no_empty_spans() {
+        let base = Style::default();
+        let hit = Style::default().add_modifier(Modifier::BOLD);
+        let spans = highlight_terms("abab", "ab", base, hit);
+        let parts: Vec<(&str, bool)> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style == hit))
+            .collect();
+        assert_eq!(parts, [("ab", true), ("ab", true)]);
+        let spans = highlight_terms("xx ab yy", "ab", base, hit);
+        assert!(spans.iter().all(|s| !s.content.is_empty()), "{spans:?}");
+        assert_eq!(spans.len(), 3);
+    }
+
+    // The last key's action ends the bar: no trailing space after it.
+    #[test]
+    fn a_help_bar_ends_on_its_last_action() {
+        let text: String = help_bar(&[("a", "one"), ("b", "two")])
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, " a:one b:two");
+    }
+
     #[test]
     fn highlight_terms_survives_non_ascii_text() {
         let base = Style::default();
@@ -14026,6 +15143,7 @@ mod tests {
                 8 => P::ProjectPopup {
                     selected: 0,
                     scroll: 0,
+                    query: crate::state::TextInput::default(),
                 },
                 9 => P::TitleEdit {
                     input: crate::TextInput::default(),

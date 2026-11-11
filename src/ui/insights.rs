@@ -26,13 +26,7 @@ fn insights_metrics(
     total_sessions: usize,
     calendar_days: usize,
 ) -> InsightsMetrics {
-    let cache_read = state.stats.total_tokens.cache_read_tokens;
-    let input_tokens = state.stats.total_tokens.input_tokens;
-    let cache_hit_rate = if input_tokens + cache_read > 0 {
-        cache_read as f64 / (input_tokens + cache_read) as f64 * 100.0
-    } else {
-        0.0
-    };
+    let cache_hit_rate = state.stats.total_tokens.cache_hit_pct().unwrap_or(0.0);
     // Share of cache writes that landed in the cheaper 5-minute TTL bucket.
     // 5m costs 1.25× base input; 1h costs 2×. Higher = cheaper writes, which
     // matches the "longer bar = better" convention shared by the other rates.
@@ -945,7 +939,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
     };
     // Metrics is sized to its content, so rows its steps cannot use go to
     // Weekly / Monthly instead of a blank band inside Metrics.
-    let today = chrono::Local::now().date_naive();
+    let today = state.view_end(chrono::Local::now().date_naive());
     let room = area.height.saturating_sub(BOTTOM_ROW_H + 1 + card_height);
     let extra = metrics_extra_lines(
         state,
@@ -992,8 +986,10 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
 
     // No ↑↓ entry: the Insights main view has nothing to scroll — reading
     // depth lives in the detail popup (Enter), which has full scroll keys.
-    let help_line = Paragraph::new(super::tab_help_bar(
+    super::draw_tab_help_bar(
+        frame,
         state,
+        chunks[2],
         &[
             ("?", "help"),
             ("q", "quit"),
@@ -1002,8 +998,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
             ("/", "search"),
             ("m", "pins"),
         ],
-    ));
-    frame.render_widget(help_line, chunks[2]);
+    );
 }
 
 /// Columns an MCP row keeps after the name: its indent, the gap and the
@@ -1234,7 +1229,7 @@ fn insights_detail_metrics(
 
     // The panel's charts; a popup too narrow for them falls back to one
     // sparkline per metric.
-    let today = chrono::Local::now().date_naive();
+    let today = state.view_end(chrono::Local::now().date_naive());
     if trend_charts_fit(w) {
         lines.extend(metrics_trend_charts(
             state,
@@ -1516,7 +1511,7 @@ fn insights_detail_metrics(
         lines.push(Line::from(vec![
             Span::styled(" Usage by category  ", Style::default().fg(theme::LABEL)),
             Span::styled(
-                format!("of {total} sessions"),
+                format!("of {}", crate::text::count_noun(total, "session")),
                 Style::default().fg(theme::LABEL),
             ),
         ]));
@@ -1679,7 +1674,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
     state.layout.active_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
-    let today = chrono::Local::now().date_naive();
+    let today = state.view_end(chrono::Local::now().date_naive());
     let calendar_days = state.calendar_days(today);
 
     // Title-cased to match the Dashboard popup convention (`Daily Costs`,
@@ -1707,7 +1702,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 (Weekday::Sun, "Sunday"),
             ];
 
-            let today_date = chrono::Local::now().date_naive();
+            let today_date = state.view_end(chrono::Local::now().date_naive());
             let today_weekday = today_date.weekday();
             let first_date = state.daily_groups.last().map_or(today_date, |g| g.date);
             let weekday_avg =
@@ -1948,20 +1943,22 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
     let max_scroll = lines.len().saturating_sub(visible_height);
     state.set_insights_detail_scroll(state.insights_detail_scroll().min(max_scroll));
 
+    let mut footer = super::popup_hints(
+        &mut state.layout,
+        popup_area,
+        &[("←→", "switch"), ("↑↓", "scroll"), ("Enter/i/q", "close")],
+    );
+    footer.spans.push(Span::styled(
+        format!(
+            " [{}/{INSIGHTS_PANELS}] {} ",
+            current_panel + 1,
+            panel_label
+        ),
+        Style::default().fg(theme::PRIMARY),
+    ));
     let popup = Paragraph::new(lines)
         .scroll((state.insights_detail_scroll() as u16, 0))
-        .block(
-            super::popup_block(&format!(" {panel_label} ")).title_bottom(Line::from(vec![
-                Span::styled(
-                    " ←→: switch  ↑↓: scroll  Enter/i/q: close ",
-                    Style::default().fg(theme::LABEL),
-                ),
-                Span::styled(
-                    format!("[{}/{INSIGHTS_PANELS}] {} ", current_panel + 1, panel_label),
-                    Style::default().fg(theme::PRIMARY),
-                ),
-            ])),
-        );
+        .block(super::popup_block(&format!(" {panel_label} ")).title_bottom(footer));
 
     frame.render_widget(popup, popup_area);
 }
@@ -2093,7 +2090,7 @@ fn metrics_trend_charts(
 const TREND_AXIS_W: usize = 9;
 
 /// Dates under a trend chart: every ten days from the window's start, and
-/// `today` under the last column.
+/// the window's last day under the last column.
 fn trend_date_axis(today: chrono::NaiveDate, col_w: usize, indent: &str) -> Line<'static> {
     let mut axis: Vec<char> = " ".repeat(TREND_DAYS * col_w + 6).chars().collect();
     let mut put = |col: usize, text: &str| {
@@ -2107,7 +2104,13 @@ fn trend_date_axis(today: chrono::NaiveDate, col_w: usize, indent: &str) -> Line
         let date = today - chrono::Duration::days((TREND_DAYS - 1 - i) as i64);
         put(i, &date.format("%m-%d").to_string());
     }
-    put(TREND_DAYS - 1, "today");
+    // A past period's window ends on its last day, which is not today.
+    let last = if today == chrono::Local::now().date_naive() {
+        "today".to_string()
+    } else {
+        today.format("%m-%d").to_string()
+    };
+    put(TREND_DAYS - 1, &last);
     Line::from(Span::styled(
         format!(
             "{indent}{}{}",

@@ -240,6 +240,17 @@ real `~/.claude` content is ever committed. CI smoke (`scripts/smoke-ci.sh`)
 drives the TUI through every tab + a popup under tmux with poll-until-ready,
 not just a first-frame capture.
 
+### Mutation testing (manual)
+
+Line coverage says a line ran, not that a test checked it. `scripts/mutants.sh`
+(cargo-mutants) breaks one line at a time over the lines changed since
+`origin/main`; a survivor is code no test checks. A run takes minutes, so it is
+no gate or CI job: pre-push only reports how many mutants a push carries, and
+`CCSIGHT_MUTANTS=1 git push` runs them there, a survivor stopping the push. Close a
+survivor with a property test against a reference model built alongside the
+input (`search.rs::a_query_parses_into_the_filters_its_tokens_name`); list one
+that cannot change behaviour in `.cargo/mutants.toml` with its reason.
+
 ### Byte-seam hardening (two drivers)
 
 `parse_entries` and `Pins::from_bytes` take bytes straight off disk — a JSONL

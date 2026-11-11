@@ -43,11 +43,14 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         if let Some(area) = state.layout.project_popup_area
             && in_area(column, row, &area)
         {
-            let relative_row = (row - area.y).saturating_sub(1) as usize;
-            let clicked_idx = state.project_popup_scroll() + relative_row;
-            let total = state.project_list.len() + 1;
-            if clicked_idx < total {
-                state.set_project_popup_selected(clicked_idx);
+            // Only the list rows pick a project; the detail lines below do not.
+            if let Some(list) = state.layout.project_popup_list_area
+                && in_area(column, row, &list)
+            {
+                let clicked_idx = state.project_popup_scroll() + (row - list.y) as usize;
+                if clicked_idx < state.project_popup_view().len() + 1 {
+                    state.set_project_popup_selected(clicked_idx);
+                }
             }
             return;
         }
@@ -79,20 +82,23 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         return;
     }
 
-    // Projects detail popup (panel 1): clicking a project row moves the
+    // Projects detail popup: clicking a project row moves the
     // cursor. Guarded by `!show_project_detail` so a click that falls through
     // an open per-project popup doesn't reset the cursor underneath.
-    if state.show_dashboard_detail() && state.dashboard_panel == 1 && !state.show_project_detail() {
+    if state.show_dashboard_detail()
+        && state.dashboard_panel == crate::DashPanel::Projects
+        && !state.show_project_detail()
+    {
         for (idx, area) in state.layout.project_detail_row_areas.clone() {
             if in_area(column, row, &area) {
-                state.dashboard_scroll[1] = idx;
+                state.dashboard_scroll[crate::DashPanel::Projects] = idx;
                 return;
             }
         }
     }
 
     // Ecosystem detail popup: tab click switches section.
-    if state.show_dashboard_detail() && state.dashboard_panel == 3 {
+    if state.show_dashboard_detail() && state.dashboard_panel == crate::DashPanel::Ecosystem {
         for (idx, area) in state.layout.tools_detail_tab_areas.clone() {
             if in_area(column, row, &area) {
                 crate::handlers::keyboard::set_ecosystem_section(state, idx);
@@ -129,14 +135,6 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
             return;
         }
         crate::dismiss_overlay(state);
-        return;
-    }
-
-    // Check if click is on help trigger button
-    if let Some(area) = state.layout.help_trigger
-        && in_area(column, row, &area)
-    {
-        state.active_popup = crate::ActivePopup::Help { scroll: 0 };
         return;
     }
 
@@ -283,7 +281,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         let category_areas = state.layout.tools_panel_category_areas.clone();
         for (section_idx, area) in category_areas {
             if in_area(column, row, &area) {
-                state.dashboard_panel = 3;
+                state.dashboard_panel = crate::DashPanel::Ecosystem;
                 state.active_popup = crate::ActivePopup::DashboardDetail;
                 crate::handlers::keyboard::set_ecosystem_section(state, section_idx);
                 return;
@@ -293,9 +291,9 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
 
     // Check if click is on a dashboard panel
     if state.tab == Tab::Dashboard && !state.show_conversation {
-        for (idx, area) in state.layout.dashboard_panel_areas.iter().enumerate() {
-            if in_area(column, row, area) {
-                state.dashboard_panel = idx;
+        for (panel, area) in state.layout.dashboard_panel_areas.clone() {
+            if in_area(column, row, &area) {
+                state.dashboard_panel = panel;
                 return;
             }
         }
@@ -401,7 +399,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
 
 /// The session row under the pointer in a popup with a session cursor.
 fn cursor_row_at(state: &AppState, column: u16, row: u16) -> Option<usize> {
-    let models = state.show_dashboard_detail() && state.dashboard_panel == 2;
+    let models = state.show_dashboard_detail() && state.dashboard_panel == crate::DashPanel::Models;
     if !(state.show_day_activity() || state.show_project_detail() || models) {
         return None;
     }
@@ -419,7 +417,7 @@ fn set_popup_cursor(state: &mut AppState, idx: usize) {
     } else if state.show_project_detail() {
         state.set_project_detail_cursor(idx);
     } else {
-        state.dashboard_scroll[2] = idx;
+        state.dashboard_scroll[crate::DashPanel::Models] = idx;
     }
 }
 
@@ -454,7 +452,13 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
     }
 
     if state.show_project_popup() {
-        crate::handlers::keyboard::choose_project_row(state);
+        if state
+            .layout
+            .project_popup_list_area
+            .is_some_and(|list| in_area(column, row, &list))
+        {
+            crate::handlers::keyboard::choose_project_row(state);
+        }
         return;
     }
 
@@ -464,10 +468,13 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
     }
 
     // Double-click on a project row → per-project popup (mirrors Enter).
-    if state.show_dashboard_detail() && state.dashboard_panel == 1 && !state.show_project_detail() {
+    if state.show_dashboard_detail()
+        && state.dashboard_panel == crate::DashPanel::Projects
+        && !state.show_project_detail()
+    {
         for (idx, area) in state.layout.project_detail_row_areas.clone() {
             if in_area(column, row, &area) {
-                state.dashboard_scroll[1] = idx;
+                state.dashboard_scroll[crate::DashPanel::Projects] = idx;
                 crate::handlers::keyboard::open_project_detail(state, idx);
                 return;
             }
@@ -565,9 +572,9 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
     }
 
     if !state.show_conversation && state.tab == Tab::Dashboard {
-        for (idx, area) in state.layout.dashboard_panel_areas.iter().enumerate() {
-            if in_area(column, row, area) {
-                state.dashboard_panel = idx;
+        for (panel, area) in state.layout.dashboard_panel_areas.clone() {
+            if in_area(column, row, &area) {
+                state.dashboard_panel = panel;
                 crate::handlers::keyboard::open_dashboard_detail(state);
                 return;
             }
@@ -607,7 +614,8 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
     }
 
     if state.show_project_popup() {
-        let max = state.project_list.len().saturating_sub(1);
+        // Row 0 is "All", so the last project sits at `len()`.
+        let max = state.project_popup_view().len();
         if up {
             state.set_project_popup_selected(state.project_popup_selected().saturating_sub(1));
         } else if state.project_popup_selected() < max {
@@ -753,18 +761,17 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
     }
 
     if state.tab == Tab::Dashboard {
-        for (idx, area) in state.layout.dashboard_panel_areas.iter().enumerate() {
-            if in_area(column, row, area) {
-                let (scroll_up, scroll_down) = if idx == 5 { (!up, up) } else { (up, !up) };
+        for (panel, area) in state.layout.dashboard_panel_areas.clone() {
+            if in_area(column, row, &area) {
+                let activity = panel == crate::DashPanel::Activity;
+                let (scroll_up, scroll_down) = if activity { (!up, up) } else { (up, !up) };
                 if scroll_up {
-                    state.dashboard_scroll[idx] = state.dashboard_scroll[idx].saturating_sub(1);
+                    state.dashboard_scroll[panel] = state.dashboard_scroll[panel].saturating_sub(1);
                 } else if scroll_down {
-                    let saved = state.dashboard_panel;
-                    state.dashboard_panel = idx;
-                    let max_items = crate::dashboard_max_items(state);
-                    state.dashboard_panel = saved;
-                    if state.dashboard_scroll[idx] + 1 < max_items {
-                        state.dashboard_scroll[idx] += 1;
+                    let today = chrono::Local::now().date_naive();
+                    let max_items = crate::ui::dashboard::panel_item_count(state, panel, today);
+                    if state.dashboard_scroll[panel] + 1 < max_items {
+                        state.dashboard_scroll[panel] += 1;
                     }
                 }
                 return;
@@ -805,6 +812,29 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wheel_reaches_the_last_project_past_the_all_row() {
+        let day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(); // lint-ok: date-literal
+        let sessions = ["a", "b", "c"]
+            .iter()
+            .map(|p| make_session(p, None, None))
+            .collect();
+        let mut state = make_test_app_state(vec![make_daily_group(day, sessions)]);
+        state.active_popup = crate::ActivePopup::ProjectPopup {
+            selected: 0,
+            scroll: 0,
+            query: crate::state::TextInput::default(),
+        };
+        for _ in 0..10 {
+            handle_mouse_scroll(&mut state, 0, 0, false);
+        }
+        assert_eq!(
+            state.project_popup_selected(),
+            3,
+            "row 0 is All, so the last is row 3"
+        );
+    }
     use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
     use ratatui::layout::Rect;
 
@@ -1157,6 +1187,7 @@ mod tests {
             crate::ActivePopup::ProjectPopup {
                 selected: 0,
                 scroll: 0,
+                query: crate::state::TextInput::default(),
             },
         ];
         for popup in popups {

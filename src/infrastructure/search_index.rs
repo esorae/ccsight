@@ -25,7 +25,7 @@ use crate::domain::{EntryType, Role};
 use crate::parser::JsonlParser;
 use crate::search::{SearchMatchType, SearchResult, extract_snippet};
 
-const INDEX_VERSION: u32 = 7;
+const INDEX_VERSION: u32 = 8;
 
 fn is_index_dir(name: &str) -> bool {
     name == "index" || name.starts_with("index-v")

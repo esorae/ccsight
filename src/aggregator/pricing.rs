@@ -96,7 +96,9 @@ pub struct ModelPricing {
 /// the usual 1.25x / 2x / 0.1x.
 #[rustfmt::skip]
 const PRICES: &[(&str, f64, f64, f64, f64, f64)] = &[
-    // 5.1 reads bill at 0.025x base, not 0.1x: a sibling's row overcharges them.
+    // 5.2 / 5.1 reads bill at 0.025x base, not 0.1x: a sibling's row overcharges them.
+    ("claude-fable-5-2", 8.0, 40.0, 10.0, 16.0, 0.20),
+    ("claude-mythos-5-2", 8.0, 40.0, 10.0, 16.0, 0.20),
     ("claude-fable-5-1", 10.0, 50.0, 12.5, 20.0, 0.25),
     ("claude-mythos-5-1", 10.0, 50.0, 12.5, 20.0, 0.25),
     ("claude-fable-5", 10.0, 50.0, 12.5, 20.0, 1.0),
@@ -141,6 +143,8 @@ type Applies = fn(&crate::domain::Usage, Option<chrono::DateTime<chrono::Utc>>) 
 const VARIANTS: &[(&str, &str, &str, Applies, f64, f64, f64, f64, f64)] = &[
     // Fast mode: a dearer base, with the model's usual cache multipliers.
     // A model without a row here runs a fast request at standard speed.
+    ("claude-fable-5-2", "fast", "fast mode", is_fast, 16.0, 80.0, 20.0, 32.0, 0.40),
+    ("claude-mythos-5-2", "fast", "fast mode", is_fast, 16.0, 80.0, 20.0, 32.0, 0.40),
     ("claude-opus-5-5", "fast", "fast mode", is_fast, 8.0, 40.0, 10.0, 16.0, 0.40),
     ("claude-opus-5", "fast", "fast mode", is_fast, 10.0, 50.0, 12.5, 20.0, 1.0),
     ("claude-opus-4-8", "fast", "fast mode", is_fast, 10.0, 50.0, 12.5, 20.0, 1.0),
@@ -596,6 +600,37 @@ mod tests {
     }
 
     #[test]
+    fn fable_and_mythos_5_2_bill_at_their_own_rates() {
+        let calculator = CostCalculator::new();
+        for model in ["claude-fable-5-2", "claude-mythos-5-2"] {
+            let p = calculator.get_pricing(Some(model)).unwrap();
+            assert_eq!(
+                (
+                    p.input_cost_per_mtok,
+                    p.output_cost_per_mtok,
+                    p.cache_write_5m_cost_per_mtok,
+                    p.cache_write_1h_cost_per_mtok,
+                    p.cache_read_cost_per_mtok
+                ),
+                (8.0, 40.0, 10.0, 16.0, 0.20),
+                "{model}"
+            );
+        }
+        assert_eq!(normalize_model_name("claude-fable-5-2"), "Fable 5.2");
+        assert_eq!(normalize_model_name("claude-mythos-5-2"), "Mythos 5.2");
+        let fast = crate::domain::Usage {
+            speed: Some("fast".to_string()),
+            ..Default::default()
+        };
+        let key = pricing_key("claude-fable-5-2", &fast, None);
+        let p = calculator.get_pricing(Some(&key)).unwrap();
+        assert_eq!(
+            (p.input_cost_per_mtok, p.output_cost_per_mtok),
+            (16.0, 80.0)
+        );
+    }
+
+    #[test]
     fn fable_5_1_reads_bill_at_the_reduced_cache_multiplier() {
         // Same base as Fable 5 but a quarter of its cache-read rate. Cache
         // reads dominate real volume, so cloning the sibling entry would
@@ -795,6 +830,39 @@ mod tests {
             1,
             "a lone record is the returned attempt itself"
         );
+    }
+
+    // A key matches a model id only at a version boundary: a date or a
+    // bracketed variant continues it, a further version number does not, so
+    // an unknown point release stays unpriced rather than borrowing its base.
+    #[test]
+    fn a_pricing_key_matches_only_up_to_a_version_boundary() {
+        let calc = CostCalculator::new();
+        let input = |id: &str| calc.get_pricing(Some(id)).map(|p| p.input_cost_per_mtok);
+        assert_eq!(input("claude-opus-4-20250514"), Some(15.0), "a date suffix");
+        assert_eq!(input("claude-opus-4-1"), Some(15.0), "its own row");
+        assert_eq!(
+            input("claude-opus-4-6[1m]"),
+            Some(5.0),
+            "a bracketed variant"
+        );
+        assert_eq!(input("claude-sonnet-4-latest"), Some(3.0), "a word suffix");
+        assert_eq!(input("claude-opus-4-9"), None, "an unknown point release");
+        assert_eq!(input("claude-opus-4x"), None, "no separator");
+    }
+
+    // The display-name lookup returns that model's own rates.
+    #[test]
+    fn a_display_name_finds_its_own_rates() {
+        let calc = CostCalculator::new();
+        let input = |name: &str| {
+            calc.get_pricing_by_display_name(name)
+                .map(|p| p.input_cost_per_mtok)
+        };
+        assert_eq!(input("Opus 4.1"), Some(15.0));
+        assert_eq!(input("Sonnet 4.6"), Some(3.0));
+        assert_eq!(input("Haiku 5.5"), Some(0.10));
+        assert_eq!(input("Nonexistent 9"), None);
     }
 
     // A message at an unrated speed leaves its cost unknown, so its model
